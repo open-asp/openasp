@@ -15,7 +15,7 @@
 - `fastcgi_connection.eg`：连接读取、内存配额、GC quiescent 区间和响应发送。
 - `worker.eg`：连接任务并发、worker GC 配置和回收。
 - `master.eg`：监听、AOT 准备、worker fork、监控和重启。
-- `fastcgi_server.eg`：保持 `FastcgiServer(...).run_tcp(...)` API 的兼容 facade。
+- `fastcgi_server.eg`：提供 TCP 与 Unix socket 启动 API 的兼容 facade。
 
 ## 依赖方向
 
@@ -26,6 +26,7 @@ cmd/openasp_fpm
         -> asp.runtime
         -> protocol.fastcgi
         -> aio.tcp
+        -> aio.unix.socket
 ```
 
 根模块 `asp` 不得反向 import `asp.server`。`openasp` 和 `openasp-cli` 不应链接 FastCGI server 符号。

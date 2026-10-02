@@ -212,8 +212,7 @@ build/openasp /tmp/openasp-site/default.asp \
 ```sh
 build/openasp-fpm \
     --root /srv/www/example \
-    --host 127.0.0.1 \
-    --port 9000 \
+    --unix-socket /run/openasp/openasp.sock \
     --workers 4 \
     --worker-connections 128 \
     --max-accepts 1000 \
@@ -224,6 +223,7 @@ build/openasp-fpm \
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
 | `--root <dir>` | `.` | 站点物理根目录 |
+| `--unix-socket <path>` | 不启用 | 监听权限为 `0660` 的 Unix socket |
 | `--host <address>` | `127.0.0.1` | FastCGI 监听地址 |
 | `--port <port>` | `9000` | FastCGI TCP 端口 |
 | `--workers <n>` | `2` | worker 进程数 |
@@ -237,6 +237,9 @@ build/openasp-fpm \
 
 日志文件名会自动追加 `-YYYYMMDD`，父目录不存在时会自动创建。请求日志不会记录
 查询字符串、请求正文、Cookie、Session 值和 OpenAI API Key。
+
+启动前需要先创建 Unix socket 的父目录。需要使用 TCP 时，不传
+`--unix-socket`，改用 `--host` 和 `--port`；两种模式不能同时指定。
 
 ### 2A. 配置 Nginx
 
@@ -265,7 +268,7 @@ server {
         fastcgi_param PATH_INFO       "";
         fastcgi_param PATH_TRANSLATED $document_root$fastcgi_script_name;
 
-        fastcgi_pass 127.0.0.1:9000;
+        fastcgi_pass unix:/run/openasp/openasp.sock;
         fastcgi_read_timeout 120s;
     }
 
@@ -336,7 +339,7 @@ http {
         }
 
         location ~ \.asp$ {
-            fastcgi_pass 127.0.0.1:9000;
+            fastcgi_pass unix:/run/openasp/openasp.sock;
             fastcgi_index default.asp;
 
             fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;

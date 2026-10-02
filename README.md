@@ -223,8 +223,7 @@ Variables, `Session`, and `Application` survive between commands; use
 ```sh
 build/openasp-fpm \
     --root /srv/www/example \
-    --host 127.0.0.1 \
-    --port 9000 \
+    --unix-socket /run/openasp/openasp.sock \
     --workers 4 \
     --worker-connections 128 \
     --max-accepts 1000 \
@@ -235,6 +234,7 @@ build/openasp-fpm \
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--root <dir>` | `.` | Physical site root |
+| `--unix-socket <path>` | disabled | Listen on a Unix socket with mode `0660` |
 | `--host <address>` | `127.0.0.1` | FastCGI listen address |
 | `--port <port>` | `9000` | FastCGI TCP port |
 | `--workers <n>` | `2` | Worker processes |
@@ -249,6 +249,10 @@ build/openasp-fpm \
 Log filenames receive a `-YYYYMMDD` suffix. The parent directory is created
 automatically. Query strings, bodies, cookies, Session values, and OpenAI API
 keys are not written to request logs.
+
+Create the Unix socket's parent directory before startup. To use TCP instead,
+omit `--unix-socket` and pass `--host` and `--port`; the two modes cannot be
+combined.
 
 ### 2A. Configure Nginx
 
@@ -277,7 +281,7 @@ server {
         fastcgi_param PATH_INFO       "";
         fastcgi_param PATH_TRANSLATED $document_root$fastcgi_script_name;
 
-        fastcgi_pass 127.0.0.1:9000;
+        fastcgi_pass unix:/run/openasp/openasp.sock;
         fastcgi_read_timeout 120s;
     }
 
@@ -350,7 +354,7 @@ http {
         }
 
         location ~ \.asp$ {
-            fastcgi_pass 127.0.0.1:9000;
+            fastcgi_pass unix:/run/openasp/openasp.sock;
             fastcgi_index default.asp;
 
             fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;

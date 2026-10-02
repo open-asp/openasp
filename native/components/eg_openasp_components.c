@@ -759,6 +759,11 @@ int64_t eg_openasp_fpm_socket_prepare(eg_string_t* path_value) {
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
+    int descriptor_flags = fcntl(fd, F_GETFL, 0);
+    if (descriptor_flags < 0 || fcntl(fd, F_SETFL, descriptor_flags | O_NONBLOCK) != 0) {
+        close(fd);
+        return -1;
+    }
     struct sockaddr_un address;
     size_t path_length = strlen(path);
     if (path_length >= sizeof(address.sun_path)) {
