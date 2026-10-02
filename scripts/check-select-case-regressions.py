@@ -1,7 +1,7 @@
 # Copyright (c) 2026 OpenASP.dev
 # SPDX-License-Identifier: MIT
 
-"""验证多值 Case、闰年、嵌套分支及匹配表达式只求值到命中项。"""
+"""Verify multi-value Case, leap years, nesting, and match evaluation order."""
 
 import os
 from pathlib import Path
@@ -21,5 +21,6 @@ for mode in ("off", "on"):
     body, _, metadata = result.stdout.partition("----")
     if result.returncode != 0 or body.strip() != expected or "status=200" not in metadata:
         raise SystemExit(
-            f"失败：Select Case，C_VM={mode}\n预期：{expected}\n实际：{result.stdout}\n{result.stderr}")
-    print(f"通过：Select Case，C_VM={mode}")
+            f"FAIL: Select Case, C_VM={mode}\n"
+            f"expected: {expected}\nactual: {result.stdout}\n{result.stderr}")
+    print(f"PASS: Select Case, C_VM={mode}")

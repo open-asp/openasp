@@ -1,7 +1,7 @@
 # Copyright (c) 2026 OpenASP.dev
 # SPDX-License-Identifier: MIT
 
-"""验证嵌套循环退出只结束所属过程，并恢复返回值和直接 ByRef 参数。"""
+"""Verify nested loop exits and restoration of return values and ByRef arguments."""
 
 import os
 from pathlib import Path
@@ -25,5 +25,6 @@ for mode in ("off", "on"):
         body, _, metadata = result.stdout.partition("----")
         if result.returncode != 0 or body.strip() != expected or "error_number=0" not in metadata or "status=200" not in metadata:
             raise SystemExit(
-                f"失败：{name}，C_VM={mode}\n预期：{expected}\n实际：{result.stdout}\n{result.stderr}")
-        print(f"通过：{name}，C_VM={mode}")
+                f"FAIL: {name}, C_VM={mode}\n"
+                f"expected: {expected}\nactual: {result.stdout}\n{result.stderr}")
+        print(f"PASS: {name}, C_VM={mode}")

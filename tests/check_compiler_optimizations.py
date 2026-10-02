@@ -1,7 +1,7 @@
 # Copyright (c) 2026 OpenASP.dev
 # SPDX-License-Identifier: MIT
 
-"""ASP 编译优化开关、语义等价性及缓存隔离的全链路验证。"""
+"""End-to-end checks for ASP optimization, semantics, and cache isolation."""
 
 from __future__ import annotations
 
@@ -225,7 +225,7 @@ def main() -> None:
         check_semantics(page, error_page, state_dir)
         check_cache_isolation(page, state_dir)
 
-    print("通过：ASP 编译优化开关、语义等价、错误保留及缓存隔离验证")
+    print("PASS: ASP optimization, semantic equivalence, errors, and cache isolation")
 
 
 if __name__ == "__main__":

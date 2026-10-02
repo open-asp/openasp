@@ -57,7 +57,8 @@ with tempfile.TemporaryDirectory(prefix="openasp-application-lock-") as state:
     actual = render(environment, "read=1")
     if actual != str(WORKERS):
         raise SystemExit(
-            f"失败：Application.Lock 跨进程计数\n预期：{WORKERS}\n实际：{actual}"
+            f"FAIL: Application.Lock cross-process count\n"
+            f"expected: {WORKERS}\nactual: {actual}"
         )
 
-print(f"通过：Application.Lock 跨进程互斥（{WORKERS} 个进程）")
+print(f"PASS: Application.Lock cross-process exclusion ({WORKERS} processes)")

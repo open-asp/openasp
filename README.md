@@ -18,9 +18,9 @@
   <a href="#classic-asp-compatibility">Compatibility</a> |
   <a href="#openasp-extensions">Extensions</a> |
   <a href="#architecture">Architecture</a> |
-  <a href="docs/OpenASP命令行.md">CLI</a> |
+  <a href="docs/OpenASP%E5%91%BD%E4%BB%A4%E8%A1%8C.md">CLI</a> |
   <a href="https://openasp.dev">Website</a> |
-  <a href="README.zh-CN.md">简体中文</a>
+  <a href="README.zh-CN.md">Chinese</a>
 </p>
 
 Official website: **[https://openasp.dev](https://openasp.dev)**. For questions, suggestions, or other feedback, please visit the website.
@@ -769,7 +769,7 @@ expose the latest call. Load API keys through the deployment secret mechanism;
 never place them in source, query strings, or response bodies. OpenASP does not
 write the key to request logs.
 
-See the [backend component reference](docs/OpenASP后端组件.md) for exact
+See the [backend component reference](docs/OpenASP%E5%90%8E%E7%AB%AF%E7%BB%84%E4%BB%B6.md) for exact
 signatures, limits, TLS behavior, and lifecycle rules.
 
 ## Architecture
@@ -813,10 +813,10 @@ recovery, and data consistency.
 
 The detailed engineering documentation is currently maintained in Chinese:
 
-- [OpenASP CLI](docs/OpenASP命令行.md)
-- [OpenASP backend components](docs/OpenASP后端组件.md)
+- [OpenASP CLI](docs/OpenASP%E5%91%BD%E4%BB%A4%E8%A1%8C.md)
+- [OpenASP backend components](docs/OpenASP%E5%90%8E%E7%AB%AF%E7%BB%84%E4%BB%B6.md)
 - [VBScript BNF support matrix](docs/VBSCRIPT_BNF_SUPPORT.md)
 - [Classic ASP feasibility and design](docs/classic-asp-feasibility-and-design.md)
 - [AOT memory optimization](docs/AOT_MEMORY_OPTIMIZATION.md)
-- [Running Z-Blog locally](docs/ZBlog本地运行.md)
+- [Running Z-Blog locally](docs/ZBlog%E6%9C%AC%E5%9C%B0%E8%BF%90%E8%A1%8C.md)
 - [Native module layout](native/README.md)

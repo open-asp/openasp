@@ -1,7 +1,7 @@
 # Copyright (c) 2026 OpenASP.dev
 # SPDX-License-Identifier: MIT
 
-"""验证布尔转换、失败赋值恢复及原生过程返回；二进制路径可由第一个参数指定。"""
+"""Verify Boolean conversion, failed assignment recovery, and native returns."""
 
 import os
 from pathlib import Path
@@ -27,8 +27,9 @@ for mode in ("off", "on"):
         body, _, metadata = result.stdout.partition("----")
         if result.returncode != 0 or body.strip() != expected or "status=200" not in metadata:
             raise SystemExit(
-                f"失败：{name}，C_VM={mode}\n预期：{expected}\n实际：{result.stdout}\n{result.stderr}"
+                f"FAIL: {name}, C_VM={mode}\n"
+                f"expected: {expected}\nactual: {result.stdout}\n{result.stderr}"
             )
         if name == "resume_next_failed_assignment" and "content_type=text/plain" not in metadata:
-            raise SystemExit("失败：转换异常覆盖了 Response.ContentType")
-        print(f"通过：{name}，C_VM={mode}")
+            raise SystemExit("FAIL: conversion error overwrote Response.ContentType")
+        print(f"PASS: {name}, C_VM={mode}")

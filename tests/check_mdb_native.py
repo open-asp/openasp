@@ -142,16 +142,17 @@ def main() -> int:
         run(
             str(test_binary),
             str(database),
-            "CREATE TABLE [unicode_表] ([id] AutoIncrement, [标题] VARCHAR(40) DEFAULT '正常', "
+            "CREATE TABLE [unicode_\u8868] ([id] AutoIncrement, "
+            "[\u6807\u9898] VARCHAR(40) DEFAULT '\u6b63\u5e38', "
             "CONSTRAINT [pk_unicode] PRIMARY KEY ([id]))",
         )
         tables = run("mdb-tables", "-1", str(database)).stdout
-        assert "unicode_表" in tables
+        assert "unicode_\u8868" in tables
         before = digest(database)
         duplicate = run(
             str(test_binary),
             str(database),
-            "CREATE TABLE [unicode_表] ([id] AutoIncrement PRIMARY KEY)",
+            "CREATE TABLE [unicode_\u8868] ([id] AutoIncrement PRIMARY KEY)",
             check=False,
         )
         assert duplicate.returncode != 0

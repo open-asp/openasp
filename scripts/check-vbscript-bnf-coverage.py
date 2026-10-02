@@ -1,7 +1,7 @@
 # Copyright (c) 2026 OpenASP.dev
 # SPDX-License-Identifier: MIT
 
-"""验证 vbscript.bnf 补齐语法在 managed VM 与 C VM 下行为一致。"""
+"""Verify vbscript.bnf syntax behaves identically in the managed and C VMs."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ def render(page: Path, root: Path, mode: str) -> str:
         or "error_number=0" not in metadata
     ):
         raise SystemExit(
-            f"失败：BNF 页面执行，C_VM={mode}\n"
+            f"FAIL: BNF page execution, C_VM={mode}\n"
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
     return body.strip()
@@ -48,7 +48,8 @@ for vm_mode in ("off", "on"):
     actual = render(FIXTURES / "vbscript_bnf_coverage.asp", FIXTURES, vm_mode)
     if actual != EXPECTED:
         raise SystemExit(
-            f"失败：BNF 语法覆盖，C_VM={vm_mode}\n预期：{EXPECTED}\n实际：{actual}"
+            f"FAIL: BNF syntax coverage, C_VM={vm_mode}\n"
+            f"expected: {EXPECTED}\nactual: {actual}"
         )
 
     with_actual = render(
@@ -56,8 +57,8 @@ for vm_mode in ("off", "on"):
     )
     if with_actual != "1":
         raise SystemExit(
-            f"失败：With 成员调用的函数名冲突，C_VM={vm_mode}\n"
-            f"预期：1\n实际：{with_actual}"
+            f"FAIL: With member-call function-name conflict, C_VM={vm_mode}\n"
+            f"expected: 1\nactual: {with_actual}"
         )
 
     with tempfile.TemporaryDirectory(prefix="vbscript-bnf-", dir=ROOT / "build") as temp:
@@ -69,8 +70,8 @@ for vm_mode in ("off", "on"):
         cr_actual = render(cr_page, temp_root, vm_mode)
         if cr_actual != "42":
             raise SystemExit(
-                f"失败：CR-only 换行及续行，C_VM={vm_mode}\n"
-                f"预期：42\n实际：{cr_actual}"
+                f"FAIL: CR-only newlines and continuation, C_VM={vm_mode}\n"
+                f"expected: 42\nactual: {cr_actual}"
             )
 
-    print(f"通过：VBScript BNF 语法覆盖，C_VM={vm_mode}")
+    print(f"PASS: VBScript BNF syntax coverage, C_VM={vm_mode}")

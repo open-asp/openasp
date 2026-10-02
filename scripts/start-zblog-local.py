@@ -1,7 +1,7 @@
 # Copyright (c) 2026 OpenASP.dev
 # SPDX-License-Identifier: MIT
 
-"""启动已有持久数据库和 Z-Blog 本地服务；不会初始化或覆盖数据库。"""
+"""Start the existing persistent database and local Z-Blog services."""
 
 import os
 from pathlib import Path
@@ -34,10 +34,11 @@ def mysql_layout():
         base = binary.parent.parent
     else:
         raise SystemExit(
-            "未找到 mysqld；请加入 PATH，或设置 OPENASP_MYSQL_BASE/OPENASP_MYSQLD。"
+            "mysqld was not found; add it to PATH or set "
+            "OPENASP_MYSQL_BASE/OPENASP_MYSQLD."
         )
     if not binary.is_file():
-        raise SystemExit(f"mysqld 不存在：{binary}")
+        raise SystemExit(f"mysqld does not exist: {binary}")
     return base, binary
 
 
@@ -52,7 +53,8 @@ def nginx_config_directory():
     match = re.search(r"(?:^|\s)--conf-path=(\"[^\"]+\"|'[^']+'|\S+)", result.stderr)
     if not match:
         raise SystemExit(
-            "无法确定 Nginx 配置目录；请设置 OPENASP_NGINX_CONFIG_DIR。"
+            "Cannot determine the Nginx configuration directory; "
+            "set OPENASP_NGINX_CONFIG_DIR."
         )
     return Path(match.group(1).strip("\"'")).expanduser().resolve().parent
 
@@ -76,24 +78,28 @@ def wait_ready(port, process, log):
         if listening(port):
             return
         if process.poll() is not None:
-            raise SystemExit(f"服务启动失败，请检查日志：{log}")
+            raise SystemExit(f"Service startup failed; inspect the log: {log}")
         if time.monotonic() >= next_notice:
-            print(f"正在等待端口 {port} 就绪，首次 AOT 编译可能较慢；日志：{log}", flush=True)
+            print(
+                f"Waiting for port {port}; initial AOT compilation may be slow. "
+                f"Log: {log}",
+                flush=True,
+            )
             next_notice = time.monotonic() + 30
         time.sleep(0.2)
-    raise SystemExit(f"等待端口 {port} 超时，请检查日志：{log}")
+    raise SystemExit(f"Timed out waiting for port {port}; inspect the log: {log}")
 
 
 def start(args, port, log, environment=None):
     """Start one local service only when its port is currently unused."""
     if listening(port):
-        print(f"端口 {port} 已运行")
+        print(f"Port {port} is already active")
         return
     with log.open("ab") as output:
         process = subprocess.Popen(args, cwd=ROOT, env=environment, stdout=output,
                                    stderr=subprocess.STDOUT, start_new_session=True)
     wait_ready(port, process, log)
-    print(f"服务已启动：端口 {port}，PID {process.pid}")
+    print(f"Service started: port {port}, PID {process.pid}")
 
 
 def prepare_site_root(site_root):
@@ -107,8 +113,8 @@ def prepare_site_root(site_root):
                            ZBLOG_SOURCE / "zb_system/cmd.asp")
         if not all(path.is_file() for path in source_required):
             raise SystemExit(
-                f"Z-Blog 运行目录缺失，且无法从源码恢复：{ZBLOG_SOURCE}。"
-                "可通过 OPENASP_ZBLOG_SOURCE 指定源码目录。"
+                f"The Z-Blog runtime directory is missing and cannot be restored "
+                f"from {ZBLOG_SOURCE}. Set OPENASP_ZBLOG_SOURCE to the source directory."
             )
         shutil.copytree(
             ZBLOG_SOURCE,
@@ -123,7 +129,7 @@ def prepare_site_root(site_root):
     if legacy in provider:
         provider_path.write_bytes(provider.replace(legacy, current))
     elif current not in provider:
-        raise SystemExit(f"无法迁移 Z-Blog MySQL Provider：{provider_path}")
+        raise SystemExit(f"Cannot migrate the Z-Blog MySQL provider: {provider_path}")
     obsolete_installer = site_root / "mssql.asp"
     if obsolete_installer.exists():
         obsolete_installer.unlink()
@@ -132,7 +138,7 @@ def prepare_site_root(site_root):
         str(site_root),
     ], cwd=ROOT, check=True)
     if restored:
-        print(f"已恢复 Z-Blog 运行目录：{site_root}")
+        print(f"Restored the Z-Blog runtime directory: {site_root}")
 
 
 def rebuild_zblog_caches(site_root):
@@ -186,7 +192,7 @@ Response.Write "OPENASP_CACHE_REBUILD_OK"
     finally:
         maintenance.unlink(missing_ok=True)
     if "OPENASP_CACHE_REBUILD_OK" not in output:
-        raise SystemExit(f"Z-Blog 缓存重建失败：{output.strip() or '未知错误'}")
+        raise SystemExit(f"Z-Blog cache rebuild failed: {output.strip() or 'unknown error'}")
     invalid = [
         path for path in required
         if not path.is_file() or path.stat().st_size == 0
@@ -198,8 +204,8 @@ Response.Write "OPENASP_CACHE_REBUILD_OK"
     ]
     if invalid or unresolved:
         names = ", ".join(str(path) for path in invalid + unresolved)
-        raise SystemExit(f"Z-Blog 缓存重建不完整：{names}")
-    print("Z-Blog 页面与侧栏缓存已重建")
+        raise SystemExit(f"Z-Blog cache rebuild is incomplete: {names}")
+    print("Rebuilt Z-Blog page and sidebar caches")
 
 
 def write_nginx_config(site_root):
@@ -209,7 +215,8 @@ def write_nginx_config(site_root):
     fastcgi_params = nginx_config_dir / "fastcgi_params"
     if not mime_types.is_file() or not fastcgi_params.is_file():
         raise SystemExit(
-            f"Nginx 配置目录缺少 mime.types 或 fastcgi_params：{nginx_config_dir}"
+            f"Nginx configuration directory lacks mime.types or fastcgi_params: "
+            f"{nginx_config_dir}"
         )
     config = f"""worker_processes 1;
 error_log "{ROOT / '.run/nginx-zblog-mysql-error.log'}" info;
@@ -276,10 +283,10 @@ def reload_nginx():
     pids = [int(value) for value in result.stdout.split() if value.isdigit()]
     if len(pids) != 1:
         raise SystemExit(
-            f"无法确定 Nginx master PID，请检查配置：{NGINX_CONFIG}"
+            f"Cannot determine the Nginx master PID; inspect: {NGINX_CONFIG}"
         )
     os.kill(pids[0], signal.SIGHUP)
-    print(f"Nginx 配置已重载：PID {pids[0]}")
+    print(f"Reloaded the Nginx configuration: PID {pids[0]}")
 
 
 def main():
@@ -288,7 +295,10 @@ def main():
     site_root = ROOT / "examples/zblog-mysql-openasp"
     prepare_site_root(site_root)
     if not (DATA_DIR / "mysql").is_dir() or not (DATA_DIR / "zblogasp_mysql").is_dir():
-        raise SystemExit(f"未找到已有 Z-Blog 数据库：{DATA_DIR}。请先恢复备份；启动脚本不会创建空库。")
+        raise SystemExit(
+            f"No existing Z-Blog database was found at {DATA_DIR}. Restore a "
+            "backup first; this startup script does not create an empty database."
+        )
     start([
         str(mysqld), "--no-defaults",
         f"--basedir={mysql_base}", f"--datadir={DATA_DIR}",
@@ -326,9 +336,15 @@ def main():
     else:
         subprocess.run(nginx, check=True)
     if not listening(18088):
-        raise SystemExit("Nginx 未监听 18088，请检查 .run/nginx-zblog-mysql-error.log")
+        raise SystemExit(
+            "Nginx is not listening on port 18088; inspect "
+            ".run/nginx-zblog-mysql-error.log"
+        )
     rebuild_zblog_caches(site_root)
-    print("站点已启动：http://127.0.0.1:18088/（AOT 开启，4 workers × 4 connections）")
+    print(
+        "Site started: http://127.0.0.1:18088/ "
+        "(AOT enabled, 4 workers x 4 connections)"
+    )
 
 
 if __name__ == "__main__":

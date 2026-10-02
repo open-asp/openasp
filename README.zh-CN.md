@@ -787,4 +787,4 @@ make test-mdb-native
 - [Classic ASP 可行性与设计](docs/classic-asp-feasibility-and-design.md)
 - [AOT 内存优化](docs/AOT_MEMORY_OPTIMIZATION.md)
 - [Z-Blog 本地运行](docs/ZBlog本地运行.md)
-- [Native 模块说明](native/README.md)
+- [Native 模块说明](native/README.zh-CN.md)

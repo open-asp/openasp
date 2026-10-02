@@ -35,7 +35,7 @@ for mode in ("off", "on"):
     output, _, metadata = result.stdout.partition("----")
     if result.returncode != 0 or output.strip() != expected or "status=200" not in metadata:
         raise SystemExit(
-            f"失败：Request.BinaryRead 游标，C_VM={mode}\n"
-            f"预期：{expected}\n实际：{result.stdout}\n{result.stderr}"
+            f"FAIL: Request.BinaryRead cursor, C_VM={mode}\n"
+            f"expected: {expected}\nactual: {result.stdout}\n{result.stderr}"
         )
-    print(f"通过：Request.BinaryRead 游标，C_VM={mode}")
+    print(f"PASS: Request.BinaryRead cursor, C_VM={mode}")

@@ -439,20 +439,20 @@ def restore_safe_theme_markup(root: Path) -> None:
             f"zb_users/theme/{blog_theme}/source/style.css.asp",
         )
         text = text.replace(
-            '<div id="divNavBar" role="navigation" aria-label="主导航">',
+            '<div id="divNavBar" role="navigation" aria-label="\u4e3b\u5bfc\u822a">',
             '<div id="divNavBar">',
         ).replace(
             '<div id="divMain" role="main">',
             '<div id="divMain">',
         ).replace(
-            '<div id="divSidebar" role="complementary" aria-label="侧栏">',
+            '<div id="divSidebar" role="complementary" aria-label="\u4fa7\u680f">',
             '<div id="divSidebar">',
         ).replace(
             '<div id="divBottom" role="contentinfo">',
             '<div id="divBottom">',
         )
         text = text.replace(
-            'type="search" name="edtSearch" aria-label="搜索关键词"',
+            'type="search" name="edtSearch" aria-label="\u641c\u7d22\u5173\u952e\u8bcd"',
             'type="text" name="edtSearch"',
         )
         text = text.replace(' rel="noopener noreferrer"', "")
@@ -474,19 +474,20 @@ def restore_safe_theme_markup(root: Path) -> None:
                 '<h5 class="post-tags">Tags: ',
             )
             text = text.replace(
-                "\t\t:admin | :未分类 | :5 | :",
-                "\t\t发布:admin | 分类:未分类 | 评论:5 | 浏览:",
+                "\t\t:admin | :\u672a\u5206\u7c7b | :5 | :",
+                "\t\t\u53d1\u5e03:admin | \u5206\u7c7b:\u672a\u5206\u7c7b | "
+                "\u8bc4\u8bba:5 | \u6d4f\u89c8:",
             )
             text = text.replace(
                 'cmd.asp?act=login">[]</a>',
-                'cmd.asp?act=login">[用户登录]</a>',
+                'cmd.asp?act=login">[\u7528\u6237\u767b\u5f55]</a>',
             ).replace(
                 'cmd.asp?act=vrs">[]</a>',
-                'cmd.asp?act=vrs">[查看权限]</a>',
+                'cmd.asp?act=vrs">[\u67e5\u770b\u6743\u9650]</a>',
             )
             text = text.replace(
                 'type="submit" value="" name="btnPost"',
-                'type="submit" value="提交" name="btnPost"',
+                'type="submit" value="\u63d0\u4ea4" name="btnPost"',
             )
             text = text.replace(
                 '<h4 id="BlogPowerBy">Powered By </h4>',

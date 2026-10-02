@@ -1,7 +1,7 @@
 # Copyright (c) 2026 OpenASP.dev
 # SPDX-License-Identifier: MIT
 
-"""验证 Response.Cookies 成员赋值在原生 VM 和缓存冷热路径下不产生错误。"""
+"""Verify Response.Cookies assignments in both VMs and cache states."""
 
 import os
 from pathlib import Path
@@ -39,7 +39,7 @@ for mode in ("off", "on"):
                 or "status=200" not in metadata
             ):
                 raise SystemExit(
-                    f"失败：Response.Cookies，C_VM={mode}，缓存={cache}\n"
-                    f"预期：{expected}\n实际：{result.stdout}\n{result.stderr}"
+                    f"FAIL: Response.Cookies, C_VM={mode}, cache={cache}\n"
+                    f"expected: {expected}\nactual: {result.stdout}\n{result.stderr}"
                 )
-            print(f"通过：Response.Cookies，C_VM={mode}，缓存={cache}")
+            print(f"PASS: Response.Cookies, C_VM={mode}, cache={cache}")

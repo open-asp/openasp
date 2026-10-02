@@ -1,7 +1,7 @@
 # Copyright (c) 2026 OpenASP.dev
 # SPDX-License-Identifier: MIT
 
-"""验证原生日期解析的年月输入、月份边界、尾随垃圾及完整日期时间。"""
+"""Verify native date parsing, boundaries, trailing data, and full timestamps."""
 import os
 from pathlib import Path
 import subprocess
@@ -22,5 +22,6 @@ for mode in ("off", "on"):
     body, _, metadata = result.stdout.partition("----")
     if result.returncode != 0 or body.strip() != expected or "status=200" not in metadata:
         raise SystemExit(
-            f"失败：日期解析，C_VM={mode}\n预期：{expected}\n实际：{result.stdout}\n{result.stderr}")
-    print(f"通过：日期解析，C_VM={mode}")
+            f"FAIL: date parsing, C_VM={mode}\n"
+            f"expected: {expected}\nactual: {result.stdout}\n{result.stderr}")
+    print(f"PASS: date parsing, C_VM={mode}")

@@ -348,7 +348,7 @@ def main() -> None:
         assert "openasp-cli statement completed sequence=3" in cli_text
         assert "x = 40" not in cli_text
 
-    print("通过：OpenASP 三命令入口集成验证")
+    print("PASS: OpenASP command-surface integration")
 
 
 if __name__ == "__main__":

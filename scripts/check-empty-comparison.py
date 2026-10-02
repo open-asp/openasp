@@ -26,7 +26,7 @@ for mode in ("off", "on"):
     body, _, metadata = result.stdout.partition("----")
     if result.returncode != 0 or body.strip() != expected or "status=200" not in metadata:
         raise SystemExit(
-            f"失败：Empty 比较语义，C_VM={mode}\n"
-            f"预期：{expected}\n实际：{result.stdout}\n{result.stderr}"
+            f"FAIL: Empty comparison semantics, C_VM={mode}\n"
+            f"expected: {expected}\nactual: {result.stdout}\n{result.stderr}"
         )
-    print(f"通过：Empty 比较语义，C_VM={mode}")
+    print(f"PASS: Empty comparison semantics, C_VM={mode}")

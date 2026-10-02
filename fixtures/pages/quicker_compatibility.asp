@@ -9,11 +9,11 @@ Response.Write "date_add=" & Year(DateAdd("yyyy", 1, DateSerial(2024, 2, 29))) &
 Response.Write "date_diff=" & DateDiff("d", DateSerial(2024, 1, 1), DateSerial(2024, 1, 11)) & vbCrLf
 Response.Write "date_part=" & DatePart("q", DateSerial(2024, 8, 1)) & vbCrLf
 Response.Write "date_arithmetic=" & Day(DateSerial(2024, 1, 31) + 1) & vbCrLf
-Response.Write "chars=" & Asc("A") & "," & AscB("Z") & "," & AscW("中") & "," & ChrW(20013) & vbCrLf
+Response.Write "chars=" & Asc("A") & "," & AscB("Z") & "," & AscW(ChrW(20013)) & "," & ChrW(20013) & vbCrLf
 Response.Write "bytes=" & LenB("abc") & "," & MidB("abcdef", 2, 3) & "," & InStrB(1, "abcdef", "cd") & vbCrLf
 Response.Write "types=" & IsArray(sample) & "," & IsDate("2024-02-29") & "," & TypeName(sample) & "," & VarType("x") & vbCrLf
 Response.Write "format=" & FormatNumber(12.345, 2) & "," & Space(2) & "x," & StrComp("ABC", "abc", 1) & vbCrLf
-Response.Write "encode=" & Server.URLEncode("a b&中") & "," & Server.HTMLEncode("<a&""'>") & vbCrLf
+Response.Write "encode=" & Server.URLEncode("a b&" & ChrW(20013)) & "," & Server.HTMLEncode("<a&""'>") & vbCrLf
 
 Dim dynamicValue
 Execute "dynamicValue = 41 + 1"

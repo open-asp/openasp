@@ -62,9 +62,10 @@ def main() -> None:
 
     if violations:
         raise SystemExit(
-            "禁止在源码或生成适配器中引入宿主绝对路径：\n" + "\n".join(violations)
+            "Host-specific absolute paths are forbidden in source and generated adapters:\n"
+            + "\n".join(violations)
         )
-    print("通过：源码和生成适配器未使用宿主绝对路径引入")
+    print("PASS: source and generated adapters contain no host-specific paths")
 
 
 if __name__ == "__main__":

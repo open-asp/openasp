@@ -1,23 +1,27 @@
-# ASP Server 模块
+# ASP Server Module
 
-`asp.server` 只负责服务端进程、FastCGI 协议适配和请求调度。ASP 语言运行时、编译器、VM 与客户端网络组件仍由各自模块负责。
+[Chinese](README.zh-CN.md)
 
-## 文件职责
+`asp.server` owns only server processes, FastCGI protocol adaptation, and
+request dispatch. The ASP language runtime, compiler, VM, and client-side
+network components remain the responsibility of their respective modules.
 
-- `fpm_command.eg`：`openasp-fpm` 参数解析、日志初始化和启动入口。
-- `server_config.eg`：worker 共享的服务端运行状态。
-- `fastcgi_types.eg`：FastCGI 请求、响应和任务 DTO。
-- `fastcgi_codec.eg`：FastCGI record 收发、参数解码和结束帧编码。
-- `request_mapper.eg`：将 FastCGI 参数映射为 ASP `RequestContext`。
-- `response_encoder.eg`：HTML 前缀、meta charset、响应头和正文编码处理。
-- `response_cache.eg`：可选的短期 HTML 响应缓存。
-- `request_lifecycle.eg`：单次请求的上下文创建、渲染、提交和响应所有权转移。
-- `fastcgi_connection.eg`：连接读取、内存配额、GC quiescent 区间和响应发送。
-- `worker.eg`：连接任务并发、worker GC 配置和回收。
-- `master.eg`：监听、AOT 准备、worker fork、监控和重启。
-- `fastcgi_server.eg`：提供 TCP 与 Unix socket 启动 API 的兼容 facade。
+## File Responsibilities
 
-## 依赖方向
+- `fpm_command.eg`: `openasp-fpm` argument parsing, log initialization, and startup entry point.
+- `server_config.eg`: Server runtime state shared by workers.
+- `fastcgi_types.eg`: FastCGI request, response, and task DTOs.
+- `fastcgi_codec.eg`: FastCGI record I/O, parameter decoding, and terminal-record encoding.
+- `request_mapper.eg`: Maps FastCGI parameters to an ASP `RequestContext`.
+- `response_encoder.eg`: Handles the HTML prefix, meta charset, response headers, and body encoding.
+- `response_cache.eg`: Optional short-lived HTML response cache.
+- `request_lifecycle.eg`: Creates, renders, commits, and transfers response ownership for one request.
+- `fastcgi_connection.eg`: Connection reads, memory quotas, GC quiescent regions, and response sends.
+- `worker.eg`: Concurrent connection tasks, worker GC configuration, and recycling.
+- `master.eg`: Listening, AOT preparation, worker forks, monitoring, and restarts.
+- `fastcgi_server.eg`: Compatibility facade for TCP and Unix socket startup APIs.
+
+## Dependency Direction
 
 ```text
 cmd/openasp_fpm
@@ -29,17 +33,19 @@ cmd/openasp_fpm
         -> aio.unix.socket
 ```
 
-根模块 `asp` 不得反向 import `asp.server`。`openasp` 和 `openasp-cli` 不应链接 FastCGI server 符号。
+The root `asp` module must not import `asp.server`. Neither `openasp` nor
+`openasp-cli` should link FastCGI server symbols.
 
-## 生命周期约束
+## Lifecycle Constraints
 
-连接处理中的以下顺序不可调整：
+Connection handling must preserve this order:
 
-1. 获取请求内存配额并保存 GC threshold。
-2. 提高 threshold，进入 GC quiescent 区间。
-3. 渲染响应并同步发送 FastCGI header record。
-4. 离开 request string arena 和 quiescent 区间，恢复 threshold。
-5. 异步发送 body，清理 response owner，释放内存配额。
-6. 发送 STDOUT 结束帧和 END_REQUEST。
+1. Acquire the request memory quota and save the GC threshold.
+2. Raise the threshold and enter the GC quiescent region.
+3. Render the response and synchronously send the FastCGI header record.
+4. Leave the request string arena and quiescent region, then restore the threshold.
+5. Send the body asynchronously, release the response owner, and return the memory quota.
+6. Send the terminal STDOUT record and `END_REQUEST`.
 
-缓存写入必须在 response owner 的 request string arena 中复制并提升字符串，禁止缓存 `StringView` 或 arena 临时字符串。
+Cache writes must copy and promote strings within the response owner's request
+string arena. Never cache a `StringView` or a temporary arena string.

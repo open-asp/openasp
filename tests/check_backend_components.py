@@ -377,7 +377,7 @@ def main() -> None:
         memcache.server_close()
         memcache_thread.join(timeout=2)
 
-    print("通过：OpenASP 后端组件、HTTPS、WebSocket 与 Memcache 专项验证")
+    print("PASS: OpenASP backend components, HTTPS, WebSocket, and Memcache")
 
 
 if __name__ == "__main__":

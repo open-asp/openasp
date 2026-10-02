@@ -1,7 +1,7 @@
 # Copyright (c) 2026 OpenASP.dev
 # SPDX-License-Identifier: MIT
 
-"""验证对象条件与只读属性 ByRef 语义在冷、热字节码中一致。"""
+"""Verify object conditions and read-only ByRef properties on cold and warm bytecode."""
 import os
 from pathlib import Path
 import subprocess
@@ -22,8 +22,8 @@ for mode in ("off", "on"):
                 capture_output=True, text=True, timeout=15)
             body, _, metadata = run.stdout.partition("----")
             if run.returncode != 0 or body.strip() != expected or "status=200" not in metadata:
-                raise SystemExit(f"失败：C_VM={mode}，缓存={cache}\n{run.stdout}\n{run.stderr}")
-            print(f"通过：缺失对象条件，C_VM={mode}，缓存={cache}")
+                raise SystemExit(f"FAIL: missing object condition, C_VM={mode}, cache={cache}\n{run.stdout}\n{run.stderr}")
+            print(f"PASS: missing object condition, C_VM={mode}, cache={cache}")
             readonly = subprocess.run(
                 [str(binary), "render", "--file",
                  str(root / "fixtures/pages/class_readonly_property_byref.asp"),
@@ -33,7 +33,7 @@ for mode in ("off", "on"):
             readonly_body, _, readonly_metadata = readonly.stdout.partition("----")
             if readonly.returncode != 0 or readonly_body.strip() != "stable|0|stable" or "status=200" not in readonly_metadata:
                 raise SystemExit(
-                    f"失败：只读属性 ByRef，C_VM={mode}，缓存={cache}\n"
+                    f"FAIL: read-only property ByRef, C_VM={mode}, cache={cache}\n"
                     f"{readonly.stdout}\n{readonly.stderr}"
                 )
-            print(f"通过：只读属性 ByRef，C_VM={mode}，缓存={cache}")
+            print(f"PASS: read-only property ByRef, C_VM={mode}, cache={cache}")
