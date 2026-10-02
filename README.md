@@ -30,7 +30,7 @@ OpenASP removes that platform lock-in, allowing existing VBScript and ASP
 applications to run natively on **Linux, Unix, and MacOS** without requiring
 Windows or IIS.
 
-OpenASP combines an Egret-based language frontend with a native C runtime,
+OpenASP combines an [Egret-based language](https://egret-lang.org) frontend with a native C runtime,
 FastCGI serving, ADO-compatible data access, bytecode execution, and AOT mmap
 loading. Compatibility and performance work stays inside the engine, so
 application code does not need platform-specific workarounds.

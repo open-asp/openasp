@@ -27,7 +27,7 @@
 
 传统 Classic ASP 应用长期依赖 **Windows Server 和 IIS** 才能运行。OpenASP 打破了这一平台限制，让现有 VBScript 与 ASP 应用无需 Windows 和 IIS，也能原生运行在 **Linux、Unix 和 MacOS** 上。
 
-OpenASP 由 Egret 语言前端和原生 C 运行时组成，内置 FastCGI 服务、ADO 兼容数据访问、字节码执行与 AOT mmap 加载。兼容性、性能优化和系统适配全部在引擎层完成，不要求业务 ASP 编写平台专用的变通逻辑。
+OpenASP 由 [Egret 语言](https://egret-lang.org)前端和原生 C 运行时组成，内置 FastCGI 服务、ADO 兼容数据访问、字节码执行与 AOT mmap 加载。兼容性、性能优化和系统适配全部在引擎层完成，不要求业务 ASP 编写平台专用的变通逻辑。
 
 可以直接[安装二进制发行包](#通过二进制安装包安装)，也可以
 [从源码构建](#从源码构建)。安装后从[第一个 ASP 页面](#hello-world)开始，
