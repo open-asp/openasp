@@ -10,3 +10,4 @@ release/
 Dockerfile.linux-x64
 make-release.sh
 Makefile
+**/.DS_Store
