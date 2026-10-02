@@ -1,0 +1,450 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.object;
+
+use asp;
+use asp.runtime;
+use asp.vm;
+
+use collections;
+use net.tcp;
+use net.udp;
+use net.unix.socket;
+use std;
+use strconv;
+use strings;
+
+// Socket components store protocol/mode/timeout metadata in RuntimeObject while
+// ObjectSpace owns the native descriptor. Taking and returning the connection
+// around each operation prevents duplicate close and concurrent use.
+func socket_protocol_name(value: String) -> String {
+    let name: String = strings.to_lower_ascii(strings.trim_space(value));
+    if name == "" || name == "tcp" || name == "stream" {
+        return "tcp";
+    }
+    if name == "udp" || name == "datagram" {
+        return "udp";
+    }
+    if name == "unix" || name == "local" || name == "unixstream" {
+        return "unix";
+    }
+    return "";
+}
+
+func socket_type_number(protocol: String) -> Int {
+    if protocol == "tcp" {
+        return 1;
+    }
+    if protocol == "udp" {
+        return 2;
+    }
+    if protocol == "unix" {
+        return 3;
+    }
+    return 0;
+}
+
+func socket_timeout(obj: asp.vm.RuntimeObject) -> Int {
+    return obj.cursor > 0 ? obj.cursor : -1;
+}
+
+func socket_raise_io_error(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj: asp.vm.RuntimeObject, operation: String, err: ErrCode) -> Void {
+    evaluator.raise_runtime_error(ctx, 10000 + (err => Int), operation + " failed with socket error " + strconv.itoa(err => Int), obj.prog_id);
+}
+
+func socket_require_arguments(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj: asp.vm.RuntimeObject, member: String, actual: Int, minimum: Int) -> Bool {
+    if actual >= minimum {
+        return true;
+    }
+    evaluator.raise_runtime_error(ctx, 450, member + " requires at least " + strconv.itoa(minimum) + " argument(s)", obj.prog_id);
+    return false;
+}
+
+func socket_require_open(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject, member: String) -> Bool {
+    if obj.opened && ctx.objects.has_socket(obj_id) {
+        return true;
+    }
+    evaluator.raise_runtime_error(ctx, 91, member + " requires an open socket", obj.prog_id);
+    return false;
+}
+
+// Publish a successfully created descriptor and its normalized metadata as one
+// state transition. Callers retain ownership of failed descriptors.
+func socket_attach(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject, fd: Int, protocol: String, mode: String) -> Void {
+    ctx.objects.put_socket(obj_id, fd, socket_type_number(protocol));
+    obj.class_name = protocol;
+    obj.secondary_text = mode;
+    obj.opened = true;
+    evaluator.set_object(ctx, obj_id, obj);
+}
+
+func socket_connect(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject, values: collections.Vector<asp.runtime.Variant>, start: Int = 0) -> asp.runtime.Variant {
+    let protocol: String = socket_protocol_name(obj.class_name);
+    if protocol == "" {
+        evaluator.raise_runtime_error(ctx, 5, "unsupported socket protocol: " + obj.class_name, obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    if values.len() > start {
+        obj.text_value = values.get(start).to_output_string();
+    }
+    if protocol == "unix" {
+        if std.len(obj.text_value) == 0 {
+            evaluator.raise_runtime_error(ctx, 5, "Unix socket path is required", obj.prog_id);
+            return asp.runtime.variant_empty();
+        }
+        if values.len() > start + 1 {
+            obj.cursor = asp.variant_to_int(values.get(start + 1));
+        }
+        let fd, err = net.unix.socket.connect(obj.text_value, socket_timeout(obj));
+        if err != std.OK {
+            socket_raise_io_error(evaluator, ctx, obj, "Connect", err);
+            return asp.runtime.variant_empty();
+        }
+        socket_attach(evaluator, ctx, obj_id, obj, fd, protocol, "connected");
+        return asp.runtime.variant_empty();
+    }
+    if values.len() > start + 1 {
+        obj.int_value = asp.variant_to_int(values.get(start + 1));
+    }
+    if std.len(obj.text_value) == 0 || obj.int_value <= 0 {
+        evaluator.raise_runtime_error(ctx, 5, "host and port are required", obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    if values.len() > start + 2 {
+        obj.cursor = asp.variant_to_int(values.get(start + 2));
+    }
+    if protocol == "tcp" {
+        let fd, err = net.tcp.connect(obj.text_value, obj.int_value, socket_timeout(obj));
+        if err != std.OK {
+            socket_raise_io_error(evaluator, ctx, obj, "Connect", err);
+            return asp.runtime.variant_empty();
+        }
+        socket_attach(evaluator, ctx, obj_id, obj, fd, protocol, "connected");
+    } else {
+        let fd, err = net.udp.connect(obj.text_value, obj.int_value, socket_timeout(obj));
+        if err != std.OK {
+            socket_raise_io_error(evaluator, ctx, obj, "Connect", err);
+            return asp.runtime.variant_empty();
+        }
+        socket_attach(evaluator, ctx, obj_id, obj, fd, protocol, "connected");
+    }
+    return asp.runtime.variant_empty();
+}
+
+func socket_open(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject, values: collections.Vector<asp.runtime.Variant>) -> asp.runtime.Variant {
+    let start: Int = 0;
+    if values.len() > 0 {
+        let requested: String = socket_protocol_name(values.get(0).to_output_string());
+        if requested != "" {
+            obj.class_name = requested;
+            start = 1;
+        }
+    }
+    return socket_connect(evaluator, ctx, obj_id, obj, values, start);
+}
+
+func socket_bind(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject, values: collections.Vector<asp.runtime.Variant>) -> asp.runtime.Variant {
+    if !socket_require_arguments(evaluator, ctx, obj, "Bind", values.len(), 2) {
+        return asp.runtime.variant_empty();
+    }
+    obj.class_name = "udp";
+    obj.text_value = values.get(0).to_output_string();
+    obj.int_value = asp.variant_to_int(values.get(1));
+    let fd, err = net.udp.bind(obj.text_value, obj.int_value);
+    if err != std.OK {
+        socket_raise_io_error(evaluator, ctx, obj, "Bind", err);
+        return asp.runtime.variant_empty();
+    }
+    let port, port_err = net.udp.sock_port(fd);
+    if port_err == std.OK {
+        obj.int_value = port;
+    }
+    socket_attach(evaluator, ctx, obj_id, obj, fd, "udp", "bound");
+    return asp.runtime.variant_empty();
+}
+
+func socket_listen(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject, values: collections.Vector<asp.runtime.Variant>) -> asp.runtime.Variant {
+    let protocol: String = socket_protocol_name(obj.class_name);
+    if protocol == "udp" {
+        evaluator.raise_runtime_error(ctx, 5, "Listen is not valid for UDP sockets; use Bind", obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    if values.len() > 0 {
+        obj.text_value = values.get(0).to_output_string();
+    }
+    if protocol == "unix" {
+        if std.len(obj.text_value) == 0 {
+            evaluator.raise_runtime_error(ctx, 5, "Unix socket path is required", obj.prog_id);
+            return asp.runtime.variant_empty();
+        }
+        let backlog: Int = values.len() > 1 ? asp.variant_to_int(values.get(1)) : 128;
+        let fd, err = net.unix.socket.listen(obj.text_value, backlog > 0 ? backlog : 128);
+        if err != std.OK {
+            socket_raise_io_error(evaluator, ctx, obj, "Listen", err);
+            return asp.runtime.variant_empty();
+        }
+        socket_attach(evaluator, ctx, obj_id, obj, fd, "unix", "listening");
+        return asp.runtime.variant_empty();
+    }
+    if values.len() > 1 {
+        obj.int_value = asp.variant_to_int(values.get(1));
+    }
+    if std.len(obj.text_value) == 0 {
+        obj.text_value = "0.0.0.0";
+    }
+    if obj.int_value < 0 {
+        evaluator.raise_runtime_error(ctx, 5, "invalid listen port", obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    let backlog: Int = values.len() > 2 ? asp.variant_to_int(values.get(2)) : 128;
+    let fd, err = net.tcp.listen(obj.text_value, obj.int_value, backlog > 0 ? backlog : 128);
+    if err != std.OK {
+        socket_raise_io_error(evaluator, ctx, obj, "Listen", err);
+        return asp.runtime.variant_empty();
+    }
+    let port, port_err = net.tcp.sock_port(fd);
+    if port_err == std.OK {
+        obj.int_value = port;
+    }
+    socket_attach(evaluator, ctx, obj_id, obj, fd, "tcp", "listening");
+    return asp.runtime.variant_empty();
+}
+
+// Accept creates a distinct component object and transfers the returned fd to
+// that object's ObjectSpace slot; the listening object remains unchanged.
+func socket_accept(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject, values: collections.Vector<asp.runtime.Variant>) -> asp.runtime.Variant {
+    if !socket_require_open(evaluator, ctx, obj_id, obj, "Accept") {
+        return asp.runtime.variant_nothing();
+    }
+    if obj.secondary_text != "listening" {
+        evaluator.raise_runtime_error(ctx, 5, "Accept requires a listening socket", obj.prog_id);
+        return asp.runtime.variant_nothing();
+    }
+    let timeout_ms: Int = values.len() > 0 ? asp.variant_to_int(values.get(0)) : socket_timeout(obj);
+    let fd: Int = -1;
+    let err: ErrCode = std.OK;
+    if obj.class_name == "tcp" {
+        fd, err = net.tcp.accept(ctx.objects.socket_fd(obj_id), timeout_ms > 0 ? timeout_ms : -1);
+    } else if obj.class_name == "unix" {
+        fd, err = net.unix.socket.accept(ctx.objects.socket_fd(obj_id), timeout_ms > 0 ? timeout_ms : -1);
+    } else {
+        evaluator.raise_runtime_error(ctx, 5, "Accept is only valid for TCP and Unix sockets", obj.prog_id);
+        return asp.runtime.variant_nothing();
+    }
+    if err != std.OK {
+        socket_raise_io_error(evaluator, ctx, obj, "Accept", err);
+        return asp.runtime.variant_nothing();
+    }
+    let child_id: Int = ctx.objects.create_component("OpenASP.Socket");
+    let child: asp.vm.RuntimeObject = ctx.objects.get(child_id);
+    child.class_name = obj.class_name;
+    child.text_value = obj.text_value;
+    child.int_value = obj.int_value;
+    child.cursor = obj.cursor;
+    socket_attach(evaluator, ctx, child_id, child, fd, obj.class_name, "connected");
+    return asp.runtime.variant_object(child_id);
+}
+
+func socket_send(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject, data: String) -> asp.runtime.Variant {
+    if !socket_require_open(evaluator, ctx, obj_id, obj, "Send") {
+        return asp.runtime.variant_int(0);
+    }
+    let fd: Int = ctx.objects.socket_fd(obj_id);
+    let sent: Int = 0;
+    let err: ErrCode = std.OK;
+    if obj.class_name == "tcp" {
+        sent, err = net.tcp.send(fd, data, socket_timeout(obj));
+    } else if obj.class_name == "udp" {
+        sent, err = net.udp.send(fd, data, socket_timeout(obj));
+    } else {
+        sent, err = net.unix.socket.send(fd, data, socket_timeout(obj));
+    }
+    if err != std.OK {
+        socket_raise_io_error(evaluator, ctx, obj, "Send", err);
+        return asp.runtime.variant_int(0);
+    }
+    return asp.runtime.variant_int(sent);
+}
+
+func socket_receive(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject, max_bytes: Int) -> asp.runtime.Variant {
+    if !socket_require_open(evaluator, ctx, obj_id, obj, "Receive") {
+        return asp.runtime.variant_string("");
+    }
+    let fd: Int = ctx.objects.socket_fd(obj_id);
+    let data: String = "";
+    let err: ErrCode = std.OK;
+    if obj.class_name == "tcp" {
+        data, err = net.tcp.recv(fd, max_bytes, socket_timeout(obj));
+    } else if obj.class_name == "udp" {
+        data, err = net.udp.recv(fd, max_bytes, socket_timeout(obj));
+    } else {
+        data, err = net.unix.socket.recv(fd, max_bytes, socket_timeout(obj));
+    }
+    if err != std.OK {
+        socket_raise_io_error(evaluator, ctx, obj, "Receive", err);
+        return asp.runtime.variant_string("");
+    }
+    return asp.runtime.variant_string(data);
+}
+
+func socket_send_to(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject, values: collections.Vector<asp.runtime.Variant>) -> asp.runtime.Variant {
+    if !socket_require_arguments(evaluator, ctx, obj, "SendTo", values.len(), 3) || !socket_require_open(evaluator, ctx, obj_id, obj, "SendTo") {
+        return asp.runtime.variant_int(0);
+    }
+    if obj.class_name != "udp" {
+        evaluator.raise_runtime_error(ctx, 5, "SendTo is only valid for UDP sockets", obj.prog_id);
+        return asp.runtime.variant_int(0);
+    }
+    let host: String = "";
+    let port: Int = 0;
+    let data: String = "";
+    if asp.variant_is_numeric(values.get(1)) {
+        host = values.get(0).to_output_string();
+        port = asp.variant_to_int(values.get(1));
+        data = values.get(2).to_output_string();
+    } else {
+        data = values.get(0).to_output_string();
+        host = values.get(1).to_output_string();
+        port = asp.variant_to_int(values.get(2));
+    }
+    let sent, err = net.udp.send_to(ctx.objects.socket_fd(obj_id), host, port, data, socket_timeout(obj));
+    if err != std.OK {
+        socket_raise_io_error(evaluator, ctx, obj, "SendTo", err);
+        return asp.runtime.variant_int(0);
+    }
+    return asp.runtime.variant_int(sent);
+}
+
+func socket_receive_from(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject, max_bytes: Int) -> asp.runtime.Variant {
+    if !socket_require_open(evaluator, ctx, obj_id, obj, "ReceiveFrom") {
+        return asp.runtime.variant_empty();
+    }
+    if obj.class_name != "udp" {
+        evaluator.raise_runtime_error(ctx, 5, "ReceiveFrom is only valid for UDP sockets", obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    let packet, err = net.udp.recv_from_packet(ctx.objects.socket_fd(obj_id), max_bytes, socket_timeout(obj));
+    if err != std.OK {
+        socket_raise_io_error(evaluator, ctx, obj, "ReceiveFrom", err);
+        return asp.runtime.variant_empty();
+    }
+    obj.auxiliary_text = packet.peer_host;
+    obj.auxiliary_int = packet.peer_port;
+    evaluator.set_object(ctx, obj_id, obj);
+    let result: collections.Vector<asp.runtime.Variant> = new collections.Vector<asp.runtime.Variant>();
+    _ = result.push(asp.runtime.variant_string(packet.data));
+    _ = result.push(asp.runtime.variant_string(packet.peer_host));
+    _ = result.push(asp.runtime.variant_int(packet.peer_port));
+    return asp.runtime.variant_array(result);
+}
+
+// Validate mode, arity, and open state before dispatching TCP/UDP operations.
+// Network errors are surfaced through Err and never represented as valid data.
+func invoke_socket(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    let name: String = strings.to_lower_ascii(member);
+    if name == "open" {
+        return socket_open(evaluator, ctx, obj_id, obj, values);
+    }
+    if name == "connect" {
+        return socket_connect(evaluator, ctx, obj_id, obj, values);
+    }
+    if name == "bind" {
+        return socket_bind(evaluator, ctx, obj_id, obj, values);
+    }
+    if name == "listen" {
+        return socket_listen(evaluator, ctx, obj_id, obj, values);
+    }
+    if name == "accept" {
+        return socket_accept(evaluator, ctx, obj_id, obj, values);
+    }
+    if name == "close" {
+        ctx.objects.close_socket(obj_id);
+        obj.opened = false;
+        obj.secondary_text = "closed";
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if name == "write" || name == "send" {
+        if !socket_require_arguments(evaluator, ctx, obj, member, values.len(), 1) {
+            return asp.runtime.variant_int(0);
+        }
+        return socket_send(evaluator, ctx, obj_id, obj, values.get(0).to_output_string());
+    }
+    if name == "read" || name == "receive" || name == "recv" {
+        let max_bytes: Int = values.len() > 0 ? asp.variant_to_int(values.get(0)) : 65536;
+        return socket_receive(evaluator, ctx, obj_id, obj, max_bytes > 0 ? max_bytes : 65536);
+    }
+    if name == "sendto" {
+        return socket_send_to(evaluator, ctx, obj_id, obj, values);
+    }
+    if name == "receivefrom" || name == "recvfrom" {
+        let max_bytes: Int = values.len() > 0 ? asp.variant_to_int(values.get(0)) : 65536;
+        return socket_receive_from(evaluator, ctx, obj_id, obj, max_bytes > 0 ? max_bytes : 65536);
+    }
+    if name == "protocol" || name == "sockettype" || name == "type" {
+        if is_set && values.len() > 0 {
+            let protocol: String = socket_protocol_name(values.get(values.len() - 1).to_output_string());
+            if protocol == "" {
+                evaluator.raise_runtime_error(ctx, 5, "unsupported socket protocol", obj.prog_id);
+                return asp.runtime.variant_empty();
+            }
+            if obj.opened {
+                evaluator.raise_runtime_error(ctx, 5, "cannot change protocol while socket is open", obj.prog_id);
+                return asp.runtime.variant_empty();
+            }
+            obj.class_name = protocol;
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_string(socket_protocol_name(obj.class_name));
+    }
+    if name == "host" || name == "address" || name == "path" {
+        if is_set && values.len() > 0 {
+            obj.text_value = values.get(values.len() - 1).to_output_string();
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_string(obj.text_value);
+    }
+    if name == "port" || name == "localport" || name == "remoteport" {
+        if is_set && values.len() > 0 {
+            obj.int_value = asp.variant_to_int(values.get(values.len() - 1));
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        if name == "remoteport" && obj.auxiliary_int > 0 {
+            return asp.runtime.variant_int(obj.auxiliary_int);
+        }
+        return asp.runtime.variant_int(obj.int_value);
+    }
+    if name == "timeout" {
+        if is_set && values.len() > 0 {
+            obj.cursor = asp.variant_to_int(values.get(values.len() - 1));
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_int(obj.cursor);
+    }
+    if name == "state" {
+        if !obj.opened || !ctx.objects.has_socket(obj_id) {
+            return asp.runtime.variant_int(0);
+        }
+        if obj.secondary_text == "listening" {
+            return asp.runtime.variant_int(3);
+        }
+        if obj.secondary_text == "bound" {
+            return asp.runtime.variant_int(2);
+        }
+        return asp.runtime.variant_int(1);
+    }
+    if name == "localaddress" {
+        return asp.runtime.variant_string(obj.secondary_text == "connected" ? "" : obj.text_value);
+    }
+    if name == "remoteaddress" || name == "lastpeeraddress" {
+        return asp.runtime.variant_string(std.len(obj.auxiliary_text) > 0 ? obj.auxiliary_text : (obj.secondary_text == "connected" ? obj.text_value : ""));
+    }
+    evaluator.raise_runtime_error(ctx, 438, "socket member not found: " + member, obj.prog_id);
+    return asp.runtime.variant_empty();
+}

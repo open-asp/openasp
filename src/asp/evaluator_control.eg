@@ -1,0 +1,634 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp;
+
+use asp.object.database;
+use asp.runtime;
+use asp.compiler;
+use asp.vm;
+
+use std;
+use fs;
+use path;
+use strings;
+use strconv;
+use collections;
+use os;
+use os.process;
+use time;
+
+extern func eg_asp_vm_member_select(arena_handle: Int, member_id: Int, object_kind: Int, candidate_id: Int, argument_count: Int, member_flags: Int) -> Int;
+extern func __gc_is_enabled() -> Int;
+extern func eg_gc_preempt_guard_enter() -> Void;
+extern func eg_gc_preempt_guard_leave() -> Void;
+
+// Materialize VBScript's inclusive upper bounds as nested Variant arrays.
+// Preserve copies overlapping leaves from the previous shape; callers validate
+// the ReDim Preserve dimensional restrictions before reaching this helper.
+func evaluator_control_build_array(bounds: collections.Vector<Int>, dimension: Int, previous: asp.runtime.Variant = (asp.runtime.variant_empty()), preserve: Bool = false) -> asp.runtime.Variant {
+    let items: collections.Vector<asp.runtime.Variant> = new collections.Vector<asp.runtime.Variant>();
+    if dimension < 0 || dimension >= bounds.len() {
+        return asp.runtime.variant_array(items);
+    }
+    let upper: Int = bounds.get(dimension);
+    let i: Int = 0;
+    loop i <= upper {
+        if dimension + 1 < bounds.len() {
+            let previous_child: asp.runtime.Variant = preserve && previous.kind == asp.runtime.VariantArray && i < previous.array_data.items.len() ? previous.array_data.items.get(i) : asp.runtime.variant_empty();
+            let child: asp.runtime.Variant = evaluator_control_build_array(bounds, dimension + 1, previous_child, preserve);
+            _ = items.push(child);
+        } else if preserve && previous.kind == asp.runtime.VariantArray && i < previous.array_data.items.len() {
+            let previous_item: asp.runtime.Variant = previous.array_data.items.get(i);
+            _ = items.push(previous_item);
+        } else {
+            let empty_item: asp.runtime.Variant = asp.runtime.variant_empty();
+            _ = items.push(empty_item);
+        }
+        i += 1;
+    }
+    return asp.runtime.variant_array(items);
+}
+
+// Execute statement-position calls while arguments are still AST ids. Host
+// operations are handled directly so Response.End/Redirect can unwind without
+// manufacturing a value; all other calls use the normal expression dispatcher.
+func evaluator_control_execute_call_stmt(evaluator: Evaluator, program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, scope: asp.vm.Scope, name: String, arg_ids: collections.Vector<Int>) -> Int {
+    if strings.equal_fold_ascii(name, "Response.Write") && arg_ids.len() >= 1 {
+        _ = ctx.response.write(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string());
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Response.BinaryWrite") && arg_ids.len() >= 1 {
+        let binary_value: asp.runtime.Variant = evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0));
+        let binary_text: String = binary_value.to_output_string();
+        _ = ctx.response.binary_write(binary_text);
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Response.Clear") {
+        _ = ctx.response.clear();
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Response.Flush") {
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Response.End") {
+        _ = ctx.response.end();
+        return 1;
+    }
+    if strings.equal_fold_ascii(name, "Response.Redirect") && arg_ids.len() >= 1 {
+        _ = ctx.response.redirect(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string());
+        return 1;
+    }
+    if strings.equal_fold_ascii(name, "Response.AddHeader") && arg_ids.len() >= 2 {
+        _ = ctx.response.add_header(
+        evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string(),
+        evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(1)).to_output_string()
+        );
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "__AspWriteLiteralHex") && arg_ids.len() >= 1 {
+        _ = ctx.response.write(asp.runtime.hex_decode_string(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string()));
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "__AspWriteExpr") && arg_ids.len() >= 1 {
+        _ = ctx.response.write(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string());
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Err.Clear") {
+        _ = ctx.error_state.clear();
+        return 0;
+    }
+    if strings.equal_fold_ascii(name, "Session.Abandon") {
+        ctx.session_abandoned = true;
+        ctx.session_dirty = true;
+        _ = ctx.session.clear();
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Session.Contents.Remove") && arg_ids.len() >= 1 {
+        _ = ctx.session.delete(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string());
+        ctx.session_dirty = true;
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Session.Contents.RemoveAll") {
+        _ = ctx.session.clear();
+        ctx.session_dirty = true;
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Application.Contents.Remove") && arg_ids.len() >= 1 {
+        _ = ctx.application.delete(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string());
+        ctx.application_dirty = true;
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Application.Contents.RemoveAll") {
+        _ = ctx.application.clear();
+        ctx.application_dirty = true;
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Application.Lock") {
+        if ctx.application_lock_depth == 0 {
+            if __gc_is_enabled() != 0 {
+                eg_gc_preempt_guard_enter();
+            }
+            _ = evaluator.engine.app.lock_mu.lock();
+            ctx.application_process_lock = asp.runtime.application_state_lock(
+                evaluator.engine.paths.application_file + ".lock"
+            );
+            if ctx.application_process_lock < 0 {
+                _ = evaluator.engine.app.lock_mu.unlock();
+                if __gc_is_enabled() != 0 {
+                    eg_gc_preempt_guard_leave();
+                }
+                evaluator.raise_runtime_error(ctx, 70, "cannot lock application state", "Application");
+                return evaluator.finish_statement(ctx);
+            }
+            ctx.application_locked = true;
+            ctx.application = evaluator.engine.load_application_store(ctx.objects);
+        }
+        ctx.application_lock_depth += 1;
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Application.Unlock") {
+        if ctx.application_lock_depth > 0 {
+            ctx.application_lock_depth -= 1;
+        }
+        if ctx.application_locked && ctx.application_lock_depth == 0 {
+            if ctx.application_dirty {
+                let _ = asp.runtime.save_store_file(evaluator.engine.paths.application_file, ctx.application, ctx.objects);
+                evaluator.engine.app.snapshot_from(ctx.application, evaluator.engine.paths.application_file);
+            }
+            ctx.application_dirty = false;
+            asp.runtime.application_state_unlock(ctx.application_process_lock);
+            ctx.application_process_lock = -1;
+            _ = evaluator.engine.app.lock_mu.unlock();
+            ctx.application_locked = false;
+            if __gc_is_enabled() != 0 {
+                eg_gc_preempt_guard_leave();
+            }
+        }
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Server.Execute") && arg_ids.len() >= 1 {
+        let target: String = evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string();
+        _ = evaluator.engine.render_page_into_context(ctx, target);
+        return ctx.response.ended ? 1 : evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Server.Transfer") && arg_ids.len() >= 1 {
+        let target: String = evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string();
+        _ = ctx.response.clear();
+        _ = evaluator.engine.render_page_into_context(ctx, target);
+        _ = ctx.response.end();
+        return 1;
+    }
+    let _ = evaluator.eval_call(program, ctx, scope, name, arg_ids);
+    return evaluator.finish_statement(ctx);
+}
+
+// Value-based twin of execute_call_stmt for the native VM. Keep this behavior
+// aligned with the AST-id path; arg_expr_ids exists only for ByRef copyback.
+func evaluator_control_execute_call_stmt_values(evaluator: Evaluator, program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, scope: asp.vm.Scope, name: String, values: collections.Vector<asp.runtime.Variant>, arg_expr_ids: collections.Vector<Int> = (new collections.Vector<Int>())) -> Int {
+    if strings.equal_fold_ascii(name, "Response.Write") && values.len() >= 1 {
+        let text: String = values.get(0).to_output_string();
+        _ = ctx.response.write(text);
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Response.BinaryWrite") && values.len() >= 1 {
+        let binary_value: asp.runtime.Variant = values.get(0);
+        let binary_text: String = binary_value.to_output_string();
+        _ = ctx.response.binary_write(binary_text);
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Response.Clear") {
+        _ = ctx.response.clear();
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Response.Flush") {
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Response.End") {
+        _ = ctx.response.end();
+        return 1;
+    }
+    if strings.equal_fold_ascii(name, "Response.Redirect") && values.len() >= 1 {
+        _ = ctx.response.redirect(values.get(0).to_output_string());
+        return 1;
+    }
+    if strings.equal_fold_ascii(name, "Response.AddHeader") && values.len() >= 2 {
+        _ = ctx.response.add_header(values.get(0).to_output_string(), values.get(1).to_output_string());
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "__AspWriteLiteralHex") && values.len() >= 1 {
+        _ = ctx.response.write(asp.runtime.hex_decode_string(values.get(0).to_output_string()));
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "__AspWriteExpr") && values.len() >= 1 {
+        _ = ctx.response.write(values.get(0).to_output_string());
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Err.Clear") {
+        _ = ctx.error_state.clear();
+        return 0;
+    }
+    if strings.equal_fold_ascii(name, "Session.Abandon") {
+        ctx.session_abandoned = true;
+        ctx.session_dirty = true;
+        _ = ctx.session.clear();
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Session.Contents.Remove") && values.len() >= 1 {
+        _ = ctx.session.delete(values.get(0).to_output_string());
+        ctx.session_dirty = true;
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Session.Contents.RemoveAll") {
+        _ = ctx.session.clear();
+        ctx.session_dirty = true;
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Application.Contents.Remove") && values.len() >= 1 {
+        _ = ctx.application.delete(values.get(0).to_output_string());
+        ctx.application_dirty = true;
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Application.Contents.RemoveAll") {
+        _ = ctx.application.clear();
+        ctx.application_dirty = true;
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Application.Lock") {
+        if ctx.application_lock_depth == 0 {
+            if __gc_is_enabled() != 0 {
+                eg_gc_preempt_guard_enter();
+            }
+            _ = evaluator.engine.app.lock_mu.lock();
+            ctx.application_process_lock = asp.runtime.application_state_lock(
+                evaluator.engine.paths.application_file + ".lock"
+            );
+            if ctx.application_process_lock < 0 {
+                _ = evaluator.engine.app.lock_mu.unlock();
+                if __gc_is_enabled() != 0 {
+                    eg_gc_preempt_guard_leave();
+                }
+                evaluator.raise_runtime_error(ctx, 70, "cannot lock application state", "Application");
+                return evaluator.finish_statement(ctx);
+            }
+            ctx.application_locked = true;
+            ctx.application = evaluator.engine.load_application_store(ctx.objects);
+        }
+        ctx.application_lock_depth += 1;
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Application.Unlock") {
+        if ctx.application_lock_depth > 0 {
+            ctx.application_lock_depth -= 1;
+        }
+        if ctx.application_locked && ctx.application_lock_depth == 0 {
+            if ctx.application_dirty {
+                let _ = asp.runtime.save_store_file(evaluator.engine.paths.application_file, ctx.application, ctx.objects);
+                evaluator.engine.app.snapshot_from(ctx.application, evaluator.engine.paths.application_file);
+            }
+            ctx.application_dirty = false;
+            asp.runtime.application_state_unlock(ctx.application_process_lock);
+            ctx.application_process_lock = -1;
+            _ = evaluator.engine.app.lock_mu.unlock();
+            ctx.application_locked = false;
+            if __gc_is_enabled() != 0 {
+                eg_gc_preempt_guard_leave();
+            }
+        }
+        return evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Server.Execute") && values.len() >= 1 {
+        _ = evaluator.engine.render_page_into_context(ctx, values.get(0).to_output_string());
+        return ctx.response.ended ? 1 : evaluator.finish_statement(ctx);
+    }
+    if strings.equal_fold_ascii(name, "Server.Transfer") && values.len() >= 1 {
+        _ = ctx.response.clear();
+        _ = evaluator.engine.render_page_into_context(ctx, values.get(0).to_output_string());
+        _ = ctx.response.end();
+        return 1;
+    }
+    _ = evaluator.eval_call_values(program, ctx, scope, name, values, arg_expr_ids);
+    return evaluator.finish_statement(ctx);
+}
+
+// Numeric ids are an internal bytecode ABI. Unknown ids deliberately fall back
+// to case-insensitive names so older cache images remain executable.
+func evaluator_control_execute_builtin_member_id_values(evaluator: Evaluator, program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, scope: asp.vm.Scope, name: String, member_id: Int, values: collections.Vector<asp.runtime.Variant>, arg_expr_ids: collections.Vector<Int>) -> Int {
+    let selected: Int = eg_asp_vm_member_select(ctx.request_arena_handle, member_id, 100, member_id, values.len(), 0);
+    if selected != member_id {
+        return evaluator_control_execute_call_stmt_values(evaluator, program, ctx, scope, name, values, arg_expr_ids);
+    }
+    if member_id == 101 && values.len() >= 1 {
+        _ = ctx.response.write(values.get(0).to_output_string());
+        return evaluator.finish_statement(ctx);
+    }
+    if member_id == 102 && values.len() >= 1 {
+        _ = ctx.response.binary_write(values.get(0).to_output_string());
+        return evaluator.finish_statement(ctx);
+    }
+    if member_id == 103 {
+        _ = ctx.response.clear();
+        return evaluator.finish_statement(ctx);
+    }
+    if member_id == 104 {
+        return evaluator.finish_statement(ctx);
+    }
+    if member_id == 105 {
+        _ = ctx.response.end();
+        return 1;
+    }
+    if member_id == 106 && values.len() >= 1 {
+        _ = ctx.response.redirect(values.get(0).to_output_string());
+        return 1;
+    }
+    if member_id == 107 && values.len() >= 2 {
+        _ = ctx.response.add_header(values.get(0).to_output_string(), values.get(1).to_output_string());
+        return evaluator.finish_statement(ctx);
+    }
+    return evaluator_control_execute_call_stmt_values(evaluator, program, ctx, scope, name, values, arg_expr_ids);
+}
+
+func evaluator_control_execute_block(evaluator: Evaluator, program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, block_id: Int) -> Int {
+    return evaluator.execute_block_in_scope(program, ctx, evaluator.root_scope(ctx), block_id);
+}
+
+// Execute sequentially until a control code or Response.End asks the caller to
+// unwind. Control codes are interpreted by the owning loop/routine, not here.
+func evaluator_control_execute_block_in_scope(evaluator: Evaluator, program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, scope: asp.vm.Scope, block_id: Int) -> Int {
+    if block_id < 0 || block_id >= program.runtime_block_count() {
+        return 0;
+    }
+    let i: Int = 0;
+    loop i < program.runtime_block_stmt_count(block_id) {
+        let result: Int = evaluator.execute_stmt(program, ctx, scope, program.runtime_block_stmt(block_id, i));
+        if result != 0 || ctx.response.ended {
+            return result == 0 && ctx.response.ended ? 1 : result;
+        }
+        i += 1;
+    }
+    return 0;
+}
+
+// Canonical statement interpreter and fallback for unsupported bytecode. Each
+// branch must either call finish_statement after potentially failing work or
+// intentionally return a structured unwind code for loops/routines/response.
+func evaluator_control_execute_stmt(evaluator: Evaluator, program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, scope: asp.vm.Scope, stmt_id: Int) -> Int {
+    if stmt_id < 0 || stmt_id >= program.runtime_stmt_count() {
+        return 0;
+    }
+    evaluator.statement_failed = false;
+    let stmt: asp.compiler.VbsStmtNode = program.get_stmt(stmt_id);
+    if stmt.kind == asp.compiler.VbsStmtNoop || stmt.kind == asp.compiler.VbsStmtOptionExplicit || stmt.kind == asp.compiler.VbsStmtRoutineDef || stmt.kind == asp.compiler.VbsStmtClassDef {
+        return 0;
+    }
+    if stmt.kind == asp.compiler.VbsStmtOnErrorResumeNext {
+        ctx.error_state.resume_next_enabled = true;
+        return 0;
+    }
+    if stmt.kind == asp.compiler.VbsStmtOnErrorGoto0 {
+        ctx.error_state.resume_next_enabled = false;
+        _ = ctx.error_state.clear();
+        return 0;
+    }
+    if program.runtime_stmt_kind(stmt_id) == asp.compiler.VbsStmtDim {
+        let i: Int = 0;
+        let bound_offset: Int = 0;
+        loop i < program.runtime_stmt_name_count(stmt_id) {
+            let value: asp.runtime.Variant = asp.runtime.variant_empty();
+            let rank: Int = i < program.runtime_stmt_expr_count(stmt_id) ? program.runtime_stmt_expr(stmt_id, i) : 0;
+            if rank > 0 {
+                let bounds: collections.Vector<Int> = new collections.Vector<Int>();
+                let dimension: Int = 0;
+                loop dimension < rank && bound_offset + dimension < program.runtime_stmt_target_arg_count(stmt_id) {
+                    let upper: Int = variant_to_int(evaluator.eval_expr_in_scope(program, ctx, scope, program.runtime_stmt_target_arg(stmt_id, bound_offset + dimension)));
+                    if upper < -1 {
+                        evaluator.raise_runtime_error(ctx, 9, "subscript out of range in Dim " + program.runtime_stmt_name(stmt_id, i) + ": stmtId=" + strconv.itoa(stmt_id) + ", dimension=" + strconv.itoa(dimension + 1) + ", upper=" + strconv.itoa(upper), "VBScript");
+                        return evaluator.finish_statement(ctx);
+                    }
+                    _ = bounds.push(upper);
+                    dimension += 1;
+                }
+                if bounds.len() != rank {
+                    evaluator.raise_runtime_error(ctx, 9, "missing array bound", "VBScript");
+                    return evaluator.finish_statement(ctx);
+                }
+                value = evaluator_control_build_array(bounds, 0);
+                bound_offset += rank;
+            }
+            let dim_name: String = program.runtime_stmt_name(stmt_id, i);
+            if !scope.vars.has(dim_name) {
+                _ = scope.vars.set(dim_name, value);
+            }
+            i += 1;
+        }
+        return 0;
+    }
+    if stmt.kind == asp.compiler.VbsStmtConst {
+        let i: Int = 0;
+        loop i < stmt.names.len() && i < stmt.expr_ids.len() {
+            let value: asp.runtime.Variant = evaluator.eval_expr_in_scope(program, ctx, scope, stmt.expr_ids.get(i));
+            _ = scope.vars.set(stmt.names.get(i), value);
+            _ = scope.add_const(stmt.names.get(i));
+            i += 1;
+        }
+        return evaluator.finish_statement(ctx);
+    }
+    if stmt.kind == asp.compiler.VbsStmtReDim {
+        // Do not retain nested fields borrowed from the statement vector while
+        // evaluating a bound. A bound may call user code and trigger GC.
+        let target_name: String = asp.runtime.clone_runtime_string(program.runtime_stmt_target_name(stmt_id));
+        let preserve: Bool = stmt.bool_value;
+        let target_arg_count: Int = program.runtime_stmt_target_arg_count(stmt_id);
+        let bounds: collections.Vector<Int> = new collections.Vector<Int>();
+        let i: Int = 0;
+        loop i < target_arg_count {
+            let bound_expr_id: Int = program.runtime_stmt_target_arg(stmt_id, i);
+            let upper: Int = variant_to_int(evaluator.eval_expr_in_scope(program, ctx, scope, bound_expr_id));
+            if upper < -1 {
+                evaluator.raise_runtime_error(ctx, 9, "subscript out of range in ReDim " + target_name + ": stmtId=" + strconv.itoa(stmt_id) + ", dimension=" + strconv.itoa(i + 1) + ", upper=" + strconv.itoa(upper), "VBScript");
+                return evaluator.finish_statement(ctx);
+            }
+            _ = bounds.push(upper);
+            i += 1;
+        }
+        if bounds.len() == 0 {
+            evaluator.raise_runtime_error(ctx, 9, "array bound required", "VBScript");
+            return evaluator.finish_statement(ctx);
+        }
+        let previous: asp.runtime.Variant = evaluator.resolve_identifier(ctx, scope, target_name, program);
+        let resized: asp.runtime.Variant = evaluator_control_build_array(bounds, 0, previous, preserve);
+        if !scope.call_frame.has(target_name)
+        && !scope.vars.has(target_name)
+        && evaluator.has_me_field(ctx, scope, target_name) {
+            _ = evaluator.set_me_field(ctx, scope, target_name, resized);
+        } else {
+            evaluator.assign_identifier(ctx, scope, target_name, resized);
+        }
+        return evaluator.finish_statement(ctx);
+    }
+    if stmt.kind == asp.compiler.VbsStmtAssign || stmt.kind == asp.compiler.VbsStmtSetAssign {
+        let value: asp.runtime.Variant = evaluator.eval_expr_in_scope(program, ctx, scope, stmt.value_expr_id);
+        if evaluator.statement_failed {
+            return evaluator.finish_statement(ctx);
+        }
+        if stmt.target_expr_id >= 0 {
+            evaluator.assign_target_expr(program, ctx, scope, stmt.target_expr_id, value, stmt.kind == asp.compiler.VbsStmtSetAssign);
+        } else {
+            evaluator.assign_target(program, ctx, scope, stmt.target_name, stmt.target_arg_ids, value, stmt.kind == asp.compiler.VbsStmtSetAssign);
+        }
+        return evaluator.finish_statement(ctx);
+    }
+    if stmt.kind == asp.compiler.VbsStmtCall {
+        if stmt.target_expr_id >= 0 {
+            _ = evaluator.eval_expr_in_scope(program, ctx, scope, stmt.target_expr_id);
+            return evaluator.finish_statement(ctx);
+        }
+        return evaluator.execute_call_stmt(program, ctx, scope, stmt.call_name, stmt.call_arg_ids);
+    }
+    if stmt.kind == asp.compiler.VbsStmtWith {
+        let target: asp.runtime.Variant = evaluator.eval_expr_in_scope(program, ctx, scope, stmt.value_expr_id);
+        _ = scope.vars.set(stmt.target_name, target);
+        return evaluator.execute_block_in_scope(program, ctx, scope, stmt.body_block_id);
+    }
+    if stmt.kind == asp.compiler.VbsStmtIf {
+        let cond: asp.runtime.Variant = evaluator.eval_expr_in_scope(program, ctx, scope, stmt.cond_expr_id);
+        if ctx.response.ended {
+            return 1;
+        }
+        if evaluator.statement_failed {
+            return evaluator.finish_statement(ctx);
+        }
+        return cond.is_truthy() ? evaluator.execute_block_in_scope(program, ctx, scope, stmt.then_block_id) : evaluator.execute_block_in_scope(program, ctx, scope, stmt.else_block_id);
+    }
+    if stmt.kind == asp.compiler.VbsStmtWhile {
+        loop true {
+            let cond: asp.runtime.Variant = evaluator.eval_expr_in_scope(program, ctx, scope, stmt.cond_expr_id);
+            if evaluator.statement_failed {
+                return evaluator.finish_statement(ctx);
+            }
+            if !cond.is_truthy() {
+                break;
+            }
+            let result: Int = evaluator.execute_block_in_scope(program, ctx, scope, stmt.body_block_id);
+            if result == 1 {
+                return result;
+            }
+            if result == 5 {
+                break;
+            }
+            if result != 0 {
+                return result;
+            }
+        }
+        return evaluator.finish_statement(ctx);
+    }
+    if stmt.kind == asp.compiler.VbsStmtDoLoop {
+        loop true {
+            if stmt.cond_expr_id >= 0 && !stmt.bool_value {
+                let pre_cond: asp.runtime.Variant = evaluator.eval_expr_in_scope(program, ctx, scope, stmt.cond_expr_id);
+                if evaluator.statement_failed {
+                    return evaluator.finish_statement(ctx);
+                }
+                if !pre_cond.is_truthy() {
+                    break;
+                }
+            }
+            let result: Int = evaluator.execute_block_in_scope(program, ctx, scope, stmt.body_block_id);
+            if result == 5 {
+                break;
+            }
+            if result != 0 {
+                return result;
+            }
+            if stmt.bool_value {
+                let post_cond: asp.runtime.Variant = evaluator.eval_expr_in_scope(program, ctx, scope, stmt.extra_expr_id);
+                if evaluator.statement_failed {
+                    return evaluator.finish_statement(ctx);
+                }
+                if !post_cond.is_truthy() {
+                    break;
+                }
+            }
+        }
+        return evaluator.finish_statement(ctx);
+    }
+    if stmt.kind == asp.compiler.VbsStmtFor {
+        let step_value: Int = stmt.extra_expr_id2 >= 0 ? variant_to_int(evaluator.eval_expr_in_scope(program, ctx, scope, stmt.extra_expr_id2)) : 1;
+        let finish: Int = variant_to_int(evaluator.eval_expr_in_scope(program, ctx, scope, stmt.extra_expr_id));
+        let current: Int = variant_to_int(evaluator.eval_expr_in_scope(program, ctx, scope, stmt.value_expr_id));
+        loop true {
+            if step_value >= 0 && current > finish {
+                break;
+            }
+            if step_value < 0 && current < finish {
+                break;
+            }
+            evaluator.assign_identifier(ctx, scope, stmt.target_name, asp.runtime.variant_int(current));
+            let result: Int = evaluator.execute_block_in_scope(program, ctx, scope, stmt.body_block_id);
+            if result == 4 {
+                break;
+            }
+            if result != 0 {
+                return result;
+            }
+            current += step_value;
+        }
+        return evaluator.finish_statement(ctx);
+    }
+    if stmt.kind == asp.compiler.VbsStmtForEach {
+        let source_value: asp.runtime.Variant = evaluator.eval_expr_in_scope(program, ctx, scope, stmt.value_expr_id);
+        let values: collections.Vector<asp.runtime.Variant> = evaluator.enumerate_expr_values(program, ctx, stmt.value_expr_id, source_value);
+        let i: Int = 0;
+        loop i < values.len() {
+            evaluator.assign_identifier(ctx, scope, stmt.target_name, values.get(i));
+            let result: Int = evaluator.execute_block_in_scope(program, ctx, scope, stmt.body_block_id);
+            if result == 4 {
+                break;
+            }
+            if result != 0 {
+                return result;
+            }
+            i += 1;
+        }
+        return evaluator.finish_statement(ctx);
+    }
+    if stmt.kind == asp.compiler.VbsStmtSelectCase {
+        let select_value: asp.runtime.Variant = evaluator.eval_expr_in_scope(program, ctx, scope, stmt.value_expr_id);
+        let i: Int = 0;
+        loop i < stmt.case_clause_ids.len() {
+            let clause_id: Int = stmt.case_clause_ids.get(i);
+            let matched: Bool = program.runtime_case_is_else(clause_id);
+            if !matched {
+                let j: Int = 0;
+                loop j < program.runtime_case_expr_count(clause_id) {
+                    if variant_compare(select_value, evaluator.eval_expr_in_scope(program, ctx, scope, program.runtime_case_expr(clause_id, j))) == 0 {
+                        matched = true;
+                        break;
+                    }
+                    j += 1;
+                }
+            }
+            if matched {
+                return evaluator.execute_block_in_scope(program, ctx, scope, program.runtime_case_block(clause_id));
+            }
+            i += 1;
+        }
+        return 0;
+    }
+    if stmt.kind == asp.compiler.VbsStmtExitFunction {
+        return 2;
+    }
+    if stmt.kind == asp.compiler.VbsStmtExitSub {
+        return 3;
+    }
+    if stmt.kind == asp.compiler.VbsStmtExitFor {
+        return 4;
+    }
+    if stmt.kind == asp.compiler.VbsStmtExitDo {
+        return 5;
+    }
+    if stmt.kind == asp.compiler.VbsStmtExitProperty {
+        return 2;
+    }
+    return 0;
+}

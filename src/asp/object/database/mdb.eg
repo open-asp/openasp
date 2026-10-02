@@ -1,0 +1,86 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.object.database;
+
+use std;
+use strings;
+
+extern func eg_mdb_table_dump(a0: String, a1: String) -> String;
+extern func eg_mdb_query(a0: String, a1: String, a2: String, a3: Int, a4: String, a5: String, a6: String, a7: Int, a8: Int, a9: Int, a10: Int) -> String;
+extern func eg_mdb_sql_query(a0: String, a1: String, a2: String, a3: String, a4: String, a5: Int, a6: Int, a7: Int, a8: Int) -> String;
+extern func eg_mdb_join_query(a0: String, a1: String, a2: String, a3: String, a4: Int, a5: String, a6: String, a7: String, a8: String, a9: Int, a10: Int) -> String;
+extern func eg_mdb_update(a0: String, a1: String, a2: String, a3: String, a4: String, a5: String) -> String;
+extern func eg_mdb_insert_row(a0: String, a1: String, a2: String, a3: String) -> String;
+extern func eg_mdb_delete(a0: String, a1: String, a2: String, a3: String) -> String;
+extern func eg_mdb_create_table(a0: String, a1: String) -> String;
+
+enum MdbWhereKind {
+    MdbWhereNone,
+    MdbWhereEq,
+    MdbWhereGt,
+    MdbWhereLt,
+    MdbWhereLikeContains,
+}
+
+// Fixed-shape query descriptor passed across the Egret/C boundary. Separating
+// parsed fields from SQL text keeps the native library independent of the
+// higher-level compatibility parser.
+class MdbQuery {
+    // ok gates execution; error_text explains unsupported input.
+    var ok: Bool;
+    var error_text: String;
+    // Remaining fields are normalized identifiers, predicates, and limits.
+    var table_name: String;
+    var top_count: Int;
+    var where_kind: MdbWhereKind;
+    var where_column: String;
+    var where_value: String;
+    var order_column: String;
+    var order_desc: Bool;
+
+    func init(self: MdbQuery) -> Void {
+        self.ok = false;
+        self.error_text = "";
+        self.table_name = "";
+        self.top_count = 0;
+        self.where_kind = MdbWhereNone;
+        self.where_column = "";
+        self.where_value = "";
+        self.order_column = "";
+        self.order_desc = false;
+    }
+}
+
+// Sanitize the delimiter-based native result format. Tabs/newlines would create
+// fake cells or rows; reserved null/type markers are removed from plain text.
+func mdb_engine_clean_cell(text: String) -> String {
+    let out: String = strings.replace_all(text, "\t", " ");
+    let out2: String = strings.replace_all(out, "\r", " ");
+    let out3: String = strings.replace_all(out2, "\n", " ");
+    let out4: String = strings.replace_all(out3, std.char_from_code(255), "");
+    return strings.replace_all(out4, std.char_from_code(254), "");
+}
+
+// Remove qualification and one pair of Access brackets before passing an
+// identifier to libmdb. Structural validation occurs in the SQL parser.
+func mdb_engine_parse_ident(text: String) -> String {
+    let trimmed: String = strings.trim_space(text);
+    let dot: Int = strings.find_substr(trimmed, ".");
+    let unqualified: String = dot >= 0 ? strings.trim_space(std.substr(trimmed, dot + 1, std.len(trimmed) - dot - 1)) : trimmed;
+    if std.len(unqualified) >= 2 && std.byte_at(unqualified, 0) == '[' && std.byte_at(unqualified, std.len(unqualified) - 1) == ']' {
+        return std.substr(unqualified, 1, std.len(unqualified) - 2);
+    }
+    return unqualified;
+}
+
+// Decode SQL's doubled-quote representation without interpreting escapes that
+// Jet does not define.
+func mdb_engine_parse_string_literal(text: String) -> String {
+    let trimmed: String = strings.trim_space(text);
+    if std.len(trimmed) >= 2 && std.byte_at(trimmed, 0) == '\'' && std.byte_at(trimmed, std.len(trimmed) - 1) == '\'' {
+        let inner: String = std.substr(trimmed, 1, std.len(trimmed) - 2);
+        return strings.replace_all(inner, "''", "'");
+    }
+    return trimmed;
+}

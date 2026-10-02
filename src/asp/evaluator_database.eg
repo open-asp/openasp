@@ -1,0 +1,308 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp;
+
+use asp.object.database;
+use asp.runtime;
+use asp.compiler;
+use asp.vm;
+
+use std;
+use fs;
+use path;
+use strings;
+use strconv;
+
+// Database evaluator helpers adapt ADO's mutable Recordset model to native
+// drivers. SQL inspection here intentionally recognizes only the narrow SELECT
+// shapes produced by supported legacy applications; it is not a general SQL
+// parser. Unrecognized shapes fail closed by returning an empty update query.
+func evaluator_database_clone_store(evaluator: Evaluator, store: asp.runtime.KeyValueStore) -> asp.runtime.KeyValueStore {
+    // Rows need independent Variants so Recordset edits can be diffed against
+    // original_rows without mutating the before-image.
+    return store.clone();
+}
+
+func evaluator_database_sql_escape_literal(evaluator: Evaluator, text: String) -> String {
+    // Jet/SQL string literals escape a quote by doubling it.
+    return strings.replace_all(text, "'", "''");
+}
+
+func evaluator_database_sql_variant_literal(evaluator: Evaluator, value: asp.runtime.Variant) -> String {
+    // Preserve VBScript Boolean's -1 representation and map absence-like
+    // values to SQL NULL. Strings are quoted only after Jet escaping.
+    if value.kind == asp.runtime.VariantEmpty || value.kind == asp.runtime.VariantNull || value.kind == asp.runtime.VariantNothing {
+        return "NULL";
+    }
+    if value.kind == asp.runtime.VariantBool {
+        return value.bool_value ? "-1" : "0";
+    }
+    if value.kind == asp.runtime.VariantInt {
+        return strconv.itoa(value.int_value);
+    }
+    if value.kind == asp.runtime.VariantFloat {
+        return strconv.format_float64(value.float_value);
+    }
+    return "'" + evaluator.sql_escape_literal(value.to_output_string()) + "'";
+}
+
+func evaluator_database_recordset_table_name(evaluator: Evaluator, sql: String) -> String {
+    // Extract the first table token after FROM. Bracketed identifiers may
+    // contain spaces; all other tokens stop at ASCII whitespace.
+    let lc: String = strings.to_lower_ascii(sql);
+    let from_at: Int = strings.find_substr(lc, " from ");
+    if from_at < 0 {
+        return "";
+    }
+    let pos: Int = from_at + 6;
+    loop pos < std.len(sql) && strings.find_substr(" \t\r\n", std.char_from_code(std.byte_at(sql, pos))) >= '\0' {
+        pos += 1;
+    }
+    if pos >= std.len(sql) {
+        return "";
+    }
+    if std.byte_at(sql, pos) == '[' {
+        let end_at: Int = strings.find_substr_from(sql, "]", pos + 1);
+        if end_at > pos {
+            return std.substr(sql, pos, end_at - pos + 1);
+        }
+    }
+    let end_pos: Int = pos;
+    loop end_pos < std.len(sql) && strings.find_substr(" \t\r\n", std.char_from_code(std.byte_at(sql, end_pos))) < '\0' {
+        end_pos += 1;
+    }
+    return std.substr(sql, pos, end_pos - pos);
+}
+
+func evaluator_database_recordset_where_clause(evaluator: Evaluator, sql: String) -> String {
+    let lc: String = strings.to_lower_ascii(sql);
+    let where_at: Int = strings.find_substr(lc, " where ");
+    if where_at < 0 {
+        return "";
+    }
+    return strings.trim_space(std.substr(sql, where_at + 7, std.len(sql) - where_at - 7));
+}
+
+func evaluator_database_recordset_where_eq_column(evaluator: Evaluator, sql: String) -> String {
+    let where_clause: String = evaluator.recordset_where_clause(sql);
+    let eq_at: Int = strings.find_substr(where_clause, "=");
+    if eq_at <= 0 {
+        return "";
+    }
+    return asp.object.database.mdb_engine_parse_ident(std.substr(where_clause, 0, eq_at));
+}
+
+func evaluator_database_native_recordset_update_sql(evaluator: Evaluator, obj: asp.vm.RuntimeObject) -> String {
+    // Native rows carry per-cell dirty bits, avoiding a full Variant clone for
+    // large MDB results. A no-op update still writes one harmless fallback
+    // column because classic ADO Update expects a command to be issued.
+    let table_name: String = evaluator.recordset_table_name(obj.text_value);
+    if std.len(table_name) == 0 {
+        return "";
+    }
+    let where_column: String = evaluator.recordset_where_eq_column(obj.text_value);
+    let builder: String = "UPDATE " + table_name + " SET ";
+    let assignment_count: Int = 0;
+    let fallback_column: String = "";
+    let fallback_value: asp.runtime.Variant = asp.runtime.variant_empty();
+    let id_value: asp.runtime.Variant = asp.runtime.variant_empty();
+    let column_index: Int = 0;
+    loop column_index < obj.items.len() {
+        let column_name: String = obj.items.get(column_index).to_output_string();
+        let next_value: asp.runtime.Variant = obj.native_cell(obj.cursor, column_index);
+        if strings.equal_fold_ascii(column_name, "id") {
+            id_value = next_value;
+        }
+        if std.len(fallback_column) == 0 && !strings.equal_fold_ascii(column_name, where_column) {
+            fallback_column = column_name;
+            fallback_value = next_value;
+        }
+        if !strings.equal_fold_ascii(column_name, where_column)
+        && obj.native_cell_changed(obj.cursor, column_index) {
+            if assignment_count > 0 {
+                builder += ", ";
+            }
+            builder += "[" + column_name + "]=" + evaluator.sql_variant_literal(next_value);
+            assignment_count += 1;
+        }
+        column_index += 1;
+    }
+    if assignment_count == 0 {
+        if std.len(fallback_column) == 0 {
+            return "";
+        }
+        builder += "[" + fallback_column + "]=" + evaluator.sql_variant_literal(fallback_value);
+    }
+    let where_clause: String = evaluator.recordset_where_clause(obj.text_value);
+    if std.len(where_clause) != 0 {
+        return builder + " WHERE " + where_clause;
+    }
+    if id_value.kind != asp.runtime.VariantEmpty {
+        return builder + " WHERE [id]=" + evaluator.sql_variant_literal(id_value);
+    }
+    return "";
+}
+
+func evaluator_database_recordset_update_sql(evaluator: Evaluator, ctx: asp.runtime.RequestContext, obj: asp.vm.RuntimeObject) -> String {
+    // Compare the editable row to its captured before-image. The original
+    // WHERE clause is preferred; an id column is the only safe fallback.
+    _ = ctx;
+    if obj.cursor < 0 || obj.cursor >= obj.row_count() {
+        return "";
+    }
+    if obj.has_native_rows() {
+        return evaluator_database_native_recordset_update_sql(evaluator, obj);
+    }
+    let table_name: String = evaluator.recordset_table_name(obj.text_value);
+    if std.len(table_name) == 0 {
+        return "";
+    }
+    let row: asp.runtime.KeyValueStore = obj.rows.get(obj.cursor);
+    let original_row: asp.runtime.KeyValueStore = obj.cursor < obj.original_rows.len() ? obj.original_rows.get(obj.cursor) : new asp.runtime.KeyValueStore();
+    let where_column: String = evaluator.recordset_where_eq_column(obj.text_value);
+    let builder: String = "UPDATE " + table_name + " SET ";
+    let i: Int = 0;
+    let assignment_count: Int = 0;
+    let fallback_column: String = "";
+    let fallback_value: asp.runtime.Variant = asp.runtime.variant_empty();
+    loop i < row.entries.len() {
+        let next_value: asp.runtime.Variant = row.entries.get(i);
+        let column_name: String = next_value.store_key;
+        if std.len(fallback_column) == 0 && !strings.equal_fold_ascii(column_name, where_column) {
+            fallback_column = column_name;
+            fallback_value = next_value.clone();
+        }
+        if strings.equal_fold_ascii(column_name, where_column) {
+            i += 1;
+            skip;
+        }
+        if original_row.has(column_name) && variant_compare(original_row.get_or_empty(column_name), next_value) == 0 {
+            i += 1;
+            skip;
+        }
+        if assignment_count > 0 {
+            builder += ", ";
+        }
+        builder += "[" + column_name + "]=" + evaluator.sql_variant_literal(next_value);
+        assignment_count += 1;
+        i += 1;
+    }
+    if assignment_count == 0 {
+        if std.len(fallback_column) == 0 {
+            return "";
+        }
+        builder += "[" + fallback_column + "]=" + evaluator.sql_variant_literal(fallback_value);
+    }
+    let where_clause: String = evaluator.recordset_where_clause(obj.text_value);
+    if std.len(where_clause) != 0 {
+        builder += " WHERE " + where_clause;
+        return builder;
+    }
+    if row.has("id") {
+        builder += " WHERE [id]=" + evaluator.sql_variant_literal(row.get_or_empty("id"));
+        return builder;
+    }
+    return "";
+}
+
+func evaluator_database_inf_recordset_for_key(evaluator: Evaluator, ctx: asp.runtime.RequestContext, output: String, sql: String, lookup_key: String) -> asp.vm.RuntimeObject {
+    // The frequently queried Inf table is cached as one full native result.
+    // Return a one-row view/copy so each ADO cursor retains independent state.
+    let full_rs: asp.vm.RuntimeObject = asp.object.database.db_driver_tabular_recordset(output, "Select * From [Inf]", ctx.request_arena_handle);
+    let rs: asp.vm.RuntimeObject = new asp.vm.RuntimeObject();
+    rs.kind = asp.vm.RuntimeObjectAdoRecordset;
+    rs.prog_id = "ADODB.Recordset";
+    rs.opened = true;
+    rs.text_value = sql;
+    let i: Int = 0;
+    loop i < full_rs.items.len() {
+        _ = rs.items.push(full_rs.items.get(i).clone());
+        i += 1;
+    }
+    let row_index: Int = 0;
+    loop row_index < full_rs.row_count() {
+        let key_column: Int = full_rs.native_column_index("key");
+        let key_value: asp.runtime.Variant = full_rs.has_native_rows()
+            ? full_rs.native_cell(row_index, key_column)
+            : full_rs.rows.get(row_index).get_or_empty("key");
+        if strings.equal_fold_ascii(key_value.to_output_string(), lookup_key) {
+            if full_rs.has_native_rows() && rs.create_native_rows(ctx.request_arena_handle, 1, full_rs.items.len()) {
+                let column_index: Int = 0;
+                loop column_index < full_rs.items.len() {
+                    _ = rs.set_native_cell(0, column_index, full_rs.native_cell(row_index, column_index));
+                    column_index += 1;
+                }
+            } else {
+                let row: asp.runtime.KeyValueStore = full_rs.rows.get(row_index);
+                let display_row: asp.runtime.KeyValueStore = evaluator.clone_store(row);
+                let original_row: asp.runtime.KeyValueStore = evaluator.clone_store(row);
+                _ = rs.rows.push(display_row);
+                _ = rs.original_rows.push(original_row);
+            }
+            break;
+        }
+        row_index += 1;
+    }
+    return rs;
+}
+
+func evaluator_database_execute_access(evaluator: Evaluator, ctx: asp.runtime.RequestContext, obj: asp.vm.RuntimeObject, sql: String) -> asp.runtime.Variant {
+    // Lookup order is request cache, validated disk cache, then native MDB.
+    // Writes invalidate every query for the database because dependencies are
+    // not tracked at table granularity. Driver failures become VBScript Err.
+    let db_path: String = asp_host_path(obj.store.get_or_empty("data source").to_output_string());
+    if std.len(db_path) == 0 {
+        evaluator.raise_runtime_error(ctx, 3709, "ADO connection has no Data Source", "ADODB.Connection");
+        return asp.runtime.variant_empty();
+    }
+    let cacheable: Bool = access_sql_is_cacheable(sql);
+    let cache_key: String = access_cache_key(db_path, sql);
+    let inf_lookup_key: String = access_inf_lookup_key(sql);
+    let inf_table_cache_key: String = access_inf_table_cache_key(db_path);
+    let exec_sql: String = std.len(inf_lookup_key) != 0 ? "Select * From [Inf]" : sql;
+    let exec_cache_key: String = std.len(inf_lookup_key) != 0 ? inf_table_cache_key : cache_key;
+    if std.len(inf_lookup_key) != 0 && ctx.access_query_cache.has(inf_table_cache_key) {
+        let cached_inf_output: String = ctx.access_query_cache.get(inf_table_cache_key);
+        let cached_rs_id: Int = ctx.objects.create_ado_recordset();
+        let cached_rs: asp.vm.RuntimeObject = evaluator.inf_recordset_for_key(ctx, cached_inf_output, sql, inf_lookup_key);
+        asp.object.database.db_driver_bind_recordset(cached_rs, obj, asp.object.database.DatabaseDriverMdbtools);
+        _ = ctx.objects.set(cached_rs_id, cached_rs);
+        return asp.runtime.variant_object(cached_rs_id);
+    }
+    if cacheable && ctx.access_query_cache.has(exec_cache_key) {
+        let cached_output: String = ctx.access_query_cache.get(exec_cache_key);
+        let cached_rs_id: Int = ctx.objects.create_ado_recordset();
+        let cached_rs: asp.vm.RuntimeObject = std.len(inf_lookup_key) != 0 ? evaluator.inf_recordset_for_key(ctx, cached_output, sql, inf_lookup_key) : asp.object.database.db_driver_tabular_recordset(cached_output, sql, ctx.request_arena_handle);
+        asp.object.database.db_driver_bind_recordset(cached_rs, obj, asp.object.database.DatabaseDriverMdbtools);
+        _ = ctx.objects.set(cached_rs_id, cached_rs);
+        return asp.runtime.variant_object(cached_rs_id);
+    }
+    let disk_cached_output: String = "";
+    let disk_cache_err: ErrCode = OK;
+    disk_cached_output, disk_cache_err = access_disk_cache_read(ctx.root_dir, db_path, exec_sql);
+    if disk_cache_err == OK {
+        _ = ctx.access_query_cache.set(exec_cache_key, disk_cached_output);
+        let disk_rs_id: Int = ctx.objects.create_ado_recordset();
+        let disk_rs: asp.vm.RuntimeObject = std.len(inf_lookup_key) != 0 ? evaluator.inf_recordset_for_key(ctx, disk_cached_output, sql, inf_lookup_key) : asp.object.database.db_driver_tabular_recordset(disk_cached_output, sql, ctx.request_arena_handle);
+        asp.object.database.db_driver_bind_recordset(disk_rs, obj, asp.object.database.DatabaseDriverMdbtools);
+        _ = ctx.objects.set(disk_rs_id, disk_rs);
+        return asp.runtime.variant_object(disk_rs_id);
+    }
+    let output: String = asp.object.database.access_execute_native(db_path, exec_sql);
+    if strings.starts_with(output, "Error:") || strings.starts_with(output, "Exception") {
+        evaluator.raise_runtime_error(ctx, 3000, strings.trim_space(output), "ADODB.Connection");
+        return asp.runtime.variant_empty();
+    }
+    if access_sql_is_cacheable(exec_sql) {
+        _ = ctx.access_query_cache.set(exec_cache_key, output);
+        access_disk_cache_write(ctx.root_dir, db_path, exec_sql, output);
+    } else {
+        invalidate_access_query_cache(ctx, db_path);
+    }
+    let rs_id: Int = ctx.objects.create_ado_recordset();
+    let rs: asp.vm.RuntimeObject = std.len(inf_lookup_key) != 0 ? evaluator.inf_recordset_for_key(ctx, output, sql, inf_lookup_key) : asp.object.database.db_driver_tabular_recordset(output, sql, ctx.request_arena_handle);
+    asp.object.database.db_driver_bind_recordset(rs, obj, asp.object.database.DatabaseDriverMdbtools);
+    _ = ctx.objects.set(rs_id, rs);
+    return asp.runtime.variant_object(rs_id);
+}

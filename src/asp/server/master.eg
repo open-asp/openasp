@@ -1,0 +1,127 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.server;
+
+use asp;
+
+use std;
+use aio.fs;
+use aio.tcp;
+use collections;
+use os;
+use strings;
+use strconv;
+
+// Parent-process supervisor. It owns the listening descriptor and stable worker
+// slots; children inherit the listener, serve a bounded lifetime, and exit.
+// Slot-based replacement avoids changing configured concurrency after crashes.
+class FastcgiMaster {
+    var runtime_state: FastcgiServerRuntime;
+    var worker: FastcgiWorker;
+
+    func init(self: FastcgiMaster, runtime_state: FastcgiServerRuntime) -> Void {
+        self.runtime_state = runtime_state;
+        self.worker = new FastcgiWorker(runtime_state);
+    }
+
+    async func fork_worker_slot(self: FastcgiMaster, lfd: Int, slot: Int, max_accepts: Int, max_concurrent_connections: Int, aot_enabled: Bool) -> Int, ErrCode {
+        let pid, fork_err = os.fork();
+        if fork_err != OK {
+            print("fastcgi failed to fork worker slot " + strconv.itoa(slot));
+            self.runtime_state.logger.error("failed to fork worker slot=" + strconv.itoa(slot));
+            return -1, fork_err;
+        }
+        if pid == 0 {
+            let child_rc: Int = await self.worker.run_child(lfd, max_accepts, max_concurrent_connections, aot_enabled);
+            return child_rc, OK;
+        }
+        self.runtime_state.logger.info("worker forked slot=" + strconv.itoa(slot) + " pid=" + strconv.itoa(pid));
+        return pid, OK;
+    }
+
+    func find_worker_slot(self: FastcgiMaster, pids: collections.Vector<Int>, pid: Int) -> Int {
+        loop (let i: Int = 0; i < pids.len(); i += 1) {
+            if pids.get_unchecked(i) == pid {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    // AOT preparation runs in a disposable child before workers fork. This
+    // prevents compiler scratch state from becoming part of every worker heap.
+    async func run(self: FastcgiMaster, host: String, port: Int, max_accepts: Int, workers: Int, max_concurrent_connections: Int, aot_enabled: Bool) -> Int {
+        if aot_enabled {
+            let prepare_pid, prepare_fork_err = os.fork();
+            if prepare_fork_err != OK {
+                self.runtime_state.logger.error("aot preparation fork failed");
+                return 1;
+            }
+            if prepare_pid == 0 {
+                let prepare_rc: Int = self.runtime_state.engine.prepare_aot();
+                _ = aio.fs.shutdown();
+                _ = os.exit(prepare_rc);
+                return prepare_rc;
+            }
+            let exited_pid, prepare_wait_err = os.wait_any_pid();
+            let prepare_status: Int = os.wait_any_status();
+            if prepare_wait_err != OK || exited_pid != prepare_pid || prepare_status != 0 {
+                self.runtime_state.logger.error("aot preparation failed status=" + strconv.itoa(prepare_status));
+                return prepare_status != 0 ? prepare_status : 1;
+            }
+        }
+        let lfd, listen_err = aio.tcp.listen(host, port, 128);
+        if listen_err != OK {
+            print("fastcgi listen failed");
+            self.runtime_state.logger.error("listen failed address=" + host + ":" + strconv.itoa(port));
+            return 2;
+        }
+        let worker_count: Int = workers < 1 ? 1 : workers;
+        print("fastcgi listening on " + host + ":" + strconv.itoa(port) + " workers=" + strconv.itoa(worker_count) + " worker_connections=" + strconv.itoa(max_concurrent_connections < 1 ? 1 : max_concurrent_connections) + " aot=" + (aot_enabled ? "on" : "off") + " shell=" + (asp.shell_application_enabled() ? "enabled" : "disabled") + " process=" + (asp.process_component_enabled() ? "enabled" : "disabled"));
+        self.runtime_state.logger.info("master listening address=" + host + ":" + strconv.itoa(port));
+        let pids: collections.Vector<Int> = new collections.Vector<Int>();
+        loop (let wi: Int = 0; wi < worker_count; wi += 1) {
+            let pid, fork_err = await self.fork_worker_slot(lfd, wi, max_accepts, max_concurrent_connections, aot_enabled);
+            if fork_err != OK {
+                _ = aio.tcp.close(lfd);
+                _ = aio.fs.shutdown();
+                return 1;
+            }
+            _ = pids.push(pid);
+        }
+        let rc: Int = 0;
+        let running: Bool = true;
+        loop running {
+            let exited_pid, wait_err = os.wait_any_pid();
+            let st: Int = os.wait_any_status();
+            if wait_err != OK {
+                self.runtime_state.logger.error("wait for worker failed error=" + strconv.itoa(wait_err => Int));
+                rc = 1;
+                break;
+            }
+            let slot: Int = self.find_worker_slot(pids, exited_pid);
+            if slot < 0 {
+                print("fastcgi unknown child " + strconv.itoa(exited_pid) + " exited with status " + strconv.itoa(st));
+                self.runtime_state.logger.warn("unknown child exited pid=" + strconv.itoa(exited_pid) + " status=" + strconv.itoa(st));
+                skip;
+            }
+            if st != 0 {
+                print("fastcgi worker slot " + strconv.itoa(slot) + " exited with status " + strconv.itoa(st) + "; respawning");
+                self.runtime_state.logger.warn("worker exited slot=" + strconv.itoa(slot) + " pid=" + strconv.itoa(exited_pid) + " status=" + strconv.itoa(st) + " action=respawn");
+            } else {
+                self.runtime_state.logger.info("worker recycled slot=" + strconv.itoa(slot) + " pid=" + strconv.itoa(exited_pid) + " status=0");
+            }
+            let next_pid, next_err = await self.fork_worker_slot(lfd, slot, max_accepts, max_concurrent_connections, aot_enabled);
+            if next_err != OK {
+                self.runtime_state.logger.error("worker respawn failed slot=" + strconv.itoa(slot));
+                rc = 1;
+                break;
+            }
+            _ = pids.set(slot, next_pid);
+        }
+        _ = aio.tcp.close(lfd);
+        _ = aio.fs.shutdown();
+        return rc;
+    }
+}

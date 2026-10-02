@@ -1,0 +1,2742 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.vm;
+
+use asp.runtime;
+use asp.compiler;
+
+use asp;
+use std;
+use strconv;
+use strings;
+use collections;
+
+extern func __gc_keepalive(obj: Any) -> Void;
+extern func __object_is_null(obj: Any) -> Int;
+extern func eg_gc_preempt_guard_enter() -> Void;
+extern func eg_gc_preempt_guard_leave() -> Void;
+extern func eg_asp_variant_or_fallback(value: Any, fallback: asp.runtime.Variant) -> asp.runtime.Variant;
+extern func eg_asp_vbc_create(instruction_count: Int) -> Int;
+extern func eg_asp_vbc_create_packed(words: Ptr, instruction_count: Int) -> Int;
+extern func eg_asp_vbc_create_mapped(mapping_handle: Int, byte_offset: Int, instruction_count: Int) -> Int;
+extern func eg_asp_vbc_set(handle: Int, pc: Int, op: Int, arg0: Int, arg1: Int) -> Int;
+extern func eg_asp_vbc_set_literal(handle: Int, expr_id: Int, kind: Int, integer: Int, floating: Float64) -> Int;
+extern func eg_asp_vbc_set_string_literal(handle: Int, expr_id: Int, value: String) -> Int;
+extern func eg_asp_vbc_validate(handle: Int) -> Int;
+extern func eg_asp_vbc_destroy(handle: Int) -> Void;
+extern func eg_asp_vm_native_enabled() -> Int;
+extern func eg_asp_vm_class_enabled() -> Int;
+extern func eg_asp_vm_fused_numeric_compare(op: Int, left_kind: Int, left_integer: Int, left_floating: Float64, right_kind: Int, right_integer: Int, right_floating: Float64) -> Int;
+extern func eg_asp_vm_fused_integer_binary(op: Int, left: Int, right: Int) -> Int;
+extern func eg_asp_vm_dispatch(arena_handle: Int, handle: Int, entry_pc: Int, limit_pc: Int) -> Int;
+extern func eg_asp_vm_slot_set(arena_handle: Int, slot_index: Int, kind: Int, integer: Int, floating: Float64) -> Int;
+extern func eg_asp_vm_slot_set_string(arena_handle: Int, slot_index: Int, value: String) -> Int;
+extern func eg_asp_vm_take_dirty_slot(arena_handle: Int) -> Int;
+extern func eg_asp_vm_slot_kind(arena_handle: Int, slot_index: Int) -> Int;
+extern func eg_asp_vm_slot_integer(arena_handle: Int, slot_index: Int) -> Int;
+extern func eg_asp_vm_slot_floating(arena_handle: Int, slot_index: Int) -> Float64;
+extern func eg_asp_vm_slot_string(arena_handle: Int, slot_index: Int) -> String;
+extern func eg_asp_vm_routine_enter(arena_handle: Int, routine_id: Int, return_pc: Int, limit_pc: Int, stack_base: Int, slot_base: Int, slot_count: Int) -> Int;
+extern func eg_asp_vm_routine_bind(arena_handle: Int, me_object_id: Int, return_dest: Int, copyback_mask: Int) -> Int;
+extern func eg_asp_vm_routine_bind_program(arena_handle: Int, caller_dynamic_active: Int, caller_dynamic_index: Int) -> Int;
+extern func eg_asp_vm_routine_bind_error(arena_handle: Int, error_mode: Int, error_number: Int, resume_target_pc: Int) -> Int;
+extern func eg_asp_vm_routine_caller_error_mode(arena_handle: Int) -> Int;
+extern func eg_asp_vm_routine_program_switched(arena_handle: Int) -> Int;
+extern func eg_asp_vm_routine_caller_dynamic_active(arena_handle: Int) -> Int;
+extern func eg_asp_vm_routine_caller_dynamic_index(arena_handle: Int) -> Int;
+extern func eg_asp_vm_routine_leave(arena_handle: Int) -> Int;
+extern func eg_asp_vm_member_select(arena_handle: Int, member_id: Int, object_kind: Int, candidate_id: Int, argument_count: Int, member_flags: Int) -> Int;
+extern func eg_asp_vm_object_call_cache_lookup(arena_handle: Int, caller_program_id: Int, callsite_pc: Int, class_hash: Int, member_id: Int) -> Int;
+extern func eg_asp_vm_object_call_cache_bind(arena_handle: Int, caller_program_id: Int, callsite_pc: Int, class_hash: Int, member_id: Int, callee_program_id: Int, routine_id: Int) -> Int;
+
+// Reusable temporary vectors for one nested evaluator operation. Scratch frames
+// are depth-indexed rather than globally shared because calls may recursively
+// re-enter the runner before the outer operation has consumed its temporaries.
+class VbsVmScratch {
+    var values: collections.Vector<asp.runtime.Variant>;
+    var aux_values: collections.Vector<asp.runtime.Variant>;
+    var ids: collections.Vector<Int>;
+    var ints: collections.Vector<Int>;
+
+    func init(self: VbsVmScratch) -> Void {
+        self.values = new collections.Vector<asp.runtime.Variant>();
+        self.aux_values = new collections.Vector<asp.runtime.Variant>();
+        self.ids = new collections.Vector<Int>();
+        self.ints = new collections.Vector<Int>();
+    }
+    func reset(self: VbsVmScratch) -> Void {
+        self.values.clear(); self.aux_values.clear(); self.ids.clear(); self.ints.clear();
+    }
+}
+
+// Executes VbsBytecodeProgram while preserving full VBScript semantics.
+//
+// There are two cooperating engines:
+// - Egret handles objects, strings, errors, dynamic calls, and all GC-visible
+//   Variant values.
+// - The native C dispatcher batches scalar opcodes and control flow, returning
+//   a reason-coded PC whenever managed semantics or a safepoint is required.
+//
+// The parallel `native_*` vectors form a shadow call stack. Entries at the same
+// index describe one frame and must always be pushed/popped together. Operand,
+// inline, scalar, scratch, and scope storage is retained between requests to
+// reduce allocation, but reset methods must remove all request-owned values.
+class VbsBytecodeRunner {
+    var evaluator: asp.Evaluator;
+    var operand_values: collections.Vector<asp.runtime.Variant>;
+    var inline_values: collections.Vector<asp.runtime.Variant>;
+    var inline_frame_starts: collections.Vector<Int>;
+    var scalar_values: collections.Vector<asp.runtime.Variant>;
+    var scalar_frame_starts: collections.Vector<Int>;
+    var empty_value: asp.runtime.Variant;
+    var zero_value: asp.runtime.Variant;
+    var one_value: asp.runtime.Variant;
+    var minus_one_value: asp.runtime.Variant;
+    var true_value: asp.runtime.Variant;
+    var false_value: asp.runtime.Variant;
+    var scalar_return_value: asp.runtime.Variant;
+    var native_return_pcs: collections.Vector<Int>;
+    var native_limit_pcs: collections.Vector<Int>;
+    var native_stack_bases: collections.Vector<Int>;
+    var native_slot_bases: collections.Vector<Int>;
+    var native_frame_functions: collections.Vector<Int>;
+    var native_frame_push_results: collections.Vector<Int>;
+    var native_frame_statements: collections.Vector<Int>;
+    var native_frame_copyback_masks: collections.Vector<Int>;
+    var native_frame_arg_starts: collections.Vector<Int>;
+    var native_arg_expr_ids: collections.Vector<Int>;
+    var native_caller_scopes: collections.Vector<Scope>;
+    var native_caller_error_modes: collections.Vector<Int>;
+    var native_caller_routine_ids: collections.Vector<Int>;
+    var scratch_frames: collections.Vector<VbsVmScratch>;
+    var scratch_depth: Int;
+    var scope_pool: collections.Vector<Scope>;
+    var scope_pool_depth: Int;
+
+    func init(self: VbsBytecodeRunner, evaluator: asp.Evaluator) -> Void {
+        self.evaluator = evaluator;
+        self.operand_values = new collections.Vector<asp.runtime.Variant>();
+        self.inline_values = new collections.Vector<asp.runtime.Variant>();
+        self.inline_frame_starts = new collections.Vector<Int>();
+        self.scalar_values = new collections.Vector<asp.runtime.Variant>();
+        self.scalar_frame_starts = new collections.Vector<Int>();
+        self.empty_value = asp.runtime.variant_empty();
+        self.zero_value = asp.runtime.variant_int(0);
+        self.one_value = asp.runtime.variant_int(1);
+        self.minus_one_value = asp.runtime.variant_int(-1);
+        self.true_value = asp.runtime.variant_bool(true);
+        self.false_value = asp.runtime.variant_bool(false);
+        self.scalar_return_value = self.empty_value;
+        self.native_return_pcs = new collections.Vector<Int>();
+        self.native_limit_pcs = new collections.Vector<Int>();
+        self.native_stack_bases = new collections.Vector<Int>();
+        self.native_slot_bases = new collections.Vector<Int>();
+        self.native_frame_functions = new collections.Vector<Int>();
+        self.native_frame_push_results = new collections.Vector<Int>();
+        self.native_frame_statements = new collections.Vector<Int>();
+        self.native_frame_copyback_masks = new collections.Vector<Int>();
+        self.native_frame_arg_starts = new collections.Vector<Int>();
+        self.native_arg_expr_ids = new collections.Vector<Int>();
+        self.native_caller_scopes = new collections.Vector<Scope>();
+        self.native_caller_error_modes = new collections.Vector<Int>();
+        self.native_caller_routine_ids = new collections.Vector<Int>();
+        self.scratch_frames = new collections.Vector<VbsVmScratch>();
+        self.scratch_depth = 0;
+        self.scope_pool = new collections.Vector<Scope>();
+        self.scope_pool_depth = 0;
+    }
+
+    // Scratch and scope pools use explicit depth counters. Acquire/reset and
+    // release/reset must remain balanced across every early-return path.
+    func acquire_scratch(self: VbsBytecodeRunner) -> VbsVmScratch {
+        if self.scratch_depth >= self.scratch_frames.len() { _ = self.scratch_frames.push(new VbsVmScratch()); }
+        let scratch: VbsVmScratch = self.scratch_frames.get_unchecked(self.scratch_depth);
+        self.scratch_depth += 1;
+        scratch.reset();
+        return scratch;
+    }
+    func release_scratch(self: VbsBytecodeRunner) -> Void {
+        if self.scratch_depth > 0 { self.scratch_depth -= 1; self.scratch_frames.get_unchecked(self.scratch_depth).reset(); }
+    }
+
+    func acquire_scope(self: VbsBytecodeRunner) -> Scope {
+        if self.scope_pool_depth >= self.scope_pool.len() {
+            _ = self.scope_pool.push(new Scope());
+        }
+        let scope: Scope = self.scope_pool.get_unchecked(self.scope_pool_depth);
+        self.scope_pool_depth += 1;
+        scope.reset();
+        return scope;
+    }
+
+    func release_scope(self: VbsBytecodeRunner) -> Void {
+        if self.scope_pool_depth > 0 {
+            self.scope_pool_depth -= 1;
+            self.scope_pool.get_unchecked(self.scope_pool_depth).reset();
+        }
+    }
+
+    // Operand helpers tolerate an empty stack and use a rooted Empty singleton.
+    // Bulk pop reverses stack order back into source argument order.
+    func pop_variant(self: VbsBytecodeRunner, values: collections.Vector<asp.runtime.Variant>) -> asp.runtime.Variant {
+        return values.len() > 0
+        ? eg_asp_variant_or_fallback(values.data.pop(), self.empty_value)
+        : self.empty_value;
+    }
+
+    func variant_at(self: VbsBytecodeRunner, values: collections.Vector<asp.runtime.Variant>, index: Int) -> asp.runtime.Variant {
+        return index >= 0 && index < values.len()
+        ? eg_asp_variant_or_fallback(values.data.get_unchecked(index), self.empty_value)
+        : self.empty_value;
+    }
+
+    func discard_variant(self: VbsBytecodeRunner, values: collections.Vector<asp.runtime.Variant>) -> Void {
+        if values.len() > 0 {
+            _ = values.data.pop();
+        }
+    }
+
+    func pop_variants_into(self: VbsBytecodeRunner, source: collections.Vector<asp.runtime.Variant>, destination: collections.Vector<asp.runtime.Variant>, count: Int) -> Void {
+        destination.clear();
+        if count <= 0 {
+            return;
+        }
+        destination.reserve(count);
+        let fill: Int = 0;
+        loop fill < count {
+            _ = destination.push(self.empty_value);
+            fill += 1;
+        }
+        let index: Int = count - 1;
+        loop index >= 0 {
+            _ = destination.set(index, self.pop_variant(source));
+            index -= 1;
+        }
+    }
+
+    // Frequently produced scalar values are reused to avoid allocating one
+    // Variant per arithmetic opcode.
+    func cached_int(self: VbsBytecodeRunner, value: Int) -> asp.runtime.Variant {
+        if value == 0 { return self.zero_value; }
+        if value == 1 { return self.one_value; }
+        if value == -1 { return self.minus_one_value; }
+        return asp.runtime.variant_int(value);
+    }
+
+    func cached_bool(self: VbsBytecodeRunner, value: Bool) -> asp.runtime.Variant {
+        return value ? self.true_value : self.false_value;
+    }
+
+    // Creates the immutable native instruction view once. Mapped programs keep
+    // the mapping alive; managed programs copy their contiguous packed words.
+    func ensure_native_program(self: VbsBytecodeRunner, bytecode: VbsBytecodeProgram) -> Int {
+        _ = self;
+        if bytecode.native_program_handle != 0 {
+            return bytecode.native_program_handle;
+        }
+        let handle: Int = bytecode.mapped_image_handle != 0
+            ? eg_asp_vbc_create_mapped(
+                bytecode.mapped_image_handle,
+                bytecode.mapped_insn_offset,
+                bytecode.instruction_count()
+            )
+            : eg_asp_vbc_create_packed(
+                bytecode.insns.data_ptr(), bytecode.instruction_count()
+            );
+        if handle == 0 {
+            return 0;
+        }
+        // Literal metadata must be installed before validation freezes the
+        // packed program.  The old trap-time registration happened after
+        // validation and was therefore rejected by eg_asp_vbc_set_literal,
+        // making every scalar region containing a constant fall back to the
+        // managed Variant stack.
+        let expr_id: Int = 0;
+        loop expr_id < bytecode.program.runtime_expr_count() {
+            let expr_kind: asp.compiler.VbsExprKind = bytecode.program.runtime_expr_kind(expr_id);
+            if expr_kind == asp.compiler.VbsExprInteger {
+                _ = eg_asp_vbc_set_literal(
+                    handle, expr_id, asp.runtime.VariantInt => Int,
+                    bytecode.program.runtime_expr_int(expr_id), 0.0
+                );
+            } else if expr_kind == asp.compiler.VbsExprBool {
+                _ = eg_asp_vbc_set_literal(
+                    handle, expr_id, asp.runtime.VariantBool => Int,
+                    bytecode.program.runtime_expr_bool(expr_id) ? 1 : 0, 0.0
+                );
+            } else if expr_kind == asp.compiler.VbsExprFloat {
+                _ = eg_asp_vbc_set_literal(
+                    handle, expr_id, asp.runtime.VariantFloat => Int, 0,
+                    strconv.parse_float64(bytecode.program.runtime_expr_text(expr_id))
+                );
+            } else if expr_kind == asp.compiler.VbsExprEmpty {
+                _ = eg_asp_vbc_set_literal(handle, expr_id, 10, 0, 0.0);
+            }
+            expr_id += 1;
+        }
+        if eg_asp_vbc_validate(handle) == 0 {
+            eg_asp_vbc_destroy(handle);
+            return 0;
+        }
+        _ = __gc_keepalive(bytecode.insns);
+        bytecode.native_program_handle = handle;
+        return handle;
+    }
+
+    // Native slots contain only scalar payloads. Sync copies managed values in,
+    // and dirty-slot draining copies native writes back at trap/yield boundaries.
+    func sync_native_slot(self: VbsBytecodeRunner, ctx: asp.runtime.RequestContext, index: Int, value: asp.runtime.Variant) -> Void {
+        if eg_asp_vm_native_enabled() == 0 {
+            return;
+        }
+        let kind: Int = value.kind => Int;
+        let integer: Int = value.kind == asp.runtime.VariantBool
+            ? (value.bool_value ? 1 : 0)
+            : value.int_value;
+        // Strings remain managed until native regions can prove that every
+        // consumer has exact VBScript coercion semantics.  Publishing a raw
+        // string here allowed a later unsupported opcode to trap after native
+        // slot writes, so replay observed mixed managed/native state.
+        _ = eg_asp_vm_slot_set(
+            ctx.request_arena_handle, index,
+            value.kind == asp.runtime.VariantString ? -1 : kind,
+            integer, value.float_value
+        );
+        _ = __gc_keepalive(value);
+        _ = __gc_keepalive(self);
+    }
+
+    func sync_native_frame(self: VbsBytecodeRunner, ctx: asp.runtime.RequestContext, start: Int, count: Int) -> Void {
+        if eg_asp_vm_native_enabled() == 0 {
+            return;
+        }
+        let i: Int = 0;
+        loop i < count && start + i < self.scalar_values.len() {
+            self.sync_native_slot(ctx, start + i, self.variant_at(self.scalar_values, start + i));
+            i += 1;
+        }
+    }
+
+    func flush_native_dirty_slots(self: VbsBytecodeRunner, ctx: asp.runtime.RequestContext) -> Void {
+        if eg_asp_vm_native_enabled() == 0 {
+            return;
+        }
+        let index: Int = eg_asp_vm_take_dirty_slot(ctx.request_arena_handle);
+        loop index >= 0 {
+            if index < self.scalar_values.len() {
+                let kind: Int = eg_asp_vm_slot_kind(ctx.request_arena_handle, index);
+                let value: asp.runtime.Variant = kind == 10
+                    ? asp.runtime.variant_empty()
+                    : ((kind == (asp.runtime.VariantString => Int) || kind == 11)
+                        ? asp.runtime.variant_string(
+                            eg_asp_vm_slot_string(ctx.request_arena_handle, index)
+                        )
+                    : (kind == (asp.runtime.VariantNull => Int)
+                        ? asp.runtime.variant_null()
+                        : (kind == (asp.runtime.VariantBool => Int)
+                    ? self.cached_bool(eg_asp_vm_slot_integer(ctx.request_arena_handle, index) != 0)
+                    : (kind == (asp.runtime.VariantFloat => Int)
+                        ? asp.runtime.variant_float(eg_asp_vm_slot_floating(ctx.request_arena_handle, index))
+                        : self.cached_int(eg_asp_vm_slot_integer(ctx.request_arena_handle, index))))));
+                _ = self.scalar_values.set(index, value);
+            }
+            index = eg_asp_vm_take_dirty_slot(ctx.request_arena_handle);
+        }
+    }
+
+    func reset_operand_values(self: VbsBytecodeRunner) -> Void {
+        loop self.operand_values.len() > 0 {
+            _ = self.discard_variant(self.operand_values);
+        }
+    }
+
+    func reset_inline_frames(self: VbsBytecodeRunner) -> Void {
+        loop self.inline_values.len() > 0 {
+            _ = self.discard_variant(self.inline_values);
+        }
+        loop self.inline_frame_starts.len() > 0 {
+            _ = self.inline_frame_starts.pop_back(0);
+        }
+    }
+
+    func reset_scalar_frames(self: VbsBytecodeRunner) -> Void {
+        loop self.scalar_values.len() > 0 {
+            _ = self.discard_variant(self.scalar_values);
+        }
+        loop self.scalar_frame_starts.len() > 0 {
+            _ = self.scalar_frame_starts.pop_back(0);
+        }
+        self.native_return_pcs.clear();
+        self.native_limit_pcs.clear();
+        self.native_stack_bases.clear();
+        self.native_slot_bases.clear();
+        self.native_frame_functions.clear();
+        self.native_frame_push_results.clear();
+        self.native_frame_statements.clear();
+        self.native_frame_copyback_masks.clear();
+        self.native_frame_arg_starts.clear();
+        self.native_arg_expr_ids.clear();
+        self.native_caller_scopes.clear();
+        self.native_caller_error_modes.clear();
+        self.native_caller_routine_ids.clear();
+    }
+
+    // Root entry points reset retained stacks before execution and translate the
+    // VM's internal signal encoding to the engine-facing result.
+    func eval_root_expr(self: VbsBytecodeRunner, bytecode: VbsBytecodeProgram, ctx: asp.runtime.RequestContext) -> asp.runtime.Variant {
+        self.evaluator.active_bytecode = bytecode;
+        self.evaluator.has_active_bytecode = true;
+        ctx.prepare_global_slots(bytecode.global_slot_names);
+        self.reset_operand_values();
+        self.reset_inline_frames();
+        self.reset_scalar_frames();
+        let stack: collections.Vector<asp.runtime.Variant> = self.operand_values;
+        _ = self.execute_pc(bytecode, ctx, self.evaluator.root_scope(ctx), bytecode.root_pc, bytecode.instruction_count(), stack);
+        let result: asp.runtime.Variant = self.pop_variant(stack);
+        return result;
+    }
+
+    func execute_root(self: VbsBytecodeRunner, bytecode: VbsBytecodeProgram, ctx: asp.runtime.RequestContext) -> Int {
+        self.evaluator.active_bytecode = bytecode;
+        self.evaluator.has_active_bytecode = true;
+        ctx.prepare_global_slots(bytecode.global_slot_names);
+        self.reset_operand_values();
+        self.reset_inline_frames();
+        self.reset_scalar_frames();
+        let root_block_id: Int = bytecode.program.root_block_id;
+        let result: Int = self.execute_block(bytecode, ctx, self.evaluator.root_scope(ctx), root_block_id);
+        return result;
+    }
+
+    func execute_block(self: VbsBytecodeRunner, bytecode: VbsBytecodeProgram, ctx: asp.runtime.RequestContext, scope: Scope, block_id: Int, forced_pc: Int = -2, initial_routine_id: Int = -1) -> Int {
+        let entry_pc: Int = forced_pc != -2 ? forced_pc : (block_id >= 0 && block_id < bytecode.block_pcs.len() ? bytecode.block_pcs.get_unchecked(block_id) : -1);
+        let end_pc: Int = block_id >= 0 && block_id < bytecode.block_end_pcs.len() ? bytecode.block_end_pcs.get_unchecked(block_id) : bytecode.instruction_count();
+        let stack_base: Int = self.operand_values.len();
+        let result: Int = entry_pc >= 0 ? self.execute_pc(bytecode, ctx, scope, entry_pc, end_pc, self.operand_values, stack_base, initial_routine_id) : self.evaluator.execute_block_in_scope(bytecode.program, ctx, scope, block_id);
+        loop self.operand_values.len() > stack_base {
+            _ = self.discard_variant(self.operand_values);
+        }
+        return result;
+    }
+
+    // Fast scalar routines keep managed Variants rooted in `scalar_values` but
+    // move frame control metadata to C. Any unsupported value or error mode
+    // rejects the optimization before observable execution begins.
+    func execute_fast_scalar_block(self: VbsBytecodeRunner, bytecode: VbsBytecodeProgram, ctx: asp.runtime.RequestContext, routine_scope: Scope, routine_id: Int, block_id: Int, slot_count: Int, values: collections.Vector<asp.runtime.Variant>) -> asp.runtime.Variant {
+        if slot_count <= 0 {
+            return asp.runtime.variant_empty();
+        }
+        let frame_start: Int = self.scalar_values.len();
+        _ = self.scalar_frame_starts.push(frame_start);
+        let empty_slot: asp.runtime.Variant = asp.runtime.variant_empty();
+        let i: Int = 0;
+        loop i < slot_count {
+            if i > 0 && i - 1 < values.len() {
+                _ = self.scalar_values.push(self.variant_at(values, i - 1));
+            } else {
+                _ = self.scalar_values.push(empty_slot);
+            }
+            i += 1;
+        }
+        self.sync_native_frame(ctx, frame_start, slot_count);
+        let entry_pc: Int = block_id >= 0 && block_id < bytecode.block_pcs.len() ? bytecode.block_pcs.get_unchecked(block_id) : 0;
+        let limit_pc: Int = block_id >= 0 && block_id < bytecode.block_end_pcs.len() ? bytecode.block_end_pcs.get_unchecked(block_id) : bytecode.instruction_count();
+        let native_frame_entered: Bool = eg_asp_vm_routine_enter(ctx.request_arena_handle, routine_id, 0, limit_pc, self.operand_values.len(), frame_start, slot_count) != 0;
+        let caller_error_mode: Bool = ctx.error_state.resume_next_enabled;
+        let stack_base: Int = self.operand_values.len();
+        let result: Int = self.execute_pc(bytecode, ctx, routine_scope, entry_pc, limit_pc, self.operand_values, stack_base, routine_id);
+        loop self.operand_values.len() > stack_base {
+            _ = self.discard_variant(self.operand_values);
+        }
+        ctx.error_state.resume_next_enabled = caller_error_mode;
+        self.scalar_return_value = result == 1 ? asp.runtime.variant_empty() : self.variant_at(self.scalar_values, frame_start);
+        i = 0;
+        loop i < values.len() && i + 1 < slot_count {
+            _ = values.set(i, self.variant_at(self.scalar_values, frame_start + i + 1));
+            i += 1;
+        }
+        _ = self.scalar_frame_starts.pop_back(0);
+        loop self.scalar_values.len() > frame_start {
+            _ = self.discard_variant(self.scalar_values);
+        }
+        if native_frame_entered {
+            _ = eg_asp_vm_routine_leave(ctx.request_arena_handle);
+        }
+        return self.scalar_return_value;
+    }
+
+    func values_are_native_scalars(self: VbsBytecodeRunner, values: collections.Vector<asp.runtime.Variant>) -> Bool {
+        _ = self;
+        let i: Int = 0;
+        loop i < values.len() {
+            let kind: asp.runtime.VariantKind = values.get(i).kind;
+            if kind == asp.runtime.VariantObject || kind == asp.runtime.VariantArray {
+                return false;
+            }
+            i += 1;
+        }
+        return true;
+    }
+
+    func routine_has_writable_byref(self: VbsBytecodeRunner, bytecode: VbsBytecodeProgram, routine_id: Int) -> Bool {
+        _ = self;
+        if routine_id < 0 || routine_id >= bytecode.program.runtime_routine_count() {
+            return true;
+        }
+        let writes_mask: Int = routine_id < bytecode.routine_writes_masks.len()
+            ? bytecode.routine_writes_masks.get_unchecked(routine_id)
+            : bytecode.program.runtime_routine_writes_mask(routine_id);
+        if (vbs_routine_frame_flags(bytecode, routine_id) & (VbsRoutineFrameExecute => Int)) != 0 {
+            // Execute can mutate any visible ByRef parameter; static AST write
+            // analysis cannot see those assignments.
+            writes_mask = 2147483647;
+        }
+        if writes_mask == 0 {
+            return false;
+        }
+        let param_index: Int = 0;
+        loop param_index < bytecode.program.runtime_routine_param_count(routine_id) && param_index < 31 {
+            if (writes_mask & (1 << param_index)) != 0
+            && bytecode.program.runtime_routine_param_by_ref(routine_id, param_index) != 0 {
+                return true;
+            }
+            param_index += 1;
+        }
+        return false;
+    }
+
+    func routine_c_frame_safe(self: VbsBytecodeRunner, bytecode: VbsBytecodeProgram, routine_id: Int) -> Bool {
+        _ = self;
+        if routine_id < 0 || routine_id >= bytecode.routine_slot_counts.len() {
+            return false;
+        }
+        let flags: Int = vbs_routine_frame_flags(bytecode, routine_id);
+        return (flags & (VbsRoutineFrameHasMetadata => Int)) != 0
+            && (flags & (VbsRoutineFrameCSafe => Int)) != 0;
+    }
+
+    func object_call_class_hash(self: VbsBytecodeRunner, class_name: String) -> Int {
+        _ = self;
+        let hash: Int = 216613626;
+        let i: Int = 0;
+        loop i < std.len(class_name) {
+            let value: Int = std.byte_at(class_name, i);
+            hash = (hash * 16777619) ^ (value >= 'A' && value <= 'Z' ? value + ('a' - 'A') : value);
+            i += 1;
+        }
+        return hash & 2147483647;
+    }
+
+    // ByRef copy-back is represented as a bit mask and original expression IDs.
+    // It occurs only after the callee frame has been restored, so writes target
+    // the caller's scope and preserve VBScript aliasing behavior.
+    func routine_copyback_mask(self: VbsBytecodeRunner, bytecode: VbsBytecodeProgram, routine_id: Int, ctx: asp.runtime.RequestContext, scope: Scope, arg_ids: collections.Vector<Int>) -> Int {
+        if routine_id < 0 || routine_id >= bytecode.program.runtime_routine_count() {
+            return 0;
+        }
+        let writes_mask: Int = routine_id < bytecode.routine_writes_masks.len()
+            ? bytecode.routine_writes_masks.get_unchecked(routine_id)
+            : bytecode.program.runtime_routine_writes_mask(routine_id);
+        if (vbs_routine_frame_flags(bytecode, routine_id) & (VbsRoutineFrameExecute => Int)) != 0 {
+            writes_mask = 2147483647;
+        }
+        let mask: Int = 0;
+        let i: Int = 0;
+        loop i < arg_ids.len() && i < 31 && i < bytecode.program.runtime_routine_param_count(routine_id) {
+            if (writes_mask & (1 << i)) != 0
+            && bytecode.program.runtime_routine_param_by_ref(routine_id, i) != 0
+            && self.evaluator.expr_supports_copyback(bytecode.program, ctx, scope, arg_ids.get_unchecked(i)) {
+                mask = mask | (1 << i);
+            }
+            i += 1;
+        }
+        return mask;
+    }
+
+    func push_copyback_frame(self: VbsBytecodeRunner, mask: Int, arg_ids: collections.Vector<Int>) -> Void {
+        _ = self.native_frame_copyback_masks.push(mask);
+        _ = self.native_frame_arg_starts.push(self.native_arg_expr_ids.len());
+        let i: Int = 0;
+        loop i < arg_ids.len() {
+            _ = self.native_arg_expr_ids.push(arg_ids.get_unchecked(i));
+            i += 1;
+        }
+    }
+
+    // Native slots and evaluator-visible names must belong to the same call.
+    // Reusing the caller's Scope lets a callee's local assignment overwrite an
+    // interpreted caller's identically named local (including object handles).
+    func enter_native_scope(self: VbsBytecodeRunner, bytecode: VbsBytecodeProgram, ctx: asp.runtime.RequestContext, caller_scope: Scope, routine_id: Int, object_id: Int, frame_start: Int) -> Scope {
+        // The caller can be interpreted and have no native error frame.
+        // Snapshot its actual mode before the callee changes On Error state.
+        _ = self.native_caller_error_modes.push(ctx.error_state.resume_next_enabled ? 1 : 0);
+        _ = self.native_caller_scopes.push(caller_scope);
+        let scope: Scope = self.acquire_scope();
+        scope.set_parent(self.evaluator.root_scope(ctx));
+        scope.me_object_id = object_id;
+        scope.me_class_name = bytecode.program.runtime_routine_owner(routine_id);
+        scope.function_name = bytecode.program.runtime_routine_is_function(routine_id)
+            ? bytecode.program.runtime_routine_name(routine_id) : "";
+        let names: collections.Vector<String> = vbs_routine_slot_names(bytecode, routine_id);
+        let i: Int = 0;
+        loop i < names.len() {
+            _ = scope.vars.set(names.get_unchecked(i), self.variant_at(self.scalar_values, frame_start + i));
+            i += 1;
+        }
+        // Keep both scopes rooted and return a borrowed vector element.
+        // Returning the newly owned Scope directly would make reassignment
+        // mark execute_pc_inner's scope parameter for recursive destruction,
+        // including the caller's variable table after it is restored.
+        _ = self.native_caller_scopes.push(scope);
+        return self.native_caller_scopes.get_unchecked(self.native_caller_scopes.len() - 1);
+    }
+
+    func assign_frame_copyback(self: VbsBytecodeRunner, bytecode: VbsBytecodeProgram, ctx: asp.runtime.RequestContext, scope: Scope, caller_routine_id: Int, expr_id: Int, value: asp.runtime.Variant) -> Void {
+        if caller_routine_id >= 0
+        && caller_routine_id < bytecode.routine_slot_names.len()
+        && self.scalar_frame_starts.len() > 0
+        && expr_id >= 0
+        && expr_id < bytecode.program.runtime_expr_count()
+        && bytecode.program.runtime_expr_kind(expr_id) == asp.compiler.VbsExprIdentifier {
+            let name: String = bytecode.program.runtime_expr_text(expr_id);
+            let names: collections.Vector<String> = vbs_routine_slot_names(bytecode, caller_routine_id);
+            let slot: Int = 0;
+            loop slot < names.len() {
+                if strings.equal_fold_ascii(names.get_unchecked(slot), name) {
+                    let frame_start: Int = self.scalar_frame_starts.get_unchecked(self.scalar_frame_starts.len() - 1);
+                    let value_index: Int = frame_start + slot;
+                    if value_index >= 0 && value_index < self.scalar_values.len() {
+                        _ = self.scalar_values.set(value_index, value);
+                        self.sync_native_slot(ctx, value_index, value);
+                        return;
+                    }
+                    break;
+                }
+                slot += 1;
+            }
+        }
+        if expr_id >= 0
+        && expr_id < bytecode.program.runtime_expr_count()
+        && bytecode.program.runtime_expr_kind(expr_id) == asp.compiler.VbsExprIdentifier {
+            let name: String = bytecode.program.runtime_expr_text(expr_id);
+            if scope.me_object_id > 0 && self.evaluator.has_me_field(ctx, scope, name) {
+                _ = self.evaluator.set_me_field(ctx, scope, name, value);
+                return;
+            }
+        }
+        self.evaluator.assign_target_expr(bytecode.program, ctx, scope, expr_id, value, true);
+    }
+
+    func find_dynamic_object_routine(self: VbsBytecodeRunner, class_name: String, member_name: String) -> Int {
+        let definition_pos: Int = self.evaluator.dynamic_definition_indices.len() - 1;
+        loop definition_pos >= 0 {
+            let candidate_index: Int = self.evaluator.dynamic_definition_indices.get_unchecked(definition_pos);
+            let candidate: VbsBytecodeProgram = self.evaluator.dynamic_bytecode_at(candidate_index);
+            let routine_id: Int = self.evaluator.find_routine_by_function_kind(candidate.program, member_name, class_name, true);
+            if routine_id >= 0 {
+                return (candidate_index + 1) * 1048576 + routine_id;
+            }
+            definition_pos -= 1;
+        }
+        return -1;
+    }
+
+    // `execute_pc` owns scratch acquisition; `execute_pc_inner` is the dispatch
+    // loop. `stack_floor` prevents a nested routine from consuming its caller's
+    // operands. Native reason-coded returns either resume managed handling at
+    // the same PC, poll GC, yield a bounded batch, or terminate.
+    func execute_pc(self: VbsBytecodeRunner, bytecode: VbsBytecodeProgram, ctx: asp.runtime.RequestContext, scope: Scope, entry_pc: Int, end_pc: Int = -1, stack: collections.Vector<asp.runtime.Variant> = (new collections.Vector<asp.runtime.Variant>()), stack_floor: Int = 0, initial_routine_id: Int = -1) -> Int {
+        let scratch: VbsVmScratch = self.acquire_scratch();
+        let native_program: Int = eg_asp_vm_native_enabled() != 0
+            ? self.ensure_native_program(bytecode)
+            : 0;
+        let result: Int = self.execute_pc_inner(bytecode, ctx, scope, entry_pc, end_pc, stack, stack_floor, scratch, native_program, initial_routine_id);
+        self.release_scratch();
+        return result;
+    }
+
+    func execute_pc_inner(self: VbsBytecodeRunner, bytecode: VbsBytecodeProgram, ctx: asp.runtime.RequestContext, scope: Scope, entry_pc: Int, end_pc: Int, stack: collections.Vector<asp.runtime.Variant>, stack_floor: Int, scratch: VbsVmScratch, native_program_handle: Int, initial_routine_id: Int) -> Int {
+        let pc: Int = entry_pc;
+        let native_program: Int = native_program_handle;
+        let native_routines_enabled: Bool = eg_asp_vm_native_enabled() != 0;
+        if !native_routines_enabled {
+            native_program = 0;
+        }
+        let native_classes_enabled: Bool = native_routines_enabled && eg_asp_vm_class_enabled() != 0;
+        let instruction_count: Int = bytecode.instruction_count();
+        let limit_pc: Int = end_pc >= 0 && end_pc < instruction_count ? end_pc : instruction_count;
+        let native_frame_floor: Int = self.native_return_pcs.len();
+        let native_current_routine_id: Int = initial_routine_id;
+        loop true {
+            if pc < 0 || pc >= limit_pc {
+                if self.native_return_pcs.len() <= native_frame_floor {
+                    break;
+                }
+                let frame_index: Int = self.native_return_pcs.len() - 1;
+                let frame_start: Int = self.native_slot_bases.get_unchecked(frame_index);
+                let frame_stack_base: Int = self.native_stack_bases.get_unchecked(frame_index);
+                let frame_is_function: Bool = self.native_frame_functions.get_unchecked(frame_index) != 0;
+                let frame_push_result: Bool = self.native_frame_push_results.get_unchecked(frame_index) != 0;
+                let frame_statement: Bool = self.native_frame_statements.get_unchecked(frame_index) != 0;
+                let copyback_mask: Int = self.native_frame_copyback_masks.pop_back(0);
+                let arg_start: Int = self.native_frame_arg_starts.pop_back(self.native_arg_expr_ids.len());
+                let frame_result: asp.runtime.Variant = frame_is_function
+                ? self.variant_at(self.scalar_values, frame_start)
+                : asp.runtime.variant_empty();
+                loop stack.len() > frame_stack_base { _ = self.discard_variant(stack); }
+                _ = self.scalar_frame_starts.pop_back(0);
+                pc = self.native_return_pcs.pop_back(0);
+                limit_pc = self.native_limit_pcs.pop_back(instruction_count);
+                _ = self.native_stack_bases.pop_back(0);
+                _ = self.native_slot_bases.pop_back(0);
+                _ = self.native_frame_functions.pop_back(0);
+                _ = self.native_frame_push_results.pop_back(0);
+                _ = self.native_frame_statements.pop_back(0);
+                let program_switched: Bool = eg_asp_vm_routine_program_switched(ctx.request_arena_handle) != 0;
+                if program_switched {
+                    let caller_dynamic_active: Bool = eg_asp_vm_routine_caller_dynamic_active(ctx.request_arena_handle) != 0;
+                    let caller_dynamic_index: Int = eg_asp_vm_routine_caller_dynamic_index(ctx.request_arena_handle);
+                    self.evaluator.dynamic_vm_active = caller_dynamic_active;
+                    self.evaluator.dynamic_active_index = caller_dynamic_index;
+                    bytecode = caller_dynamic_active
+                        ? self.evaluator.dynamic_bytecode_at(caller_dynamic_index)
+                        : self.evaluator.active_bytecode;
+                    instruction_count = bytecode.instruction_count();
+                    ctx.prepare_global_slots(bytecode.global_slot_names);
+                }
+                let caller_routine_id: Int = self.native_caller_routine_ids.pop_back(-1);
+                _ = self.native_caller_scopes.remove_at(self.native_caller_scopes.len() - 1);
+                scope = self.native_caller_scopes.get_unchecked(self.native_caller_scopes.len() - 1);
+                _ = self.native_caller_scopes.remove_at(self.native_caller_scopes.len() - 1);
+                self.release_scope();
+                native_current_routine_id = caller_routine_id;
+                let copyback_index: Int = 0;
+                loop copyback_index < 31 && arg_start + copyback_index < self.native_arg_expr_ids.len() {
+                    if (copyback_mask & (1 << copyback_index)) != 0 {
+                        self.assign_frame_copyback(
+                            bytecode, ctx, scope, native_current_routine_id,
+                            self.native_arg_expr_ids.get_unchecked(arg_start + copyback_index),
+                            self.variant_at(self.scalar_values, frame_start + 1 + copyback_index)
+                        );
+                    }
+                    copyback_index += 1;
+                }
+                loop self.native_arg_expr_ids.len() > arg_start { _ = self.native_arg_expr_ids.pop_back(-1); }
+                loop self.scalar_values.len() > frame_start { _ = self.discard_variant(self.scalar_values); }
+                _ = eg_asp_vm_routine_leave(ctx.request_arena_handle);
+                ctx.error_state.resume_next_enabled = self.native_caller_error_modes.pop_back(0) != 0;
+                if frame_push_result {
+                    _ = stack.push(frame_result);
+                }
+                if frame_statement {
+                    let statement_result: Int = self.evaluator.finish_statement(ctx);
+                    if statement_result != 0 || ctx.response.ended {
+                        return statement_result == 0 && ctx.response.ended ? 1 : statement_result;
+                    }
+                }
+                skip;
+            }
+            if native_routines_enabled
+            && (native_program == 0 || native_program != bytecode.native_program_handle) {
+                native_program = self.ensure_native_program(bytecode);
+            }
+            if native_program != 0 && !self.evaluator.statement_failed {
+                let dispatch: Int = eg_asp_vm_dispatch(ctx.request_arena_handle, native_program, pc, limit_pc);
+                if dispatch == -1 {
+                    self.flush_native_dirty_slots(ctx);
+                    return 0;
+                }
+                if dispatch == -2 {
+                    // A bad native view is a soft failure: preserve the old VM.
+                    self.flush_native_dirty_slots(ctx);
+                    native_program = 0;
+                } else {
+                    let dispatch_reason: Int = dispatch % 4;
+                    pc = dispatch / 4;
+                    // YIELD and GC_POLL remain entirely inside the tagged
+                    // native frame. Materialize dirty scalar slots only when
+                    // an unsupported opcode actually crosses into managed
+                    // execution.
+                    if dispatch_reason == 0 {
+                        self.flush_native_dirty_slots(ctx);
+                    }
+                    // A native branch can land exactly on the routine limit.
+                    // Re-enter the frame-unwind path before reading another
+                    // instruction; the next opcode belongs to the caller or
+                    // another routine and may be the page's Halt instruction.
+                    if pc < 0 || pc >= limit_pc {
+                        skip;
+                    }
+                    if dispatch_reason == 1 {
+                        // Re-enter managed code at a precise compiler-known
+                        // safepoint; C only observes the runtime latch.
+                        eg_gc_preempt_guard_enter();
+                        eg_gc_preempt_guard_leave();
+                        skip;
+                    }
+                    if dispatch_reason == 2 {
+                        skip;
+                    }
+                }
+            }
+            let instruction_offset: Int = pc * 3;
+            let op: Int = bytecode.instruction_word(instruction_offset);
+            let arg0: Int = bytecode.instruction_word(instruction_offset + 1);
+            let arg1: Int = bytecode.instruction_word(instruction_offset + 2);
+            if self.evaluator.statement_failed {
+                // A failed RHS must leave its destination unchanged under
+                // Resume Next. Consume only this assignment's operands so an
+                // enclosing expression or native caller keeps its stack.
+                let discard_count: Int = 0;
+                if op == (VbsBytecodeAssignScalarSlot => Int) {
+                    discard_count = 1 + arg1;
+                } else if op == (VbsBytecodeAssignGlobalSlot => Int)
+                || op == (VbsBytecodeAssignIdentifier => Int)
+                || (op >= (VbsBytecodeAssignSessionTimeout => Int) && op <= (VbsBytecodeAssignResponseStatus => Int)) {
+                    discard_count = 1;
+                } else if op == (VbsBytecodeAssignSessionValue => Int) || op == (VbsBytecodeAssignApplicationValue => Int) {
+                    discard_count = 2;
+                } else if op == (VbsBytecodeAssignStmt => Int) {
+                    discard_count = 1 + bytecode.program.runtime_stmt_target_arg_count(arg0);
+                } else if op == (VbsBytecodeAssignTargetDefault => Int) || op == (VbsBytecodeAssignTargetMember => Int) {
+                    let target_id: Int = bytecode.program.runtime_stmt_target_expr(arg0);
+                    discard_count = 1 + bytecode.program.runtime_expr_arg_count(target_id)
+                        + (bytecode.program.runtime_expr_left(target_id) >= 0 ? 1 : 0);
+                }
+                if discard_count > 0 {
+                    loop discard_count > 0 && stack.len() > stack_floor {
+                        _ = self.discard_variant(stack);
+                        discard_count -= 1;
+                    }
+                    let failed_result: Int = self.evaluator.finish_statement(ctx);
+                    if failed_result != 0 {
+                        return failed_result;
+                    }
+                    pc += 1;
+                    skip;
+                }
+            }
+            // Native scalar superinstruction:
+            //   load slot/literal, load slot/literal, compare, jump-if-false.
+            // It keeps primitive operands unboxed and materializes nothing.
+            if native_routines_enabled && native_program == 0 && pc + 3 < limit_pc {
+                let right_offset: Int = instruction_offset + 3;
+                let compare_offset: Int = instruction_offset + 6;
+                let branch_offset: Int = instruction_offset + 9;
+                let right_op: Int = bytecode.instruction_word(right_offset);
+                let compare_op: Int = bytecode.instruction_word(compare_offset);
+                let branch_op: Int = bytecode.instruction_word(branch_offset);
+                let source_ops: Bool = (op == (VbsBytecodePushScalarSlot => Int) || op == (VbsBytecodePushExprLeaf => Int))
+                    && (right_op == (VbsBytecodePushScalarSlot => Int) || right_op == (VbsBytecodePushExprLeaf => Int));
+                if source_ops
+                && compare_op >= (VbsBytecodeEq => Int)
+                && compare_op <= (VbsBytecodeGe => Int)
+                && branch_op == (VbsBytecodeJumpIfFalse => Int) {
+                    let left_kind: Int = -1;
+                    let left_integer: Int = 0;
+                    let left_floating: Float64 = 0.0;
+                    let right_kind: Int = -1;
+                    let right_integer: Int = 0;
+                    let right_floating: Float64 = 0.0;
+                    let frame_start: Int = self.scalar_frame_starts.len() > 0
+                        ? self.scalar_frame_starts.get_unchecked(self.scalar_frame_starts.len() - 1)
+                        : -1;
+                    if op == (VbsBytecodePushScalarSlot => Int) {
+                        let value_index: Int = frame_start + arg0;
+                        if frame_start >= 0 && value_index >= 0 && value_index < self.scalar_values.len() {
+                            let value: asp.runtime.Variant = self.variant_at(self.scalar_values, value_index);
+                            left_kind = value.kind => Int;
+                            left_integer = value.kind == asp.runtime.VariantBool ? (value.bool_value ? 1 : 0) : value.int_value;
+                            left_floating = value.float_value;
+                        }
+                    } else if arg0 >= 0 && arg0 < bytecode.program.runtime_expr_count() {
+                        let kind: asp.compiler.VbsExprKind = bytecode.program.runtime_expr_kind(arg0);
+                        if kind == asp.compiler.VbsExprInteger {
+                            left_kind = asp.runtime.VariantInt => Int;
+                            left_integer = bytecode.program.runtime_expr_int(arg0);
+                        } else if kind == asp.compiler.VbsExprFloat {
+                            left_kind = asp.runtime.VariantFloat => Int;
+                            left_floating = strconv.parse_float64(bytecode.program.runtime_expr_text(arg0));
+                        } else if kind == asp.compiler.VbsExprBool {
+                            left_kind = asp.runtime.VariantBool => Int;
+                            left_integer = bytecode.program.runtime_expr_bool(arg0) ? 1 : 0;
+                        }
+                    }
+                    let right_arg0: Int = bytecode.instruction_word(right_offset + 1);
+                    if right_op == (VbsBytecodePushScalarSlot => Int) {
+                        let value_index: Int = frame_start + right_arg0;
+                        if frame_start >= 0 && value_index >= 0 && value_index < self.scalar_values.len() {
+                            let value: asp.runtime.Variant = self.variant_at(self.scalar_values, value_index);
+                            right_kind = value.kind => Int;
+                            right_integer = value.kind == asp.runtime.VariantBool ? (value.bool_value ? 1 : 0) : value.int_value;
+                            right_floating = value.float_value;
+                        }
+                    } else if right_arg0 >= 0 && right_arg0 < bytecode.program.runtime_expr_count() {
+                        let kind: asp.compiler.VbsExprKind = bytecode.program.runtime_expr_kind(right_arg0);
+                        if kind == asp.compiler.VbsExprInteger {
+                            right_kind = asp.runtime.VariantInt => Int;
+                            right_integer = bytecode.program.runtime_expr_int(right_arg0);
+                        } else if kind == asp.compiler.VbsExprFloat {
+                            right_kind = asp.runtime.VariantFloat => Int;
+                            right_floating = strconv.parse_float64(bytecode.program.runtime_expr_text(right_arg0));
+                        } else if kind == asp.compiler.VbsExprBool {
+                            right_kind = asp.runtime.VariantBool => Int;
+                            right_integer = bytecode.program.runtime_expr_bool(right_arg0) ? 1 : 0;
+                        }
+                    }
+                    let fused_result: Int = eg_asp_vm_fused_numeric_compare(
+                        compare_op,
+                        left_kind, left_integer, left_floating,
+                        right_kind, right_integer, right_floating
+                    );
+                    if fused_result != 2 {
+                        pc = fused_result != 0
+                            ? pc + 4
+                            : bytecode.instruction_word(branch_offset + 2);
+                        skip;
+                    }
+                }
+                let arithmetic_op: Int = compare_op;
+                let assign_op: Int = branch_op;
+                let integer_arithmetic: Bool = arithmetic_op == (VbsBytecodeAdd => Int)
+                    || arithmetic_op == (VbsBytecodeSub => Int)
+                    || arithmetic_op == (VbsBytecodeMul => Int)
+                    || arithmetic_op == (VbsBytecodeMod => Int)
+                    || arithmetic_op == (VbsBytecodeAnd => Int)
+                    || arithmetic_op == (VbsBytecodeOr => Int)
+                    || arithmetic_op == (VbsBytecodeXor => Int);
+                if source_ops && integer_arithmetic
+                && assign_op == (VbsBytecodeAssignScalarSlot => Int)
+                && bytecode.instruction_word(branch_offset + 2) == 0 {
+                    let left_valid: Bool = false;
+                    let left_value: Int = 0;
+                    let right_valid: Bool = false;
+                    let right_value: Int = 0;
+                    let frame_start: Int = self.scalar_frame_starts.len() > 0
+                        ? self.scalar_frame_starts.get_unchecked(self.scalar_frame_starts.len() - 1)
+                        : -1;
+                    if op == (VbsBytecodePushScalarSlot => Int) {
+                        let value_index: Int = frame_start + arg0;
+                        if frame_start >= 0 && value_index >= 0 && value_index < self.scalar_values.len() {
+                            let value: asp.runtime.Variant = self.variant_at(self.scalar_values, value_index);
+                            if value.kind == asp.runtime.VariantInt || value.kind == asp.runtime.VariantBool {
+                                left_valid = true;
+                                left_value = value.kind == asp.runtime.VariantBool ? (value.bool_value ? -1 : 0) : value.int_value;
+                            }
+                        }
+                    } else if arg0 >= 0 && arg0 < bytecode.program.runtime_expr_count() {
+                        let kind: asp.compiler.VbsExprKind = bytecode.program.runtime_expr_kind(arg0);
+                        if kind == asp.compiler.VbsExprInteger || kind == asp.compiler.VbsExprBool {
+                            left_valid = true;
+                            left_value = kind == asp.compiler.VbsExprBool
+                                ? (bytecode.program.runtime_expr_bool(arg0) ? -1 : 0)
+                                : bytecode.program.runtime_expr_int(arg0);
+                        }
+                    }
+                    let right_arg0: Int = bytecode.instruction_word(right_offset + 1);
+                    if right_op == (VbsBytecodePushScalarSlot => Int) {
+                        let value_index: Int = frame_start + right_arg0;
+                        if frame_start >= 0 && value_index >= 0 && value_index < self.scalar_values.len() {
+                            let value: asp.runtime.Variant = self.variant_at(self.scalar_values, value_index);
+                            if value.kind == asp.runtime.VariantInt || value.kind == asp.runtime.VariantBool {
+                                right_valid = true;
+                                right_value = value.kind == asp.runtime.VariantBool ? (value.bool_value ? -1 : 0) : value.int_value;
+                            }
+                        }
+                    } else if right_arg0 >= 0 && right_arg0 < bytecode.program.runtime_expr_count() {
+                        let kind: asp.compiler.VbsExprKind = bytecode.program.runtime_expr_kind(right_arg0);
+                        if kind == asp.compiler.VbsExprInteger || kind == asp.compiler.VbsExprBool {
+                            right_valid = true;
+                            right_value = kind == asp.compiler.VbsExprBool
+                                ? (bytecode.program.runtime_expr_bool(right_arg0) ? -1 : 0)
+                                : bytecode.program.runtime_expr_int(right_arg0);
+                        }
+                    }
+                    if left_valid && right_valid
+                    && (arithmetic_op != (VbsBytecodeMod => Int) || right_value != 0) {
+                        let result_value: asp.runtime.Variant = self.cached_int(
+                            eg_asp_vm_fused_integer_binary(arithmetic_op, left_value, right_value)
+                        );
+                        let target_slot: Int = bytecode.instruction_word(branch_offset + 1);
+                        let target_index: Int = frame_start + target_slot;
+                        if frame_start >= 0 && target_index >= 0 && target_index < self.scalar_values.len() {
+                            _ = self.scalar_values.set(target_index, result_value);
+                            self.sync_native_slot(ctx, target_index, result_value);
+                            if target_slot == 0 && std.len(scope.function_name) > 0 {
+                                _ = scope.vars.set(scope.function_name, result_value);
+                            }
+                            pc += 4;
+                            skip;
+                        }
+                    }
+                }
+            }
+            if op == (VbsBytecodeHalt => Int) {
+                return 0;
+            }
+            if op == (VbsBytecodeWriteLiteral => Int) {
+                if arg0 >= 0 && arg0 < bytecode.literal_strings.len() {
+                    ctx.response.write(bytecode.literal_strings.get_unchecked(arg0));
+                }
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeOnErrorResumeNext => Int) {
+                ctx.error_state.resume_next_enabled = true;
+                _ = eg_asp_vm_routine_bind_error(ctx.request_arena_handle, 1, ctx.error_state.error_number, pc + 1);
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeOnErrorGoto0 => Int) {
+                ctx.error_state.resume_next_enabled = false;
+                _ = ctx.error_state.clear();
+                self.evaluator.statement_failed = false;
+                _ = eg_asp_vm_routine_bind_error(ctx.request_arena_handle, 0, 0, pc + 1);
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeExecStmt => Int) {
+                // Unsupported statements (notably Execute) are interpreted at
+                // this exact PC.  Unified routine locals live in scalar_values,
+                // so expose a temporary Scope view and copy known slots back
+                // instead of recursively interpreting the whole routine.
+                let fallback_scope: Scope = scope;
+                let fallback_names: collections.Vector<String> = new collections.Vector<String>();
+                let fallback_frame_start: Int = -1;
+                if native_current_routine_id >= 0
+                && native_current_routine_id < bytecode.routine_slot_names.len()
+                && self.scalar_frame_starts.len() > 0 {
+                    fallback_names = vbs_routine_slot_names(bytecode, native_current_routine_id);
+                    fallback_frame_start = self.scalar_frame_starts.get_unchecked(self.scalar_frame_starts.len() - 1);
+                    let fallback_slot: Int = 0;
+                    loop fallback_slot < fallback_names.len() {
+                        _ = fallback_scope.vars.set(
+                            fallback_names.get_unchecked(fallback_slot),
+                            self.variant_at(self.scalar_values, fallback_frame_start + fallback_slot)
+                        );
+                        fallback_slot += 1;
+                    }
+                    self.sync_native_frame(ctx, fallback_frame_start, fallback_names.len());
+                }
+                let result: Int = self.evaluator.execute_stmt(bytecode.program, ctx, fallback_scope, arg0);
+                if fallback_frame_start >= 0 {
+                    let fallback_slot: Int = 0;
+                    loop fallback_slot < fallback_names.len() {
+                        let fallback_name: String = fallback_names.get_unchecked(fallback_slot);
+                        if fallback_scope.vars.has(fallback_name) {
+                            _ = self.scalar_values.set(
+                                fallback_frame_start + fallback_slot,
+                                fallback_scope.vars.get_or_empty(fallback_name)
+                            );
+                        }
+                        fallback_slot += 1;
+                    }
+                }
+                // Interpreted statements may mutate ctx.locals directly (Dim,
+                // Const, ExecuteGlobal), so invalidate the dense view.
+                ctx.invalidate_global_slots();
+                if result != 0 || ctx.response.ended {
+                    return result == 0 && ctx.response.ended ? 1 : result;
+                }
+                pc += 1;
+                skip;
+            }
+            // Calls dominate real ASP workloads. Dispatch them before the
+            // arithmetic/control opcode chain so a routine call does not pay
+            // dozens of failed opcode comparisons.
+            if op == (VbsBytecodeObjectCallStmt => Int) {
+                let receiver_expr_id: Int = bytecode.program.runtime_stmt_extra_expr(arg0);
+                let member_expr_id: Int = bytecode.program.runtime_stmt_extra_expr2(arg0);
+                let member_name: String = member_expr_id >= 0 && member_expr_id < bytecode.program.runtime_expr_count()
+                    ? bytecode.program.runtime_expr_text(member_expr_id)
+                    : "";
+                let call_arg_count: Int = bytecode.program.runtime_stmt_call_arg_count(arg0);
+                let call_arg_ids: collections.Vector<Int> = scratch.ids;
+                call_arg_ids.clear();
+                let call_args: collections.Vector<asp.runtime.Variant> = scratch.values;
+                self.pop_variants_into(stack, call_args, call_arg_count);
+                let call_arg_index: Int = 0;
+                loop call_arg_index < call_arg_count {
+                    _ = call_arg_ids.push(bytecode.program.runtime_stmt_call_arg(arg0, call_arg_index));
+                    call_arg_index += 1;
+                }
+                let target: asp.runtime.Variant = self.pop_variant(stack);
+                if native_classes_enabled && target.kind == asp.runtime.VariantObject {
+                    let obj: RuntimeObject = self.evaluator.get_object(ctx, target.object_value);
+                    let callee_dynamic_index: Int = -1;
+                    let caller_dynamic_active: Bool = self.evaluator.dynamic_vm_active;
+                    let caller_dynamic_index: Int = self.evaluator.dynamic_active_index;
+                    let caller_program_id: Int = caller_dynamic_active ? caller_dynamic_index + 1 : 0;
+                    let class_hash: Int = self.object_call_class_hash(obj.class_name);
+                    let cached_binding: Int = eg_asp_vm_object_call_cache_lookup(
+                        ctx.request_arena_handle, caller_program_id, pc, class_hash, arg1 > 0 ? arg1 : 0
+                    );
+                    let object_routine_id: Int = -1;
+                    if cached_binding >= 0 {
+                        let cached_program_id: Int = cached_binding / 1048576 - 1;
+                        let cached_routine_id: Int = cached_binding % 1048576;
+                        if cached_program_id > 0 {
+                            callee_dynamic_index = cached_program_id - 1;
+                            bytecode = self.evaluator.dynamic_bytecode_at(callee_dynamic_index);
+                            instruction_count = bytecode.instruction_count();
+                            self.evaluator.dynamic_vm_active = true;
+                            self.evaluator.dynamic_active_index = callee_dynamic_index;
+                            ctx.prepare_global_slots(bytecode.global_slot_names);
+                            object_routine_id = cached_routine_id;
+                        } else if !caller_dynamic_active {
+                            object_routine_id = cached_routine_id;
+                        }
+                    }
+                    if object_routine_id < 0 {
+                        object_routine_id = self.evaluator.find_routine_by_function_kind(bytecode.program, member_name, obj.class_name, true);
+                    }
+                    if object_routine_id < 0 && obj.kind == RuntimeObjectUserClass {
+                        let packed_candidate: Int = self.find_dynamic_object_routine(obj.class_name, member_name);
+                        if packed_candidate >= 0 {
+                            callee_dynamic_index = packed_candidate / 1048576 - 1;
+                            object_routine_id = packed_candidate % 1048576;
+                            bytecode = self.evaluator.dynamic_bytecode_at(callee_dynamic_index);
+                            instruction_count = bytecode.instruction_count();
+                            self.evaluator.dynamic_vm_active = true;
+                            self.evaluator.dynamic_active_index = callee_dynamic_index;
+                            ctx.prepare_global_slots(bytecode.global_slot_names);
+                        }
+                    }
+                    if obj.kind == RuntimeObjectUserClass
+                    && !obj.store.has(member_name)
+                    && object_routine_id >= 0
+                    && object_routine_id < bytecode.routine_slot_counts.len()
+                    && object_routine_id < bytecode.routine_block_ids.len()
+                    && self.routine_c_frame_safe(bytecode, object_routine_id)
+                    && strings.equal_fold_ascii(bytecode.program.runtime_routine_owner(object_routine_id), obj.class_name)
+                    && eg_asp_vm_member_select(ctx.request_arena_handle, arg1 > 0 ? arg1 : object_routine_id + 1, obj.kind => Int, object_routine_id, call_args.len(), 0) == object_routine_id {
+                        let routine_block_id: Int = bytecode.routine_block_ids.get_unchecked(object_routine_id);
+                        let routine_entry_pc: Int = routine_block_id >= 0 && routine_block_id < bytecode.block_pcs.len()
+                            ? bytecode.block_pcs.get_unchecked(routine_block_id) : -1;
+                        let routine_limit_pc: Int = routine_block_id >= 0 && routine_block_id < bytecode.block_end_pcs.len()
+                            ? bytecode.block_end_pcs.get_unchecked(routine_block_id) : -1;
+                        let routine_slot_count: Int = bytecode.routine_slot_counts.get_unchecked(object_routine_id);
+                        let object_copyback_mask: Int = self.routine_copyback_mask(bytecode, object_routine_id, ctx, scope, call_arg_ids);
+                        let frame_start: Int = self.scalar_values.len();
+                        if routine_entry_pc >= 0
+                        && routine_limit_pc >= routine_entry_pc
+                        && eg_asp_vm_routine_enter(ctx.request_arena_handle, object_routine_id, pc + 1, limit_pc, stack.len(), frame_start, routine_slot_count) != 0 {
+                            _ = eg_asp_vm_object_call_cache_bind(
+                                ctx.request_arena_handle,
+                                caller_program_id,
+                                pc,
+                                class_hash,
+                                arg1 > 0 ? arg1 : 0,
+                                callee_dynamic_index >= 0 ? callee_dynamic_index + 1 : 0,
+                                object_routine_id
+                            );
+                            _ = eg_asp_vm_routine_bind(ctx.request_arena_handle, target.object_value, 0, object_copyback_mask);
+                            if callee_dynamic_index >= 0 {
+                                _ = eg_asp_vm_routine_bind_program(ctx.request_arena_handle, caller_dynamic_active ? 1 : 0, caller_dynamic_index);
+                            }
+                            _ = self.native_return_pcs.push(pc + 1);
+                            _ = self.native_limit_pcs.push(limit_pc);
+                            _ = self.native_stack_bases.push(stack.len());
+                            _ = self.native_slot_bases.push(frame_start);
+                            _ = self.native_frame_functions.push(bytecode.program.runtime_routine_is_function(object_routine_id) ? 1 : 0);
+                            _ = self.native_frame_push_results.push(0);
+                            _ = self.native_frame_statements.push(1);
+                            self.push_copyback_frame(object_copyback_mask, call_arg_ids);
+                            _ = self.native_caller_routine_ids.push(native_current_routine_id);
+                            _ = self.scalar_frame_starts.push(frame_start);
+                            let empty_slot: asp.runtime.Variant = asp.runtime.variant_empty();
+                            let slot_index: Int = 0;
+                            loop slot_index < routine_slot_count {
+                                _ = self.scalar_values.push(slot_index > 0 && slot_index - 1 < call_args.len()
+                                    ? self.variant_at(call_args, slot_index - 1) : empty_slot);
+                                slot_index += 1;
+                            }
+                            self.sync_native_frame(ctx, frame_start, routine_slot_count);
+                            scope = self.enter_native_scope(bytecode, ctx, scope, object_routine_id, target.object_value, frame_start);
+                            native_current_routine_id = object_routine_id;
+                            pc = routine_entry_pc;
+                            limit_pc = routine_limit_pc;
+                            skip;
+                        }
+                    }
+                    if callee_dynamic_index >= 0 {
+                        self.evaluator.dynamic_vm_active = caller_dynamic_active;
+                        self.evaluator.dynamic_active_index = caller_dynamic_index;
+                        bytecode = caller_dynamic_active
+                            ? self.evaluator.dynamic_bytecode_at(caller_dynamic_index)
+                            : self.evaluator.active_bytecode;
+                        instruction_count = bytecode.instruction_count();
+                        ctx.prepare_global_slots(bytecode.global_slot_names);
+                    }
+                }
+                if target.kind == asp.runtime.VariantObject {
+                    if arg1 > 0 {
+                        _ = self.evaluator.invoke_object_member_id_values(bytecode.program, ctx, scope, target, member_name, arg1, call_args, call_arg_ids);
+                    } else {
+                        _ = self.evaluator.invoke_object_values(bytecode.program, ctx, scope, target, member_name, call_args, false, asp.runtime.variant_empty(), call_arg_ids);
+                    }
+                } else {
+                    self.evaluator.raise_runtime_error(ctx, 438,
+                        "value does not support member call (receiver expression " + strconv.itoa(receiver_expr_id) + ")",
+                        "VBScript");
+                }
+                let object_statement_result: Int = self.evaluator.finish_statement(ctx);
+                if object_statement_result != 0 || ctx.response.ended {
+                    return object_statement_result == 0 && ctx.response.ended ? 1 : object_statement_result;
+                }
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeCallStmt => Int) {
+                let target_expr_id: Int = bytecode.program.runtime_stmt_target_expr(arg0);
+                let call_name: String = bytecode.program.runtime_stmt_call_name(arg0);
+                let call_arg_count: Int = bytecode.program.runtime_stmt_call_arg_count(arg0);
+                let call_arg_ids: collections.Vector<Int> = scratch.ids;
+                call_arg_ids.clear();
+                call_arg_ids.reserve(call_arg_count);
+                let call_arg_index: Int = 0;
+                loop call_arg_index < call_arg_count {
+                    _ = call_arg_ids.push(bytecode.program.runtime_stmt_call_arg(arg0, call_arg_index));
+                    call_arg_index += 1;
+                }
+                _ = __gc_keepalive(call_name);
+                _ = __gc_keepalive(call_arg_ids);
+                _ = __gc_keepalive(bytecode);
+                if target_expr_id >= 0 {
+                    if arg1 == 0 {
+                        _ = self.discard_variant(stack);
+                    } else {
+                        _ = self.evaluator.eval_expr_in_scope(bytecode.program, ctx, scope, target_expr_id);
+                    }
+                    let expression_result: Int = self.evaluator.finish_statement(ctx);
+                    if expression_result != 0 {
+                        return expression_result;
+                    }
+                    pc += 1;
+                    skip;
+                }
+                let call_args: collections.Vector<asp.runtime.Variant> = scratch.values;
+                self.pop_variants_into(stack, call_args, call_arg_count);
+                // Response.Write is by far the hottest builtin statement in
+                // template-heavy pages.  Its arguments are already evaluated
+                // on the VM stack, so avoid constructing call scopes and
+                // dispatch vectors only to append the first value.
+                if arg1 == -100101 && call_args.len() >= 1 {
+                    _ = ctx.response.write(call_args.get_unchecked(0).to_output_string());
+                    let write_result: Int = self.evaluator.finish_statement(ctx);
+                    if write_result != 0 || ctx.response.ended {
+                        return write_result == 0 && ctx.response.ended ? 1 : write_result;
+                    }
+                    pc += 1;
+                    skip;
+                }
+                let bound_routine_id: Int = arg1;
+                if bound_routine_id < 0 && scope.me_object_id > 0 && std.len(scope.me_class_name) > 0 {
+                    bound_routine_id = self.evaluator.find_routine(bytecode.program, call_name, scope.me_class_name);
+                }
+                let bound_routine_valid: Bool = bound_routine_id >= 0 && bound_routine_id < bytecode.program.runtime_routine_count();
+                let result: Int = 0;
+                if bound_routine_valid
+                && native_routines_enabled
+                && bound_routine_id < bytecode.routine_slot_counts.len()
+                && self.routine_c_frame_safe(bytecode, bound_routine_id)
+                && bound_routine_id < bytecode.routine_owners.len()
+                && (std.len(bytecode.routine_owners.get_unchecked(bound_routine_id)) == 0
+                    || (native_classes_enabled && scope.me_object_id > 0 && strings.equal_fold_ascii(bytecode.routine_owners.get_unchecked(bound_routine_id), scope.me_class_name))) {
+                    let routine_block_id: Int = bound_routine_id < bytecode.routine_block_ids.len()
+                    ? bytecode.routine_block_ids.get_unchecked(bound_routine_id)
+                    : -1;
+                    let routine_entry_pc: Int = routine_block_id >= 0 && routine_block_id < bytecode.block_pcs.len()
+                    ? bytecode.block_pcs.get_unchecked(routine_block_id)
+                    : -1;
+                    let routine_limit_pc: Int = routine_block_id >= 0 && routine_block_id < bytecode.block_end_pcs.len()
+                    ? bytecode.block_end_pcs.get_unchecked(routine_block_id)
+                    : -1;
+                    let routine_slot_count: Int = bytecode.routine_slot_counts.get_unchecked(bound_routine_id);
+                    let frame_start: Int = self.scalar_values.len();
+                    if routine_entry_pc >= 0
+                    && routine_limit_pc >= routine_entry_pc
+                    && eg_asp_vm_routine_enter(ctx.request_arena_handle, bound_routine_id, pc + 1, limit_pc, stack.len(), frame_start, routine_slot_count) != 0 {
+                        let bound_owner: String = bytecode.routine_owners.get_unchecked(bound_routine_id);
+                        let bound_object_id: Int = std.len(bound_owner) > 0 ? scope.me_object_id : 0;
+                        if std.len(bound_owner) > 0 {
+                            _ = eg_asp_vm_routine_bind(ctx.request_arena_handle, bound_object_id, 0, 0);
+                        }
+                        _ = self.native_return_pcs.push(pc + 1);
+                        _ = self.native_limit_pcs.push(limit_pc);
+                        _ = self.native_stack_bases.push(stack.len());
+                        _ = self.native_slot_bases.push(frame_start);
+                        _ = self.native_frame_functions.push(bytecode.program.runtime_routine_is_function(bound_routine_id) ? 1 : 0);
+                        _ = self.native_frame_push_results.push(0);
+                        _ = self.native_frame_statements.push(1);
+                        self.push_copyback_frame(self.routine_copyback_mask(bytecode, bound_routine_id, ctx, scope, call_arg_ids), call_arg_ids);
+                        _ = self.native_caller_routine_ids.push(native_current_routine_id);
+                        _ = self.scalar_frame_starts.push(frame_start);
+                        let empty_slot: asp.runtime.Variant = asp.runtime.variant_empty();
+                        let slot_index: Int = 0;
+                        loop slot_index < routine_slot_count {
+                            _ = self.scalar_values.push(slot_index > 0 && slot_index - 1 < call_args.len()
+                            ? self.variant_at(call_args, slot_index - 1)
+                            : empty_slot);
+                            slot_index += 1;
+                        }
+                        self.sync_native_frame(ctx, frame_start, routine_slot_count);
+                        scope = self.enter_native_scope(bytecode, ctx, scope, bound_routine_id, bound_object_id, frame_start);
+                        native_current_routine_id = bound_routine_id;
+                        pc = routine_entry_pc;
+                        limit_pc = routine_limit_pc;
+                        skip;
+                    }
+                }
+                if !bound_routine_valid && arg1 < 0 && native_classes_enabled {
+                    let dot: Int = bytecode.program.runtime_stmt_call_dot(arg0);
+                    if dot > 0 && dot + 1 < std.len(call_name) {
+                        let receiver_name: String = bytecode.program.runtime_stmt_call_receiver(arg0);
+                        let member_name: String = bytecode.program.runtime_stmt_call_member(arg0);
+                        let target: asp.runtime.Variant = self.evaluator.resolve_identifier(ctx, scope, receiver_name, bytecode.program);
+                        if target.kind == asp.runtime.VariantObject {
+                            let obj: RuntimeObject = self.evaluator.get_object(ctx, target.object_value);
+                            let callee_dynamic_index: Int = -1;
+                            let caller_dynamic_active: Bool = self.evaluator.dynamic_vm_active;
+                            let caller_dynamic_index: Int = self.evaluator.dynamic_active_index;
+                            let object_routine_id: Int = self.evaluator.find_routine_by_function_kind(bytecode.program, member_name, obj.class_name, true);
+                            if object_routine_id < 0 && obj.kind == RuntimeObjectUserClass {
+                                let packed_candidate: Int = self.find_dynamic_object_routine(obj.class_name, member_name);
+                                if packed_candidate >= 0 {
+                                    callee_dynamic_index = packed_candidate / 1048576 - 1;
+                                    object_routine_id = packed_candidate % 1048576;
+                                    bytecode = self.evaluator.dynamic_bytecode_at(callee_dynamic_index);
+                                    instruction_count = bytecode.instruction_count();
+                                    self.evaluator.dynamic_vm_active = true;
+                                    self.evaluator.dynamic_active_index = callee_dynamic_index;
+                                    ctx.prepare_global_slots(bytecode.global_slot_names);
+                                }
+                            }
+                            if obj.kind == RuntimeObjectUserClass
+                            && !obj.store.has(member_name)
+                            && object_routine_id >= 0
+                            && object_routine_id < bytecode.routine_slot_counts.len()
+                            && object_routine_id < bytecode.routine_block_ids.len()
+                            && self.routine_c_frame_safe(bytecode, object_routine_id)
+                            && strings.equal_fold_ascii(bytecode.program.runtime_routine_owner(object_routine_id), obj.class_name)
+                            && eg_asp_vm_member_select(ctx.request_arena_handle, object_routine_id + 1, obj.kind => Int, object_routine_id, call_args.len(), 0) == object_routine_id {
+                                let routine_block_id: Int = bytecode.routine_block_ids.get_unchecked(object_routine_id);
+                                let routine_entry_pc: Int = routine_block_id >= 0 && routine_block_id < bytecode.block_pcs.len()
+                                    ? bytecode.block_pcs.get_unchecked(routine_block_id) : -1;
+                                let routine_limit_pc: Int = routine_block_id >= 0 && routine_block_id < bytecode.block_end_pcs.len()
+                                    ? bytecode.block_end_pcs.get_unchecked(routine_block_id) : -1;
+                                let routine_slot_count: Int = bytecode.routine_slot_counts.get_unchecked(object_routine_id);
+                                let object_copyback_mask: Int = self.routine_copyback_mask(bytecode, object_routine_id, ctx, scope, call_arg_ids);
+                                let frame_start: Int = self.scalar_values.len();
+                                if routine_entry_pc >= 0
+                                && routine_limit_pc >= routine_entry_pc
+                                && eg_asp_vm_routine_enter(ctx.request_arena_handle, object_routine_id, pc + 1, limit_pc, stack.len(), frame_start, routine_slot_count) != 0 {
+                                    _ = eg_asp_vm_routine_bind(ctx.request_arena_handle, target.object_value, 0, object_copyback_mask);
+                                    if callee_dynamic_index >= 0 {
+                                        _ = eg_asp_vm_routine_bind_program(ctx.request_arena_handle, caller_dynamic_active ? 1 : 0, caller_dynamic_index);
+                                    }
+                                    _ = self.native_return_pcs.push(pc + 1);
+                                    _ = self.native_limit_pcs.push(limit_pc);
+                                    _ = self.native_stack_bases.push(stack.len());
+                                    _ = self.native_slot_bases.push(frame_start);
+                                    _ = self.native_frame_functions.push(bytecode.program.runtime_routine_is_function(object_routine_id) ? 1 : 0);
+                                    _ = self.native_frame_push_results.push(0);
+                                    _ = self.native_frame_statements.push(1);
+                                    self.push_copyback_frame(object_copyback_mask, call_arg_ids);
+                                    _ = self.native_caller_routine_ids.push(native_current_routine_id);
+                                    _ = self.scalar_frame_starts.push(frame_start);
+                                    let empty_slot: asp.runtime.Variant = asp.runtime.variant_empty();
+                                    let slot_index: Int = 0;
+                                    loop slot_index < routine_slot_count {
+                                        _ = self.scalar_values.push(slot_index > 0 && slot_index - 1 < call_args.len()
+                                            ? self.variant_at(call_args, slot_index - 1) : empty_slot);
+                                        slot_index += 1;
+                                    }
+                                    self.sync_native_frame(ctx, frame_start, routine_slot_count);
+                                    scope = self.enter_native_scope(bytecode, ctx, scope, object_routine_id, target.object_value, frame_start);
+                                    native_current_routine_id = object_routine_id;
+                                    pc = routine_entry_pc;
+                                    limit_pc = routine_limit_pc;
+                                    skip;
+                                }
+                            }
+                            if callee_dynamic_index >= 0 {
+                                self.evaluator.dynamic_vm_active = caller_dynamic_active;
+                                self.evaluator.dynamic_active_index = caller_dynamic_index;
+                                bytecode = caller_dynamic_active
+                                    ? self.evaluator.dynamic_bytecode_at(caller_dynamic_index)
+                                    : self.evaluator.active_bytecode;
+                                instruction_count = bytecode.instruction_count();
+                                ctx.prepare_global_slots(bytecode.global_slot_names);
+                            }
+                        }
+                    }
+                }
+                if bound_routine_valid {
+                    let bound_owner: String = bound_routine_id < bytecode.routine_owners.len()
+                    ? bytecode.routine_owners.get_unchecked(bound_routine_id)
+                    : bytecode.program.runtime_routine_owner(bound_routine_id);
+                    let bound_object_id: Int = std.len(bound_owner) > 0 && strings.equal_fold_ascii(bound_owner, scope.me_class_name) ? scope.me_object_id : 0;
+                    _ = self.evaluator.call_user_routine_values(bytecode.program, bytecode.program, ctx, scope, bound_routine_id, call_args, call_arg_ids, bound_object_id);
+                    result = self.evaluator.finish_statement(ctx);
+                } else {
+                    let call_scope: Scope = scope;
+                    let call_slot_names: collections.Vector<String> = new collections.Vector<String>();
+                    let call_frame_start: Int = -1;
+                    let bridge_dynamic_call: Bool = strings.equal_fold_ascii(call_name, "Execute")
+                        || strings.equal_fold_ascii(call_name, "ExecuteGlobal");
+                    if bridge_dynamic_call
+                    && native_current_routine_id >= 0
+                    && native_current_routine_id < bytecode.routine_slot_names.len()
+                    && self.scalar_frame_starts.len() > 0 {
+                        call_slot_names = vbs_routine_slot_names(bytecode, native_current_routine_id);
+                        call_frame_start = self.scalar_frame_starts.get_unchecked(self.scalar_frame_starts.len() - 1);
+                        let call_slot: Int = 0;
+                        loop call_slot < call_slot_names.len() {
+                            _ = call_scope.vars.set(
+                                call_slot_names.get_unchecked(call_slot),
+                                self.variant_at(self.scalar_values, call_frame_start + call_slot)
+                            );
+                            call_slot += 1;
+                        }
+                    self.sync_native_frame(ctx, call_frame_start, call_slot_names.len());
+                    }
+                    if arg1 <= -100001 {
+                        result = self.evaluator.execute_builtin_member_id_values(bytecode.program, ctx, call_scope, call_name, 0 - arg1 - 100000, call_args, call_arg_ids);
+                    } else if arg1 <= -2 {
+                        _ = self.evaluator.eval_object_member_id_values(bytecode.program, ctx, call_scope, call_name, 0 - arg1 - 1, call_args, call_arg_ids);
+                        result = self.evaluator.finish_statement(ctx);
+                    } else {
+                        result = self.evaluator.execute_call_stmt_values(bytecode.program, ctx, call_scope, call_name, call_args, call_arg_ids);
+                    }
+                    if call_frame_start >= 0 {
+                        let call_slot: Int = 0;
+                        loop call_slot < call_slot_names.len() {
+                            let call_slot_name: String = call_slot_names.get_unchecked(call_slot);
+                            if call_scope.vars.has(call_slot_name) {
+                                _ = self.scalar_values.set(
+                                    call_frame_start + call_slot,
+                                    call_scope.vars.get_or_empty(call_slot_name)
+                                );
+                            }
+                            call_slot += 1;
+                        }
+                    }
+                }
+                ctx.invalidate_global_slots();
+                if result != 0 || ctx.response.ended {
+                    return result == 0 && ctx.response.ended ? 1 : result;
+                }
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeCallExpr => Int) {
+                let expr_arg_ids: collections.Vector<Int> = scratch.ids;
+                expr_arg_ids.clear();
+                let expr_arg_count: Int = bytecode.program.runtime_expr_arg_count(arg0);
+                let expr_arg_index: Int = 0;
+                loop expr_arg_index < expr_arg_count { _ = expr_arg_ids.push(bytecode.program.runtime_expr_arg(arg0, expr_arg_index)); expr_arg_index += 1; }
+                let expr_left_id: Int = bytecode.program.runtime_expr_left(arg0);
+                let expr_text: String = bytecode.program.runtime_expr_text(arg0);
+                let bound_routine_id: Int = arg1;
+                if bound_routine_id < 0 && expr_left_id < 0 && scope.me_object_id > 0 && std.len(scope.me_class_name) > 0 {
+                    bound_routine_id = self.evaluator.find_routine_by_function_kind(bytecode.program, expr_text, scope.me_class_name, true);
+                    if bound_routine_id < 0 {
+                        bound_routine_id = self.evaluator.find_routine(bytecode.program, expr_text, scope.me_class_name);
+                    }
+                }
+                let bound_routine_valid: Bool = bound_routine_id >= 0 && bound_routine_id < bytecode.program.runtime_routine_count();
+                let left_kind: Int = -1;
+                let left_text: String = "";
+                if expr_left_id >= 0 {
+                    left_kind = bytecode.program.runtime_expr_kind(expr_left_id) => Int;
+                    left_text = bytecode.program.runtime_expr_text(expr_left_id);
+                }
+                let call_args: collections.Vector<asp.runtime.Variant> = scratch.values;
+                self.pop_variants_into(stack, call_args, expr_arg_count);
+                if bound_routine_valid
+                && native_routines_enabled
+                && bound_routine_id < bytecode.routine_slot_counts.len()
+                && self.routine_c_frame_safe(bytecode, bound_routine_id)
+                && bound_routine_id < bytecode.routine_owners.len()
+                && (std.len(bytecode.routine_owners.get_unchecked(bound_routine_id)) == 0
+                    || (native_classes_enabled && scope.me_object_id > 0 && strings.equal_fold_ascii(bytecode.routine_owners.get_unchecked(bound_routine_id), scope.me_class_name))) {
+                    let routine_block_id: Int = bound_routine_id < bytecode.routine_block_ids.len()
+                    ? bytecode.routine_block_ids.get_unchecked(bound_routine_id)
+                    : -1;
+                    let routine_entry_pc: Int = routine_block_id >= 0 && routine_block_id < bytecode.block_pcs.len()
+                    ? bytecode.block_pcs.get_unchecked(routine_block_id)
+                    : -1;
+                    let routine_limit_pc: Int = routine_block_id >= 0 && routine_block_id < bytecode.block_end_pcs.len()
+                    ? bytecode.block_end_pcs.get_unchecked(routine_block_id)
+                    : -1;
+                    let routine_slot_count: Int = bytecode.routine_slot_counts.get_unchecked(bound_routine_id);
+                    let frame_start: Int = self.scalar_values.len();
+                    if routine_entry_pc >= 0
+                    && routine_limit_pc >= routine_entry_pc
+                    && eg_asp_vm_routine_enter(ctx.request_arena_handle, bound_routine_id, pc + 1, limit_pc, stack.len(), frame_start, routine_slot_count) != 0 {
+                        let bound_owner: String = bytecode.routine_owners.get_unchecked(bound_routine_id);
+                        let bound_object_id: Int = std.len(bound_owner) > 0 ? scope.me_object_id : 0;
+                        if std.len(bound_owner) > 0 {
+                            _ = eg_asp_vm_routine_bind(ctx.request_arena_handle, bound_object_id, 1, 0);
+                        }
+                        _ = self.native_return_pcs.push(pc + 1);
+                        _ = self.native_limit_pcs.push(limit_pc);
+                        _ = self.native_stack_bases.push(stack.len());
+                        _ = self.native_slot_bases.push(frame_start);
+                        _ = self.native_frame_functions.push(bytecode.program.runtime_routine_is_function(bound_routine_id) ? 1 : 0);
+                        _ = self.native_frame_push_results.push(1);
+                        _ = self.native_frame_statements.push(0);
+                        self.push_copyback_frame(self.routine_copyback_mask(bytecode, bound_routine_id, ctx, scope, expr_arg_ids), expr_arg_ids);
+                        _ = self.native_caller_routine_ids.push(native_current_routine_id);
+                        _ = self.scalar_frame_starts.push(frame_start);
+                        let empty_slot: asp.runtime.Variant = asp.runtime.variant_empty();
+                        let slot_index: Int = 0;
+                        loop slot_index < routine_slot_count {
+                            _ = self.scalar_values.push(slot_index > 0 && slot_index - 1 < call_args.len()
+                            ? self.variant_at(call_args, slot_index - 1)
+                            : empty_slot);
+                            slot_index += 1;
+                        }
+                        self.sync_native_frame(ctx, frame_start, routine_slot_count);
+                        scope = self.enter_native_scope(bytecode, ctx, scope, bound_routine_id, bound_object_id, frame_start);
+                        native_current_routine_id = bound_routine_id;
+                        pc = routine_entry_pc;
+                        limit_pc = routine_limit_pc;
+                        skip;
+                    }
+                }
+                let out: asp.runtime.Variant = asp.runtime.variant_empty();
+                if expr_left_id >= 0 {
+                    let target: asp.runtime.Variant = self.pop_variant(stack);
+                    if target.kind == asp.runtime.VariantObject {
+                        if native_classes_enabled && std.len(expr_text) > 0 {
+                            let obj: RuntimeObject = self.evaluator.get_object(ctx, target.object_value);
+                            let callee_dynamic_index: Int = -1;
+                            let caller_dynamic_active: Bool = self.evaluator.dynamic_vm_active;
+                            let caller_dynamic_index: Int = self.evaluator.dynamic_active_index;
+                            let object_routine_id: Int = self.evaluator.find_routine_by_function_kind(bytecode.program, expr_text, obj.class_name, true);
+                            if object_routine_id < 0 && obj.kind == RuntimeObjectUserClass {
+                                let packed_candidate: Int = self.find_dynamic_object_routine(obj.class_name, expr_text);
+                                if packed_candidate >= 0 {
+                                    callee_dynamic_index = packed_candidate / 1048576 - 1;
+                                    object_routine_id = packed_candidate % 1048576;
+                                    bytecode = self.evaluator.dynamic_bytecode_at(callee_dynamic_index);
+                                    instruction_count = bytecode.instruction_count();
+                                    self.evaluator.dynamic_vm_active = true;
+                                    self.evaluator.dynamic_active_index = callee_dynamic_index;
+                                    ctx.prepare_global_slots(bytecode.global_slot_names);
+                                }
+                            }
+                            if obj.kind == RuntimeObjectUserClass
+                            && !obj.store.has(expr_text)
+                            && object_routine_id >= 0
+                            && object_routine_id < bytecode.program.runtime_routine_count()
+                            && object_routine_id < bytecode.routine_slot_counts.len()
+                            && object_routine_id < bytecode.routine_block_ids.len()
+                            && self.routine_c_frame_safe(bytecode, object_routine_id)
+                            && strings.equal_fold_ascii(bytecode.program.runtime_routine_owner(object_routine_id), obj.class_name)
+                            && eg_asp_vm_member_select(ctx.request_arena_handle, object_routine_id + 1, obj.kind => Int, object_routine_id, call_args.len(), 0) == object_routine_id {
+                                let routine_block_id: Int = bytecode.routine_block_ids.get_unchecked(object_routine_id);
+                                let routine_entry_pc: Int = routine_block_id >= 0 && routine_block_id < bytecode.block_pcs.len()
+                                    ? bytecode.block_pcs.get_unchecked(routine_block_id) : -1;
+                                let routine_limit_pc: Int = routine_block_id >= 0 && routine_block_id < bytecode.block_end_pcs.len()
+                                    ? bytecode.block_end_pcs.get_unchecked(routine_block_id) : -1;
+                                let routine_slot_count: Int = bytecode.routine_slot_counts.get_unchecked(object_routine_id);
+                                let object_copyback_mask: Int = self.routine_copyback_mask(bytecode, object_routine_id, ctx, scope, expr_arg_ids);
+                                let frame_start: Int = self.scalar_values.len();
+                                if routine_entry_pc >= 0
+                                && routine_limit_pc >= routine_entry_pc
+                                && eg_asp_vm_routine_enter(ctx.request_arena_handle, object_routine_id, pc + 1, limit_pc, stack.len(), frame_start, routine_slot_count) != 0 {
+                                    _ = eg_asp_vm_routine_bind(ctx.request_arena_handle, target.object_value, 1, object_copyback_mask);
+                                    if callee_dynamic_index >= 0 {
+                                        _ = eg_asp_vm_routine_bind_program(ctx.request_arena_handle, caller_dynamic_active ? 1 : 0, caller_dynamic_index);
+                                    }
+                                    _ = self.native_return_pcs.push(pc + 1);
+                                    _ = self.native_limit_pcs.push(limit_pc);
+                                    _ = self.native_stack_bases.push(stack.len());
+                                    _ = self.native_slot_bases.push(frame_start);
+                                    _ = self.native_frame_functions.push(bytecode.program.runtime_routine_is_function(object_routine_id) ? 1 : 0);
+                                    _ = self.native_frame_push_results.push(1);
+                                    _ = self.native_frame_statements.push(0);
+                                    self.push_copyback_frame(object_copyback_mask, expr_arg_ids);
+                                    _ = self.native_caller_routine_ids.push(native_current_routine_id);
+                                    _ = self.scalar_frame_starts.push(frame_start);
+                                    let empty_slot: asp.runtime.Variant = asp.runtime.variant_empty();
+                                    let slot_index: Int = 0;
+                                    loop slot_index < routine_slot_count {
+                                        _ = self.scalar_values.push(slot_index > 0 && slot_index - 1 < call_args.len()
+                                            ? self.variant_at(call_args, slot_index - 1) : empty_slot);
+                                        slot_index += 1;
+                                    }
+                                    self.sync_native_frame(ctx, frame_start, routine_slot_count);
+                                    scope = self.enter_native_scope(bytecode, ctx, scope, object_routine_id, target.object_value, frame_start);
+                                    native_current_routine_id = object_routine_id;
+                                    pc = routine_entry_pc;
+                                    limit_pc = routine_limit_pc;
+                                    skip;
+                                }
+                            }
+                            if callee_dynamic_index >= 0 {
+                                self.evaluator.dynamic_vm_active = caller_dynamic_active;
+                                self.evaluator.dynamic_active_index = caller_dynamic_index;
+                                bytecode = caller_dynamic_active
+                                    ? self.evaluator.dynamic_bytecode_at(caller_dynamic_index)
+                                    : self.evaluator.active_bytecode;
+                                instruction_count = bytecode.instruction_count();
+                                ctx.prepare_global_slots(bytecode.global_slot_names);
+                            }
+                        }
+                        out = self.evaluator.invoke_object_values(bytecode.program, ctx, scope, target, expr_text, call_args, false, asp.runtime.variant_empty(), expr_arg_ids);
+                    } else if target.kind == asp.runtime.VariantArray && std.len(expr_text) == 0 {
+                        out = self.evaluator.invoke_array_values(ctx, target, call_args, false, asp.runtime.variant_empty());
+                    } else if left_kind == (asp.compiler.VbsExprIdentifier => Int) && std.len(expr_text) == 0 {
+                        out = self.evaluator.eval_call_values(bytecode.program, ctx, scope, left_text, call_args, expr_arg_ids);
+                    } else {
+                        self.evaluator.raise_runtime_error(ctx, 438, "value does not support default call (expression " + strconv.itoa(arg0) + ", member '" + expr_text + "', left expression " + strconv.itoa(expr_left_id) + ", left kind " + strconv.itoa(left_kind) + ", left text '" + left_text + "', target kind " + strconv.itoa(target.kind => Int) + ", argument count " + strconv.itoa(expr_arg_count) + ")", "VBScript");
+                    }
+                } else if bound_routine_valid {
+                    let bound_owner: String = bound_routine_id < bytecode.routine_owners.len()
+                    ? bytecode.routine_owners.get_unchecked(bound_routine_id)
+                    : bytecode.program.runtime_routine_owner(bound_routine_id);
+                    let bound_object_id: Int = std.len(bound_owner) > 0 && strings.equal_fold_ascii(bound_owner, scope.me_class_name) ? scope.me_object_id : 0;
+                    out = self.evaluator.call_user_routine_values(bytecode.program, bytecode.program, ctx, scope, bound_routine_id, call_args, expr_arg_ids, bound_object_id);
+                } else if arg1 <= -100001 {
+                    out = self.evaluator.eval_builtin_member_id_values(bytecode.program, ctx, scope, expr_text, 0 - arg1 - 100000, call_args, expr_arg_ids);
+                } else if arg1 <= -2 {
+                    out = self.evaluator.eval_object_member_id_values(bytecode.program, ctx, scope, expr_text, 0 - arg1 - 1, call_args, expr_arg_ids);
+                } else {
+                    out = self.evaluator.eval_call_values(bytecode.program, ctx, scope, expr_text, call_args, expr_arg_ids);
+                }
+                ctx.invalidate_global_slots();
+                _ = stack.push(out);
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeJump => Int) {
+                pc = arg0;
+                skip;
+            }
+            if op == (VbsBytecodeJumpIfFalse => Int) {
+                let cond: asp.runtime.Variant = self.pop_variant(stack);
+                if ctx.response.ended {
+                    return 1;
+                }
+                if self.evaluator.statement_failed {
+                    let failed_result: Int = self.evaluator.finish_statement(ctx);
+                    if failed_result != 0 {
+                        return failed_result;
+                    }
+                    // A failed condition must not enter either branch or
+                    // retry the loop. arg0 carries the whole statement end;
+                    // old bytecode falls back to its normal false edge.
+                    pc = arg0 >= 0 ? arg0 : arg1;
+                    skip;
+                }
+                pc = cond.is_truthy() ? pc + 1 : arg1;
+                skip;
+            }
+            if op == (VbsBytecodePop => Int) {
+                if stack.len() > stack_floor {
+                    _ = self.discard_variant(stack);
+                }
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeDup => Int) {
+                let value: asp.runtime.Variant = stack.len() > stack_floor ? self.variant_at(stack, stack.len() - 1) : asp.runtime.variant_empty();
+                _ = stack.push(value);
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeInlineEnter => Int) {
+                let arg_count: Int = arg0;
+                let stack_base: Int = stack.len() - stack_floor >= arg_count ? stack.len() - arg_count : stack_floor;
+                let frame_start: Int = self.inline_values.len();
+                _ = self.inline_frame_starts.push(frame_start);
+                let i: Int = 0;
+                loop i < arg_count {
+                    _ = self.inline_values.push(stack_base + i < stack.len() ? self.variant_at(stack, stack_base + i) : asp.runtime.variant_empty());
+                    i += 1;
+                }
+                i = 0;
+                loop i < arg_count && stack.len() > stack_floor {
+                    _ = self.discard_variant(stack);
+                    i += 1;
+                }
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeInlineExit => Int) {
+                let frame_start: Int = self.inline_frame_starts.len() > 0 ? self.inline_frame_starts.pop_back(0) : self.inline_values.len();
+                loop self.inline_values.len() > frame_start {
+                    _ = self.discard_variant(self.inline_values);
+                }
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodePushInlineParam => Int) {
+                let frame_start: Int = self.inline_frame_starts.len() > 0 ? self.inline_frame_starts.get_unchecked(self.inline_frame_starts.len() - 1) : -1;
+                let value_index: Int = frame_start + arg0;
+                _ = stack.push(frame_start >= 0 && value_index >= 0 && value_index < self.inline_values.len() ? self.variant_at(self.inline_values, value_index) : asp.runtime.variant_empty());
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodePushScalarSlot => Int) {
+                let frame_start: Int = self.scalar_frame_starts.len() > 0 ? self.scalar_frame_starts.get_unchecked(self.scalar_frame_starts.len() - 1) : -1;
+                let value_index: Int = frame_start + arg0;
+                let slot_value: asp.runtime.Variant = frame_start >= 0 && value_index >= 0 && value_index < self.scalar_values.len() ? self.variant_at(self.scalar_values, value_index) : asp.runtime.variant_empty();
+                _ = stack.push(slot_value);
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodePushGlobalSlot => Int) {
+                let slot_name: String = arg0 >= 0 && arg0 < bytecode.global_slot_names.len()
+                ? bytecode.global_slot_names.get_unchecked(arg0)
+                : "";
+                let slot_value: asp.runtime.Variant = scope.me_object_id > 0 && std.len(slot_name) > 0
+                ? self.evaluator.resolve_identifier(ctx, scope, slot_name, bytecode.program)
+                : ctx.global_slot_value(arg0);
+                _ = stack.push(slot_value);
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeAssignGlobalSlot => Int) {
+                let value: asp.runtime.Variant = self.pop_variant(stack);
+                let name: String = arg0 >= 0 && arg0 < bytecode.global_slot_names.len()
+                ? bytecode.global_slot_names.get_unchecked(arg0)
+                : "";
+                let root_scope: Scope = self.evaluator.root_scope(ctx);
+                if std.len(name) == 0 {
+                    self.evaluator.raise_runtime_error(ctx, 13, "invalid global slot", "VBScript");
+                } else if scope.me_object_id > 0 {
+                    self.evaluator.assign_identifier(ctx, scope, name, value);
+                } else if root_scope.has_const(name) {
+                    self.evaluator.assign_identifier(ctx, root_scope, name, value);
+                } else {
+                    ctx.set_global_slot(arg0, value);
+                }
+                let result: Int = self.evaluator.finish_statement(ctx);
+                if result != 0 || ctx.response.ended {
+                    return result == 0 && ctx.response.ended ? 1 : result;
+                }
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeAssignScalarSlot => Int) {
+                let frame_start: Int = self.scalar_frame_starts.len() > 0 ? self.scalar_frame_starts.get_unchecked(self.scalar_frame_starts.len() - 1) : -1;
+                let value_index: Int = frame_start + arg0;
+                let value: asp.runtime.Variant = self.pop_variant(stack);
+                if frame_start >= 0 && value_index >= 0 && value_index < self.scalar_values.len() {
+                    if arg1 > 0 {
+                        let indices: collections.Vector<asp.runtime.Variant> = scratch.values;
+                        indices.clear();
+                        let i: Int = arg1 - 1;
+                        loop i >= 0 {
+                            indices.insert(0, self.pop_variant(stack));
+                            i -= 1;
+                        }
+                        _ = self.evaluator.assign_array_value_in_place(ctx, self.variant_at(self.scalar_values, value_index), indices, value);
+                        let result: Int = self.evaluator.finish_statement(ctx);
+                        if result != 0 {
+                            return result;
+                        }
+                    } else {
+                        _ = self.scalar_values.set(value_index, value);
+                        self.sync_native_slot(ctx, value_index, value);
+                        if native_current_routine_id >= 0
+                        && native_current_routine_id < bytecode.routine_slot_names.len() {
+                            let slot_names: collections.Vector<String> = vbs_routine_slot_names(bytecode, native_current_routine_id);
+                            if arg0 >= 0 && arg0 < slot_names.len() {
+                                _ = scope.vars.set(slot_names.get_unchecked(arg0), value);
+                            }
+                        }
+                        if arg0 == 0 && std.len(scope.function_name) > 0 {
+                            _ = scope.vars.set(scope.function_name, value);
+                        }
+                    }
+                } else if arg0 == 0 && arg1 == 0 && std.len(scope.function_name) > 0 {
+                    _ = scope.vars.set(scope.function_name, value);
+                }
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeInitScalarArray => Int) || op == (VbsBytecodeReDimScalarArray => Int) {
+                let frame_start: Int = self.scalar_frame_starts.len() > 0 ? self.scalar_frame_starts.get_unchecked(self.scalar_frame_starts.len() - 1) : -1;
+                let value_index: Int = frame_start + arg0;
+                let rank: Int = arg1 < 0 ? -arg1 : arg1;
+                let bounds: collections.Vector<Int> = scratch.ints;
+                bounds.clear();
+                let valid_bounds: Bool = rank > 0;
+                let i: Int = rank - 1;
+                loop i >= 0 {
+                    let upper: Int = asp.variant_to_int(self.pop_variant(stack));
+                    if upper < -1 {
+                        valid_bounds = false;
+                    }
+                    bounds.insert(0, upper);
+                    i -= 1;
+                }
+                if !valid_bounds {
+                    self.evaluator.raise_runtime_error(ctx, 9, rank > 0 ? "subscript out of range" : "array bound required", "VBScript");
+                } else if frame_start >= 0 && value_index >= 0 && value_index < self.scalar_values.len() {
+                    let previous: asp.runtime.Variant = op == (VbsBytecodeReDimScalarArray => Int) ? self.variant_at(self.scalar_values, value_index) : asp.runtime.variant_empty();
+                    let array_value: asp.runtime.Variant = asp.evaluator_control_build_array(bounds, 0, previous, op == (VbsBytecodeReDimScalarArray => Int) && arg1 < 0);
+                    _ = self.scalar_values.set(value_index, array_value);
+                    self.sync_native_slot(ctx, value_index, array_value);
+                }
+                if op == (VbsBytecodeReDimScalarArray => Int) || !valid_bounds {
+                    let result: Int = self.evaluator.finish_statement(ctx);
+                    if result != 0 {
+                        return result;
+                    }
+                }
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeReDimIdentifier => Int) {
+                let rank: Int = arg1 < 0 ? 0 - arg1 : arg1;
+                let bounds: collections.Vector<Int> = scratch.ints;
+                bounds.clear();
+                let valid_bounds: Bool = rank > 0;
+                let i: Int = rank - 1;
+                loop i >= 0 {
+                    let upper: Int = asp.variant_to_int(self.pop_variant(stack));
+                    if upper < -1 {
+                        valid_bounds = false;
+                    }
+                    bounds.insert(0, upper);
+                    i -= 1;
+                }
+                let target_name: String = arg0 >= 0 && arg0 < bytecode.program.runtime_stmt_count()
+                ? bytecode.program.runtime_stmt_target_name(arg0)
+                : "";
+                if !valid_bounds || std.len(target_name) == 0 {
+                    self.evaluator.raise_runtime_error(ctx, 9,
+                        valid_bounds ? "array target required" : "subscript out of range in ReDim " + target_name,
+                        "VBScript");
+                } else {
+                    let previous: asp.runtime.Variant = self.evaluator.resolve_identifier(ctx, scope, target_name, bytecode.program);
+                    let resized: asp.runtime.Variant = asp.evaluator_control_build_array(bounds, 0, previous, arg1 < 0);
+                    // A class-local dense array would have compiled to
+                    // ReDimScalarArray. ReDimIdentifier therefore denotes a
+                    // field/global binding; do not let compatibility vars
+                    // created for trap boundaries capture a Me field.
+                    if self.evaluator.has_me_field(ctx, scope, target_name) {
+                        _ = self.evaluator.set_me_field(ctx, scope, target_name, resized);
+                    } else {
+                        self.evaluator.assign_identifier(ctx, scope, target_name, resized);
+                    }
+                }
+                let result: Int = self.evaluator.finish_statement(ctx);
+                if result != 0 {
+                    return result;
+                }
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeReturnSignal => Int) {
+                if (arg0 == 2 || arg0 == 3) && self.native_return_pcs.len() > native_frame_floor {
+                    let frame_index: Int = self.native_return_pcs.len() - 1;
+                    let frame_start: Int = self.native_slot_bases.get_unchecked(frame_index);
+                    let frame_stack_base: Int = self.native_stack_bases.get_unchecked(frame_index);
+                    let frame_is_function: Bool = self.native_frame_functions.get_unchecked(frame_index) != 0;
+                    let frame_push_result: Bool = self.native_frame_push_results.get_unchecked(frame_index) != 0;
+                    let frame_statement: Bool = self.native_frame_statements.get_unchecked(frame_index) != 0;
+                    let copyback_mask: Int = self.native_frame_copyback_masks.pop_back(0);
+                    let arg_start: Int = self.native_frame_arg_starts.pop_back(self.native_arg_expr_ids.len());
+                    let frame_result: asp.runtime.Variant = frame_is_function
+                    ? self.variant_at(self.scalar_values, frame_start)
+                    : asp.runtime.variant_empty();
+                    loop stack.len() > frame_stack_base { _ = self.discard_variant(stack); }
+                    _ = self.scalar_frame_starts.pop_back(0);
+                    pc = self.native_return_pcs.pop_back(0);
+                    limit_pc = self.native_limit_pcs.pop_back(instruction_count);
+                    _ = self.native_stack_bases.pop_back(0);
+                    _ = self.native_slot_bases.pop_back(0);
+                    _ = self.native_frame_functions.pop_back(0);
+                    _ = self.native_frame_push_results.pop_back(0);
+                    _ = self.native_frame_statements.pop_back(0);
+                    let program_switched: Bool = eg_asp_vm_routine_program_switched(ctx.request_arena_handle) != 0;
+                    if program_switched {
+                        let caller_dynamic_active: Bool = eg_asp_vm_routine_caller_dynamic_active(ctx.request_arena_handle) != 0;
+                        let caller_dynamic_index: Int = eg_asp_vm_routine_caller_dynamic_index(ctx.request_arena_handle);
+                        self.evaluator.dynamic_vm_active = caller_dynamic_active;
+                        self.evaluator.dynamic_active_index = caller_dynamic_index;
+                        bytecode = caller_dynamic_active
+                            ? self.evaluator.dynamic_bytecode_at(caller_dynamic_index)
+                            : self.evaluator.active_bytecode;
+                        instruction_count = bytecode.instruction_count();
+                        ctx.prepare_global_slots(bytecode.global_slot_names);
+                    }
+                    let caller_routine_id: Int = self.native_caller_routine_ids.pop_back(-1);
+                    _ = self.native_caller_scopes.remove_at(self.native_caller_scopes.len() - 1);
+                    scope = self.native_caller_scopes.get_unchecked(self.native_caller_scopes.len() - 1);
+                    _ = self.native_caller_scopes.remove_at(self.native_caller_scopes.len() - 1);
+                    self.release_scope();
+                    native_current_routine_id = caller_routine_id;
+                    let copyback_index: Int = 0;
+                    loop copyback_index < 31 && arg_start + copyback_index < self.native_arg_expr_ids.len() {
+                        if (copyback_mask & (1 << copyback_index)) != 0 {
+                            self.assign_frame_copyback(
+                                bytecode, ctx, scope, native_current_routine_id,
+                                self.native_arg_expr_ids.get_unchecked(arg_start + copyback_index),
+                                self.variant_at(self.scalar_values, frame_start + 1 + copyback_index)
+                            );
+                        }
+                        copyback_index += 1;
+                    }
+                    loop self.native_arg_expr_ids.len() > arg_start { _ = self.native_arg_expr_ids.pop_back(-1); }
+                    loop self.scalar_values.len() > frame_start { _ = self.discard_variant(self.scalar_values); }
+                    _ = eg_asp_vm_routine_leave(ctx.request_arena_handle);
+                    ctx.error_state.resume_next_enabled = self.native_caller_error_modes.pop_back(0) != 0;
+                    if frame_push_result {
+                        _ = stack.push(frame_result);
+                    }
+                    if frame_statement {
+                        let statement_result: Int = self.evaluator.finish_statement(ctx);
+                        if statement_result != 0 || ctx.response.ended {
+                            return statement_result == 0 && ctx.response.ended ? 1 : statement_result;
+                        }
+                    }
+                    skip;
+                }
+                return arg0;
+            }
+            if op == (VbsBytecodeForLoop => Int) {
+                let step_value: Int = bytecode.program.runtime_stmt_extra_expr2(arg0) >= 0 && stack.len() > stack_floor ? asp.variant_to_int(self.pop_variant(stack)) : 1;
+                let finish: Int = asp.variant_to_int(self.pop_variant(stack));
+                let current: Int = asp.variant_to_int(self.pop_variant(stack));
+                loop true {
+                    if step_value >= 0 && current > finish {
+                        break;
+                    }
+                    if step_value < 0 && current < finish {
+                        break;
+                    }
+                    if arg1 >= 0 && self.scalar_frame_starts.len() > 0 {
+                        let frame_start: Int = self.scalar_frame_starts.get_unchecked(self.scalar_frame_starts.len() - 1);
+                        let value_index: Int = frame_start + arg1;
+                        if value_index >= 0 && value_index < self.scalar_values.len() {
+                            let current_value: asp.runtime.Variant = self.cached_int(current);
+                            _ = self.scalar_values.set(value_index, current_value);
+                            self.sync_native_slot(ctx, value_index, current_value);
+                        }
+                    } else if arg1 <= -2 {
+                        let global_index: Int = 0 - arg1 - 2;
+                        if scope.me_object_id > 0 && global_index >= 0 && global_index < bytecode.global_slot_names.len() {
+                            self.evaluator.assign_identifier(ctx, scope, bytecode.global_slot_names.get_unchecked(global_index), self.cached_int(current));
+                        } else {
+                            ctx.set_global_slot(global_index, self.cached_int(current));
+                        }
+                    } else {
+                        self.evaluator.assign_identifier(ctx, scope, bytecode.program.runtime_stmt_target_name(arg0), self.cached_int(current));
+                    }
+                    let result: Int = self.execute_block(bytecode, ctx, scope, bytecode.program.runtime_stmt_body_block(arg0), -2, native_current_routine_id);
+                    if result == 4 {
+                        break;
+                    }
+                    // A recursively executed loop body can exit the routine
+                    // owned by this dispatcher. Unwind that native call at
+                    // its limit, preserving its return value and ByRef slots,
+                    // instead of propagating the exit through every caller.
+                    if (result == 2 || result == 3) && self.native_return_pcs.len() > native_frame_floor {
+                        pc = limit_pc;
+                        break;
+                    }
+                    if result != 0 {
+                        return result;
+                    }
+                    current += step_value;
+                }
+                if pc < limit_pc {
+                    pc += 1;
+                }
+                skip;
+            }
+            if op == (VbsBytecodeForEachLoop => Int) {
+                let source_value: asp.runtime.Variant = self.pop_variant(stack);
+                let values: collections.Vector<asp.runtime.Variant> = source_value.kind == asp.runtime.VariantArray
+                ? self.evaluator.enumerate_values(ctx, source_value)
+                : self.evaluator.enumerate_expr_values(bytecode.program, ctx, bytecode.program.runtime_stmt_value_expr(arg0), source_value);
+                let i: Int = 0;
+                loop i < values.len() {
+                    if arg1 >= 0 && self.scalar_frame_starts.len() > 0 {
+                        let frame_start: Int = self.scalar_frame_starts.get_unchecked(self.scalar_frame_starts.len() - 1);
+                        let value_index: Int = frame_start + arg1;
+                        if value_index >= 0 && value_index < self.scalar_values.len() {
+                            let each_value: asp.runtime.Variant = self.variant_at(values, i);
+                            _ = self.scalar_values.set(value_index, each_value);
+                            self.sync_native_slot(ctx, value_index, each_value);
+                            _ = scope.vars.set(bytecode.program.runtime_stmt_target_name(arg0), each_value);
+                        }
+                    } else if arg1 <= -2 {
+                        let global_index: Int = 0 - arg1 - 2;
+                        if scope.me_object_id > 0 && global_index >= 0 && global_index < bytecode.global_slot_names.len() {
+                            self.evaluator.assign_identifier(ctx, scope, bytecode.global_slot_names.get_unchecked(global_index), self.variant_at(values, i));
+                        } else {
+                            ctx.set_global_slot(global_index, self.variant_at(values, i));
+                        }
+                    } else {
+                        self.evaluator.assign_identifier(ctx, scope, bytecode.program.runtime_stmt_target_name(arg0), self.variant_at(values, i));
+                    }
+                    let result: Int = self.execute_block(bytecode, ctx, scope, bytecode.program.runtime_stmt_body_block(arg0), -2, native_current_routine_id);
+                    if result == 4 {
+                        break;
+                    }
+                    if (result == 2 || result == 3) && self.native_return_pcs.len() > native_frame_floor {
+                        pc = limit_pc;
+                        break;
+                    }
+                    if result != 0 {
+                        return result;
+                    }
+                    i += 1;
+                }
+                if pc < limit_pc {
+                    pc += 1;
+                }
+                skip;
+            }
+            if op == (VbsBytecodeSelectDispatch => Int) {
+                let select_value: asp.runtime.Variant = self.pop_variant(stack);
+                let i: Int = 0;
+                loop i < bytecode.program.runtime_stmt_case_count(arg0) {
+                    let clause_id: Int = bytecode.program.runtime_stmt_case(arg0, i);
+                    let matched: Bool = bytecode.program.runtime_case_is_else(clause_id);
+                    if !matched {
+                        let j: Int = 0;
+                        loop j < bytecode.program.runtime_case_expr_count(clause_id) {
+                            if asp.variant_compare(select_value, self.evaluator.eval_expr_in_scope(bytecode.program, ctx, scope, bytecode.program.runtime_case_expr(clause_id, j))) == 0 {
+                                matched = true;
+                                break;
+                            }
+                            j += 1;
+                        }
+                    }
+                    if matched {
+                        let result: Int = self.execute_block(bytecode, ctx, scope, bytecode.program.runtime_case_block(clause_id), -2, native_current_routine_id);
+                        if (result == 2 || result == 3) && self.native_return_pcs.len() > native_frame_floor {
+                            pc = limit_pc;
+                            break;
+                        }
+                        if result != 0 {
+                            return result;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                if pc < limit_pc {
+                    pc += 1;
+                }
+                skip;
+            }
+            if op == (VbsBytecodePushExprLeaf => Int) {
+                let expr_kind: asp.compiler.VbsExprKind = bytecode.program.runtime_expr_kind(arg0);
+                let expr_text: String = bytecode.program.runtime_expr_text(arg0);
+                // A scalar literal that first reaches a managed boundary is
+                // interned into the resident C program. Subsequent executions
+                // keep it tagged on the native operand stack without scanning
+                // the full expression table during request startup.
+                if native_program != 0 {
+                    if expr_kind == asp.compiler.VbsExprInteger {
+                        _ = eg_asp_vbc_set_literal(native_program, arg0,
+                            asp.runtime.VariantInt => Int,
+                            bytecode.program.runtime_expr_int(arg0), 0.0);
+                    } else if expr_kind == asp.compiler.VbsExprBool {
+                        _ = eg_asp_vbc_set_literal(native_program, arg0,
+                            asp.runtime.VariantBool => Int,
+                            bytecode.program.runtime_expr_bool(arg0) ? 1 : 0, 0.0);
+                    } else if expr_kind == asp.compiler.VbsExprFloat {
+                        _ = eg_asp_vbc_set_literal(native_program, arg0,
+                            asp.runtime.VariantFloat => Int, 0,
+                            strconv.parse_float64(expr_text));
+                    }
+                }
+                if expr_kind == asp.compiler.VbsExprString {
+                    _ = stack.push(asp.runtime.variant_string(expr_text));
+                } else if expr_kind == asp.compiler.VbsExprInteger {
+                    _ = stack.push(self.cached_int(bytecode.program.runtime_expr_int(arg0)));
+                } else if expr_kind == asp.compiler.VbsExprFloat {
+                    _ = stack.push(asp.runtime.variant_float(strconv.parse_float64(expr_text)));
+                } else if expr_kind == asp.compiler.VbsExprDate {
+                    _ = stack.push(asp.runtime.variant_date(bytecode.program.runtime_expr_int(arg0)));
+                } else if expr_kind == asp.compiler.VbsExprBool {
+                    _ = stack.push(self.cached_bool(bytecode.program.runtime_expr_bool(arg0)));
+                } else if expr_kind == asp.compiler.VbsExprNothing {
+                    _ = stack.push(asp.runtime.variant_nothing());
+                } else if expr_kind == asp.compiler.VbsExprIdentifier {
+                    let dot: Int = bytecode.program.runtime_expr_name_dot(arg0);
+                    let me_field_name: String = bytecode.program.runtime_expr_receiver_name(arg0);
+                    if scope.me_object_id > 0 && self.evaluator.has_me_field(ctx, scope, me_field_name) {
+                        let me_value: asp.runtime.Variant = self.evaluator.get_me_field(ctx, scope, me_field_name);
+                        if dot > 0 && me_value.kind == asp.runtime.VariantObject {
+                            let no_args: collections.Vector<asp.runtime.Variant> = scratch.values;
+                            let no_arg_ids: collections.Vector<Int> = scratch.ids;
+                            no_args.clear();
+                            no_arg_ids.clear();
+                            _ = stack.push(self.evaluator.invoke_object_values(
+                                bytecode.program, ctx, scope, me_value,
+                                bytecode.program.runtime_expr_member_name(arg0),
+                                no_args, false, asp.runtime.variant_empty(), no_arg_ids));
+                        } else {
+                            _ = stack.push(me_value);
+                        }
+                    } else {
+                        _ = stack.push(self.evaluator.resolve_identifier(ctx, scope, expr_text, bytecode.program));
+                    }
+                } else if expr_kind == asp.compiler.VbsExprNew {
+                    _ = stack.push(self.evaluator.instantiate_class(bytecode.program, ctx, expr_text));
+                } else {
+                    _ = stack.push(asp.runtime.variant_empty());
+                }
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodePushGlobalExprLeaf => Int) {
+                let value: asp.runtime.Variant = asp.runtime.variant_empty();
+                if bytecode.program.runtime_expr_kind(arg0) == asp.compiler.VbsExprIdentifier {
+                    value = self.evaluator.dynamic_vm_active
+                        ? self.evaluator.resolve_identifier(ctx, scope, bytecode.program.runtime_expr_text(arg0), bytecode.program)
+                        : self.evaluator.resolve_identifier(ctx, self.evaluator.root_scope(ctx), bytecode.program.runtime_expr_text(arg0), bytecode.program);
+                }
+                _ = stack.push(value);
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeNeg => Int) {
+                let value: asp.runtime.Variant = self.pop_variant(stack);
+                let result: asp.runtime.Variant = new asp.runtime.Variant();
+                if value.kind == asp.runtime.VariantFloat {
+                    result.kind = asp.runtime.VariantFloat;
+                    result.float_value = 0.0 - value.float_value;
+                } else {
+                    result.kind = asp.runtime.VariantInt;
+                    result.int_value = 0 - asp.variant_to_int(value);
+                }
+                _ = stack.push(result);
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeNot => Int) {
+                let value: asp.runtime.Variant = self.pop_variant(stack);
+                let result: asp.runtime.Variant = asp.runtime.variant_empty();
+                if value.kind == asp.runtime.VariantBool {
+                    result = self.cached_bool(!value.bool_value);
+                } else {
+                    result = self.cached_int(~asp.variant_to_int(value));
+                }
+                _ = stack.push(result);
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeConcatN => Int) {
+                let available: Int = stack.len() - stack_floor;
+                let part_count: Int = arg0 >= 0 && arg0 <= available ? arg0 : available;
+                let part_start: Int = stack.len() - part_count;
+                // Fuse `ConcatN; Response.Write` and append each already
+                // evaluated part directly.  This preserves output order while
+                // eliminating the combined String and its Variant wrapper.
+                if pc + 1 < limit_pc {
+                    let next_offset: Int = (pc + 1) * 3;
+                    let next_op: Int = bytecode.instruction_word(next_offset);
+                    let next_stmt_id: Int = bytecode.instruction_word(next_offset + 1);
+                    let next_binding: Int = bytecode.instruction_word(next_offset + 2);
+                    if next_op == (VbsBytecodeCallStmt => Int)
+                    && next_binding == -100101
+                    && bytecode.program.runtime_stmt_call_arg_count(next_stmt_id) == 1 {
+                        let write_part_index: Int = 0;
+                        loop write_part_index < part_count {
+                            _ = ctx.response.write(
+                                self.variant_at(stack, part_start + write_part_index).to_output_string()
+                            );
+                            write_part_index += 1;
+                        }
+                        loop stack.len() > part_start {
+                            _ = self.discard_variant(stack);
+                        }
+                        let write_result: Int = self.evaluator.finish_statement(ctx);
+                        if write_result != 0 || ctx.response.ended {
+                            return write_result == 0 && ctx.response.ended ? 1 : write_result;
+                        }
+                        pc += 2;
+                        skip;
+                    }
+                }
+                let builder: std.StringBuilder = new std.StringBuilder(part_count * 16 + 1);
+                let part_index: Int = 0;
+                loop part_index < part_count {
+                    let part: asp.runtime.Variant = self.variant_at(stack, part_start + part_index);
+                    _ = builder.append(part.to_output_string());
+                    part_index += 1;
+                }
+                loop stack.len() > part_start {
+                    _ = self.discard_variant(stack);
+                }
+                let combined: String = builder.to_string();
+                _ = builder.free();
+                _ = stack.push(asp.runtime.variant_string(combined));
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeConcat => Int) || op == (VbsBytecodeEq => Int) || op == (VbsBytecodeNe => Int) || op == (VbsBytecodeIs => Int) || op == (VbsBytecodeLt => Int) || op == (VbsBytecodeLe => Int) || op == (VbsBytecodeGt => Int) || op == (VbsBytecodeGe => Int) || op == (VbsBytecodeAdd => Int) || op == (VbsBytecodeSub => Int) || op == (VbsBytecodeMul => Int) || op == (VbsBytecodeDiv => Int) || op == (VbsBytecodeIntDiv => Int) || op == (VbsBytecodeMod => Int) || op == (VbsBytecodeAnd => Int) || op == (VbsBytecodeOr => Int) || op == (VbsBytecodeXor => Int) || op == (VbsBytecodePow => Int) {
+                let right: asp.runtime.Variant = self.pop_variant(stack);
+                let left: asp.runtime.Variant = self.pop_variant(stack);
+                if op == (VbsBytecodeConcat => Int) {
+                    _ = stack.push(asp.runtime.variant_string(left.to_output_string() + right.to_output_string()));
+                } else if op == (VbsBytecodeEq => Int) {
+                    _ = stack.push(self.cached_bool(asp.variant_compare(left, right) == 0));
+                } else if op == (VbsBytecodeNe => Int) {
+                    _ = stack.push(self.cached_bool(asp.variant_compare(left, right) != 0));
+                } else if op == (VbsBytecodeIs => Int) {
+                    _ = stack.push(self.cached_bool(asp.variant_is(left, right)));
+                } else if op == (VbsBytecodeLt => Int) {
+                    _ = stack.push(self.cached_bool(asp.variant_compare(left, right) < 0));
+                } else if op == (VbsBytecodeLe => Int) {
+                    _ = stack.push(self.cached_bool(asp.variant_compare(left, right) <= 0));
+                } else if op == (VbsBytecodeGt => Int) {
+                    _ = stack.push(self.cached_bool(asp.variant_compare(left, right) > 0));
+                } else if op == (VbsBytecodeGe => Int) {
+                    _ = stack.push(self.cached_bool(asp.variant_compare(left, right) >= 0));
+                } else if op == (VbsBytecodeAdd => Int) {
+                    let result: asp.runtime.Variant = new asp.runtime.Variant();
+                    asp.variant_numeric_apply_into(result, 1, left, right);
+                    _ = stack.push(result);
+                } else if op == (VbsBytecodeSub => Int) {
+                    let result: asp.runtime.Variant = new asp.runtime.Variant();
+                    if left.kind == asp.runtime.VariantDate || right.kind == asp.runtime.VariantDate {
+                        asp.variant_numeric_apply_into(result, 2, left, right);
+                    } else if left.kind == asp.runtime.VariantFloat || right.kind == asp.runtime.VariantFloat {
+                        result.kind = asp.runtime.VariantFloat;
+                        result.float_value = asp.variant_to_float64(left) - asp.variant_to_float64(right);
+                    } else {
+                        result.kind = asp.runtime.VariantInt;
+                        result.int_value = asp.variant_to_int(left) - asp.variant_to_int(right);
+                    }
+                    _ = stack.push(result);
+                } else if op == (VbsBytecodeMul => Int) {
+                    let result: asp.runtime.Variant = new asp.runtime.Variant();
+                    if left.kind == asp.runtime.VariantFloat || right.kind == asp.runtime.VariantFloat {
+                        result.kind = asp.runtime.VariantFloat;
+                        result.float_value = asp.variant_to_float64(left) * asp.variant_to_float64(right);
+                    } else {
+                        result.kind = asp.runtime.VariantInt;
+                        result.int_value = asp.variant_to_int(left) * asp.variant_to_int(right);
+                    }
+                    _ = stack.push(result);
+                } else if op == (VbsBytecodeAnd => Int) {
+                    _ = stack.push(self.cached_int(asp.variant_to_int(left) & asp.variant_to_int(right)));
+                } else if op == (VbsBytecodeOr => Int) {
+                    _ = stack.push(self.cached_int(asp.variant_to_int(left) | asp.variant_to_int(right)));
+                } else if op == (VbsBytecodeXor => Int) {
+                    _ = stack.push(self.cached_int(asp.variant_to_int(left) ^ asp.variant_to_int(right)));
+                } else if op == (VbsBytecodePow => Int) {
+                    _ = stack.push(asp.variant_power(left, right));
+                } else if op == (VbsBytecodeMod => Int) {
+                    let divisor: Int = asp.variant_to_int(right);
+                    if divisor == 0 {
+                        self.evaluator.raise_runtime_error(ctx, 11, "division by zero", "VBScript");
+                        _ = stack.push(asp.runtime.variant_empty());
+                    } else {
+                        _ = stack.push(self.cached_int(asp.variant_to_int(left) % divisor));
+                    }
+                } else if op == (VbsBytecodeDiv => Int) {
+                    let divisor: Float64 = asp.variant_to_float64(right);
+                    if divisor == 0.0 {
+                        self.evaluator.raise_runtime_error(ctx, 11, "division by zero", "VBScript");
+                        _ = stack.push(asp.runtime.variant_empty());
+                    } else {
+                        _ = stack.push(asp.runtime.variant_float(asp.variant_to_float64(left) / divisor));
+                    }
+                } else {
+                    let divisor: Int = asp.variant_to_int(right);
+                    if divisor == 0 {
+                        self.evaluator.raise_runtime_error(ctx, 11, "division by zero", "VBScript");
+                        _ = stack.push(asp.runtime.variant_empty());
+                    } else {
+                        _ = stack.push(self.cached_int(asp.variant_to_int(left) / divisor));
+                    }
+                }
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeTargetAccessExpr => Int) {
+                let expr_arg_ids: collections.Vector<Int> = scratch.ids;
+                expr_arg_ids.clear();
+                let expr_arg_count: Int = bytecode.program.runtime_expr_arg_count(arg0);
+                let expr_arg_index: Int = 0;
+                loop expr_arg_index < expr_arg_count { _ = expr_arg_ids.push(bytecode.program.runtime_expr_arg(arg0, expr_arg_index)); expr_arg_index += 1; }
+                let expr_text: String = bytecode.program.runtime_expr_text(arg0);
+                let expr_left_id: Int = bytecode.program.runtime_expr_left(arg0);
+                let left_kind: Int = -1;
+                let left_text: String = "";
+                if expr_left_id >= 0 {
+                    left_kind = bytecode.program.runtime_expr_kind(expr_left_id) => Int;
+                    left_text = bytecode.program.runtime_expr_text(expr_left_id);
+                }
+                let call_args: collections.Vector<asp.runtime.Variant> = scratch.values;
+                call_args.clear();
+                let i: Int = expr_arg_count - 1;
+                loop i >= 0 {
+                    call_args.insert(0, self.pop_variant(stack));
+                    i -= 1;
+                }
+                let scalar_value_index: Int = arg1 >= 0 && self.scalar_frame_starts.len() > 0
+                ? self.scalar_frame_starts.get_unchecked(self.scalar_frame_starts.len() - 1) + arg1
+                : -1;
+                let scalar_target: asp.runtime.Variant = scalar_value_index >= 0 && scalar_value_index < self.scalar_values.len()
+                ? self.variant_at(self.scalar_values, scalar_value_index)
+                : asp.runtime.variant_empty();
+                if scalar_value_index >= 0
+                && scalar_value_index < self.scalar_values.len()
+                && expr_arg_count == 1
+                && scalar_target.kind == asp.runtime.VariantArray {
+                    let index_value: asp.runtime.Variant = self.variant_at(call_args, 0);
+                    let index: Int = asp.variant_to_int(index_value);
+                    if scalar_target.array_data == nil {
+                        _ = stack.push(asp.runtime.variant_empty());
+                        pc += 1;
+                        skip;
+                    }
+                    let raw_array_items: Any = scalar_target.array_data.items;
+                    if __object_is_null(raw_array_items) != 0 {
+                        _ = stack.push(asp.runtime.variant_empty());
+                        pc += 1;
+                        skip;
+                    }
+                    let array_items: collections.Vector<asp.runtime.Variant> = scalar_target.array_data.items;
+                    let array_length: Int = array_items.len();
+                    if index >= 0 && index < array_length {
+                        let raw_element: Any = array_items.data.get_unchecked(index);
+                        if __object_is_null(raw_element) != 0 {
+                            _ = stack.push(asp.runtime.variant_empty());
+                        } else {
+                            let element: asp.runtime.Variant = raw_element => asp.runtime.Variant;
+                            _ = stack.push(element);
+                            _ = __gc_keepalive(element);
+                        }
+                        _ = __gc_keepalive(raw_element);
+                    } else {
+                        self.evaluator.raise_runtime_error(ctx, 9, "subscript out of range: dimension=1, index=" + strconv.itoa(index) + ", length=" + strconv.itoa(array_length) + ", kind=" + strconv.itoa(asp.runtime.VariantArray => Int) + ", isSet=false", "VBScript");
+                        _ = stack.push(asp.runtime.variant_empty());
+                    }
+                    _ = __gc_keepalive(index_value);
+                    _ = __gc_keepalive(call_args);
+                    _ = __gc_keepalive(raw_array_items);
+                    _ = __gc_keepalive(array_items);
+                    _ = __gc_keepalive(scalar_target);
+                    _ = __gc_keepalive(self.scalar_values);
+                    _ = __gc_keepalive(self);
+                    pc += 1;
+                    skip;
+                }
+                let target_from_stack: Bool = scalar_value_index < 0 || scalar_value_index >= self.scalar_values.len();
+                let target: asp.runtime.Variant = target_from_stack
+                ? (stack.len() > stack_floor ? self.variant_at(stack, stack.len() - 1) : asp.runtime.variant_empty())
+                : self.variant_at(self.scalar_values, scalar_value_index);
+                let out: asp.runtime.Variant = asp.runtime.variant_empty();
+                if target.kind == asp.runtime.VariantObject {
+                    out = self.evaluator.invoke_object_values(bytecode.program, ctx, scope, target, "", call_args, false, asp.runtime.variant_empty(), expr_arg_ids);
+                } else if target.kind == asp.runtime.VariantArray {
+                    out = self.evaluator.invoke_array_values(ctx, target, call_args, false, asp.runtime.variant_empty());
+                } else {
+                    if left_kind == (asp.compiler.VbsExprIdentifier => Int) {
+                        out = self.evaluator.eval_call_values(bytecode.program, ctx, scope, left_text, call_args, expr_arg_ids);
+                    } else {
+                        self.evaluator.raise_runtime_error(ctx, 438, "value does not support default call (expression " + strconv.itoa(arg0) + ", member '" + expr_text + "', left expression " + strconv.itoa(expr_left_id) + ", left kind " + strconv.itoa(left_kind) + ", left text '" + left_text + "', target kind " + strconv.itoa(target.kind => Int) + ", argument count " + strconv.itoa(expr_arg_count) + ")", "VBScript");
+                    }
+                }
+                _ = __gc_keepalive(target);
+                _ = __gc_keepalive(call_args);
+                _ = __gc_keepalive(self.scalar_values);
+                _ = __gc_keepalive(self);
+                if target_from_stack && stack.len() > stack_floor {
+                    _ = self.discard_variant(stack);
+                }
+                _ = stack.push(out);
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeMemberAccessExpr => Int) {
+                let expr_arg_ids: collections.Vector<Int> = scratch.ids;
+                expr_arg_ids.clear();
+                let expr_arg_count: Int = bytecode.program.runtime_expr_arg_count(arg0);
+                let expr_arg_index: Int = 0;
+                loop expr_arg_index < expr_arg_count { _ = expr_arg_ids.push(bytecode.program.runtime_expr_arg(arg0, expr_arg_index)); expr_arg_index += 1; }
+                let expr_text: String = bytecode.program.runtime_expr_text(arg0);
+                let expr_dot: Int = bytecode.program.runtime_expr_left(arg0) < 0 ? bytecode.program.runtime_expr_name_dot(arg0) : -1;
+                let member_name: String = expr_dot > 0 && expr_dot + 1 < std.len(expr_text)
+                    ? bytecode.program.runtime_expr_member_name(arg0)
+                    : expr_text;
+                let call_args: collections.Vector<asp.runtime.Variant> = scratch.values;
+                call_args.clear();
+                let i: Int = expr_arg_count - 1;
+                loop i >= 0 {
+                    call_args.insert(0, self.pop_variant(stack));
+                    i -= 1;
+                }
+                let target: asp.runtime.Variant = self.pop_variant(stack);
+                if native_classes_enabled && target.kind == asp.runtime.VariantObject {
+                    let obj: RuntimeObject = self.evaluator.get_object(ctx, target.object_value);
+                    let callee_dynamic_index: Int = -1;
+                    let caller_dynamic_active: Bool = self.evaluator.dynamic_vm_active;
+                    let caller_dynamic_index: Int = self.evaluator.dynamic_active_index;
+                    let routine_id: Int = arg1 > 0 ? arg1 - 1 : -1;
+                    if routine_id < 0 && obj.kind == RuntimeObjectUserClass && std.len(member_name) > 0 {
+                        routine_id = self.evaluator.find_routine_by_function_kind(bytecode.program, member_name, obj.class_name, true);
+                        if routine_id < 0 {
+                            routine_id = self.evaluator.find_routine(bytecode.program, member_name, obj.class_name);
+                        }
+                    }
+                    if routine_id < 0 && obj.kind == RuntimeObjectUserClass && std.len(member_name) > 0 {
+                        let packed_candidate: Int = self.find_dynamic_object_routine(obj.class_name, member_name);
+                        if packed_candidate >= 0 {
+                            callee_dynamic_index = packed_candidate / 1048576 - 1;
+                            routine_id = packed_candidate % 1048576;
+                            bytecode = self.evaluator.dynamic_bytecode_at(callee_dynamic_index);
+                            instruction_count = bytecode.instruction_count();
+                            self.evaluator.dynamic_vm_active = true;
+                            self.evaluator.dynamic_active_index = callee_dynamic_index;
+                            ctx.prepare_global_slots(bytecode.global_slot_names);
+                        }
+                    }
+                    if obj.kind == RuntimeObjectUserClass
+                    && !obj.store.has(member_name)
+                    && routine_id >= 0
+                    && routine_id < bytecode.program.runtime_routine_count()
+                    && routine_id < bytecode.routine_slot_counts.len()
+                    && self.routine_c_frame_safe(bytecode, routine_id)
+                    && strings.equal_fold_ascii(bytecode.program.runtime_routine_owner(routine_id), obj.class_name)
+                    && eg_asp_vm_member_select(ctx.request_arena_handle, routine_id + 1, obj.kind => Int, routine_id, call_args.len(), 0) == routine_id {
+                        let routine_block_id: Int = routine_id < bytecode.routine_block_ids.len()
+                        ? bytecode.routine_block_ids.get_unchecked(routine_id)
+                        : -1;
+                        let routine_entry_pc: Int = routine_block_id >= 0 && routine_block_id < bytecode.block_pcs.len()
+                        ? bytecode.block_pcs.get_unchecked(routine_block_id)
+                        : -1;
+                        let routine_limit_pc: Int = routine_block_id >= 0 && routine_block_id < bytecode.block_end_pcs.len()
+                        ? bytecode.block_end_pcs.get_unchecked(routine_block_id)
+                        : -1;
+                        let routine_slot_count: Int = bytecode.routine_slot_counts.get_unchecked(routine_id);
+                        let object_copyback_mask: Int = self.routine_copyback_mask(bytecode, routine_id, ctx, scope, expr_arg_ids);
+                        let frame_start: Int = self.scalar_values.len();
+                        if routine_entry_pc >= 0
+                        && routine_limit_pc >= routine_entry_pc
+                        && eg_asp_vm_routine_enter(ctx.request_arena_handle, routine_id, pc + 1, limit_pc, stack.len(), frame_start, routine_slot_count) != 0 {
+                            _ = eg_asp_vm_routine_bind(ctx.request_arena_handle, target.object_value, 1, object_copyback_mask);
+                            _ = self.native_return_pcs.push(pc + 1);
+                            _ = self.native_limit_pcs.push(limit_pc);
+                            _ = self.native_stack_bases.push(stack.len());
+                            _ = self.native_slot_bases.push(frame_start);
+                            _ = self.native_frame_functions.push(bytecode.program.runtime_routine_is_function(routine_id) ? 1 : 0);
+                            _ = self.native_frame_push_results.push(1);
+                            _ = self.native_frame_statements.push(0);
+                            self.push_copyback_frame(object_copyback_mask, expr_arg_ids);
+                            if callee_dynamic_index >= 0 {
+                                _ = eg_asp_vm_routine_bind_program(
+                                    ctx.request_arena_handle,
+                                    caller_dynamic_active ? 1 : 0,
+                                    caller_dynamic_index
+                                );
+                            }
+                            _ = self.native_caller_routine_ids.push(native_current_routine_id);
+                            _ = self.scalar_frame_starts.push(frame_start);
+                            let empty_slot: asp.runtime.Variant = asp.runtime.variant_empty();
+                            let slot_index: Int = 0;
+                            loop slot_index < routine_slot_count {
+                                _ = self.scalar_values.push(slot_index > 0 && slot_index - 1 < call_args.len()
+                                ? self.variant_at(call_args, slot_index - 1)
+                                : empty_slot);
+                                slot_index += 1;
+                            }
+                            self.sync_native_frame(ctx, frame_start, routine_slot_count);
+                            scope = self.enter_native_scope(bytecode, ctx, scope, routine_id, target.object_value, frame_start);
+                            native_current_routine_id = routine_id;
+                            pc = routine_entry_pc;
+                            limit_pc = routine_limit_pc;
+                            skip;
+                        }
+                    }
+                    if callee_dynamic_index >= 0 {
+                        self.evaluator.dynamic_vm_active = caller_dynamic_active;
+                        self.evaluator.dynamic_active_index = caller_dynamic_index;
+                        bytecode = caller_dynamic_active
+                            ? self.evaluator.dynamic_bytecode_at(caller_dynamic_index)
+                            : self.evaluator.active_bytecode;
+                        instruction_count = bytecode.instruction_count();
+                        ctx.prepare_global_slots(bytecode.global_slot_names);
+                    }
+                }
+                let scalar_field_value: Bool = self.evaluator.is_recordset_field_value_access(bytecode.program, ctx, scope, arg0, target);
+                let out: asp.runtime.Variant = target.kind == asp.runtime.VariantObject
+                ? (arg1 > 0
+                    ? self.evaluator.invoke_object_member_id_values(bytecode.program, ctx, scope, target, member_name, arg1, call_args, expr_arg_ids)
+                    : self.evaluator.invoke_object_values(bytecode.program, ctx, scope, target, member_name, call_args, false, asp.runtime.variant_empty(), expr_arg_ids))
+                : (scalar_field_value ? target : asp.runtime.variant_empty());
+                if target.kind != asp.runtime.VariantObject && !scalar_field_value {
+                    self.evaluator.raise_runtime_error(
+                        ctx, 438,
+                        "value does not support member access (receiver expression "
+                            + strconv.itoa(arg0) + " '" + bytecode.program.runtime_expr_text(arg0)
+                            + "', kind " + strconv.itoa(target.kind => Int)
+                            + ", routine " + strconv.itoa(native_current_routine_id)
+                            + (native_current_routine_id >= 0
+                                ? " '" + bytecode.program.runtime_routine_name(native_current_routine_id) + "'"
+                                : "")
+                            + ", pc " + strconv.itoa(pc) + ")",
+                        "VBScript"
+                    );
+                }
+                _ = stack.push(out);
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeAssignStmt => Int) {
+                let set_assignment: Bool = bytecode.program.runtime_stmt_kind(arg0) == asp.compiler.VbsStmtSetAssign;
+                let target_name: String = bytecode.program.runtime_stmt_target_name(arg0);
+                let target_arg_count: Int = bytecode.program.runtime_stmt_target_arg_count(arg0);
+                let value: asp.runtime.Variant = self.pop_variant(stack);
+                let assign_args: collections.Vector<asp.runtime.Variant> = scratch.values;
+                assign_args.clear();
+                let i: Int = target_arg_count - 1;
+                loop i >= 0 {
+                    assign_args.insert(0, self.pop_variant(stack));
+                    i -= 1;
+                }
+                if scope.me_object_id > 0 && self.evaluator.has_me_field(ctx, scope, target_name) {
+                    let target: asp.runtime.Variant = self.evaluator.get_me_field(ctx, scope, target_name);
+                    if target.kind == asp.runtime.VariantArray {
+                        _ = self.evaluator.set_me_field(ctx, scope, target_name,
+                            self.evaluator.invoke_array_values(ctx, target, assign_args, true, value));
+                    } else if target.kind == asp.runtime.VariantObject {
+                        _ = self.evaluator.invoke_object_values(bytecode.program, ctx, scope, target, "", assign_args, true, value, new collections.Vector<Int>());
+                    } else if assign_args.len() == 0 {
+                        _ = self.evaluator.set_me_field(ctx, scope, target_name, value);
+                    } else {
+                        self.evaluator.assign_target_values(bytecode.program, ctx, scope, target_name, assign_args, value, set_assignment);
+                    }
+                } else {
+                    self.evaluator.assign_target_values(bytecode.program, ctx, scope, target_name, assign_args, value, set_assignment);
+                }
+                let result: Int = self.evaluator.finish_statement(ctx);
+                if result != 0 || ctx.response.ended {
+                    return result == 0 && ctx.response.ended ? 1 : result;
+                }
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeAssignIdentifier => Int) {
+                let value: asp.runtime.Variant = self.pop_variant(stack);
+                let target_expr_id: Int = bytecode.program.runtime_stmt_target_expr(arg0);
+                let target_name: String = "";
+                if target_expr_id >= 0 && target_expr_id < bytecode.program.runtime_expr_count() {
+                    let target_kind: asp.compiler.VbsExprKind = bytecode.program.runtime_expr_kind(target_expr_id);
+                    if target_kind == asp.compiler.VbsExprIdentifier {
+                        target_name = bytecode.program.runtime_expr_text(target_expr_id);
+                    } else if target_kind == asp.compiler.VbsExprCall
+                    && bytecode.program.runtime_expr_left(target_expr_id) >= 0
+                    && bytecode.program.runtime_expr_left(target_expr_id) < bytecode.program.runtime_expr_count()
+                    && std.len(bytecode.program.runtime_expr_text(target_expr_id)) == 0
+                    && bytecode.program.runtime_expr_arg_count(target_expr_id) == 0 {
+                        let left_id: Int = bytecode.program.runtime_expr_left(target_expr_id);
+                        if bytecode.program.runtime_expr_kind(left_id) == asp.compiler.VbsExprIdentifier {
+                            target_name = bytecode.program.runtime_expr_text(left_id);
+                        }
+                    }
+                }
+                if std.len(target_name) == 0 {
+                    target_name = bytecode.program.runtime_stmt_target_name(arg0);
+                }
+                if scope.me_object_id > 0 && self.evaluator.has_me_field(ctx, scope, target_name) {
+                    _ = self.evaluator.set_me_field(ctx, scope, target_name, value);
+                } else {
+                    self.evaluator.assign_identifier(ctx, scope, target_name, value);
+                }
+                let result: Int = self.evaluator.finish_statement(ctx);
+                if result != 0 || ctx.response.ended {
+                    return result == 0 && ctx.response.ended ? 1 : result;
+                }
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeAssignSessionValue => Int) {
+                let value: asp.runtime.Variant = self.pop_variant(stack);
+                let key: asp.runtime.Variant = self.pop_variant(stack);
+                _ = ctx.session.set(key.to_output_string(), value);
+                ctx.session_dirty = true;
+                let result: Int = self.evaluator.finish_statement(ctx);
+                if result != 0 || ctx.response.ended {
+                    return result == 0 && ctx.response.ended ? 1 : result;
+                }
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeAssignApplicationValue => Int) {
+                let value: asp.runtime.Variant = self.pop_variant(stack);
+                let key: asp.runtime.Variant = self.pop_variant(stack);
+                _ = ctx.application.set(key.to_output_string(), value);
+                ctx.application_dirty = true;
+                let result: Int = self.evaluator.finish_statement(ctx);
+                if result != 0 || ctx.response.ended {
+                    return result == 0 && ctx.response.ended ? 1 : result;
+                }
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeAssignSessionTimeout => Int) {
+                let value: asp.runtime.Variant = self.pop_variant(stack);
+                ctx.session_timeout_minutes = asp.variant_to_int(value);
+                ctx.session_dirty = true;
+                let result: Int = self.evaluator.finish_statement(ctx);
+                if result != 0 || ctx.response.ended {
+                    return result == 0 && ctx.response.ended ? 1 : result;
+                }
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeAssignResponseContentType => Int) {
+                let value: asp.runtime.Variant = self.pop_variant(stack);
+                ctx.response.content_type = value.to_output_string();
+                let result: Int = self.evaluator.finish_statement(ctx);
+                if result != 0 || ctx.response.ended {
+                    return result == 0 && ctx.response.ended ? 1 : result;
+                }
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeAssignResponseCharset => Int) {
+                let value: asp.runtime.Variant = self.pop_variant(stack);
+                ctx.response.charset = value.to_output_string();
+                let result: Int = self.evaluator.finish_statement(ctx);
+                if result != 0 || ctx.response.ended {
+                    return result == 0 && ctx.response.ended ? 1 : result;
+                }
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeAssignResponseBuffer => Int) {
+                let value: asp.runtime.Variant = self.pop_variant(stack);
+                ctx.response.buffer_enabled = value.is_truthy();
+                let result: Int = self.evaluator.finish_statement(ctx);
+                if result != 0 || ctx.response.ended {
+                    return result == 0 && ctx.response.ended ? 1 : result;
+                }
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeAssignResponseStatus => Int) {
+                let value: asp.runtime.Variant = self.pop_variant(stack);
+                ctx.response.set_status(value.to_output_string());
+                let result: Int = self.evaluator.finish_statement(ctx);
+                if result != 0 || ctx.response.ended {
+                    return result == 0 && ctx.response.ended ? 1 : result;
+                }
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeAssignTargetDefault => Int) {
+                if arg0 < 0 || arg0 >= bytecode.program.runtime_stmt_count() {
+                    self.evaluator.raise_runtime_error(ctx, 438, "invalid assignment statement", "VBScript");
+                    return self.evaluator.finish_statement(ctx);
+                }
+                let target_expr_id: Int = bytecode.program.runtime_stmt_target_expr(arg0);
+                if target_expr_id < 0 || target_expr_id >= bytecode.program.runtime_expr_count() {
+                    self.evaluator.raise_runtime_error(ctx, 438, "invalid assignment target", "VBScript");
+                    return self.evaluator.finish_statement(ctx);
+                }
+                let target_text: String = bytecode.program.runtime_expr_text(target_expr_id);
+                let target_arg_ids: collections.Vector<Int> = scratch.ids;
+                target_arg_ids.clear();
+                let target_arg_count: Int = bytecode.program.runtime_expr_arg_count(target_expr_id);
+                let target_arg_index: Int = 0;
+                loop target_arg_index < target_arg_count { _ = target_arg_ids.push(bytecode.program.runtime_expr_arg(target_expr_id, target_arg_index)); target_arg_index += 1; }
+                let target_left_id: Int = bytecode.program.runtime_expr_left(target_expr_id);
+                let set_assignment: Bool = bytecode.program.runtime_stmt_kind(arg0) == asp.compiler.VbsStmtSetAssign;
+                let left_kind: Int = -1;
+                let left_name: String = target_text;
+                if target_left_id >= 0 {
+                    left_kind = bytecode.program.runtime_expr_kind(target_left_id) => Int;
+                    left_name = bytecode.program.runtime_expr_text(target_left_id);
+                }
+                let value: asp.runtime.Variant = self.pop_variant(stack);
+                let assign_args: collections.Vector<asp.runtime.Variant> = scratch.values;
+                assign_args.clear();
+                let i: Int = target_arg_count - 1;
+                loop i >= 0 {
+                    assign_args.insert(0, self.pop_variant(stack));
+                    i -= 1;
+                }
+                let base_value: asp.runtime.Variant = target_left_id >= 0 ? self.pop_variant(stack) : asp.runtime.variant_empty();
+                if target_left_id >= 0 {
+                    if left_kind == (asp.compiler.VbsExprIdentifier => Int) && base_value.kind != asp.runtime.VariantObject && base_value.kind != asp.runtime.VariantArray {
+                        self.evaluator.assign_target_values(bytecode.program, ctx, scope, left_name, assign_args, value, set_assignment);
+                    } else if base_value.kind == asp.runtime.VariantObject {
+                        _ = self.evaluator.invoke_object_values(bytecode.program, ctx, scope, base_value, "", assign_args, true, value, target_arg_ids);
+                    } else if base_value.kind == asp.runtime.VariantArray {
+                        let updated: asp.runtime.Variant = self.evaluator.invoke_array_values(ctx, base_value, assign_args, true, value);
+                        if left_kind == (asp.compiler.VbsExprIdentifier => Int) {
+                            self.evaluator.assign_identifier(ctx, scope, left_name, updated);
+                        } else {
+                            let no_args: collections.Vector<asp.runtime.Variant> = scratch.aux_values;
+                            no_args.clear();
+                            self.evaluator.assign_target_expr_values(bytecode.program, ctx, scope, target_left_id, asp.runtime.variant_empty(), no_args, updated, set_assignment);
+                        }
+                    } else {
+                        self.evaluator.raise_runtime_error(ctx, 438, "assignment target is not an object", "VBScript");
+                    }
+                } else {
+                    if scope.me_object_id > 0 && self.evaluator.has_me_field(ctx, scope, target_text) {
+                        let target: asp.runtime.Variant = self.evaluator.get_me_field(ctx, scope, target_text);
+                        if target.kind == asp.runtime.VariantArray {
+                            _ = self.evaluator.set_me_field(ctx, scope, target_text,
+                                self.evaluator.invoke_array_values(ctx, target, assign_args, true, value));
+                        } else if target.kind == asp.runtime.VariantObject {
+                            _ = self.evaluator.invoke_object_values(bytecode.program, ctx, scope, target, "", assign_args, true, value, target_arg_ids);
+                        } else if assign_args.len() == 0 {
+                            _ = self.evaluator.set_me_field(ctx, scope, target_text, value);
+                        } else {
+                            self.evaluator.assign_target_values(bytecode.program, ctx, scope, target_text, assign_args, value, set_assignment);
+                        }
+                    } else {
+                        self.evaluator.assign_target_values(bytecode.program, ctx, scope, target_text, assign_args, value, set_assignment);
+                    }
+                }
+                let result: Int = self.evaluator.finish_statement(ctx);
+                if result != 0 || ctx.response.ended {
+                    return result == 0 && ctx.response.ended ? 1 : result;
+                }
+                pc += 1;
+                skip;
+            }
+            if op == (VbsBytecodeAssignTargetMember => Int) {
+                let target_expr_id: Int = bytecode.program.runtime_stmt_target_expr(arg0);
+                let response_cookie_member: Bool = arg1 == 1;
+                let target_arg_ids: collections.Vector<Int> = scratch.ids;
+                target_arg_ids.clear();
+                let target_arg_count: Int = bytecode.program.runtime_expr_arg_count(target_expr_id);
+                let target_arg_index: Int = 0;
+                loop target_arg_index < target_arg_count { _ = target_arg_ids.push(bytecode.program.runtime_expr_arg(target_expr_id, target_arg_index)); target_arg_index += 1; }
+                let value: asp.runtime.Variant = self.pop_variant(stack);
+                let assign_args: collections.Vector<asp.runtime.Variant> = scratch.values;
+                assign_args.clear();
+                let i: Int = target_arg_count - 1;
+                loop i >= 0 {
+                    assign_args.insert(0, self.pop_variant(stack));
+                    i -= 1;
+                }
+                let base_value: asp.runtime.Variant = response_cookie_member ? asp.runtime.variant_empty() : self.pop_variant(stack);
+                self.evaluator.assign_target_expr_values(bytecode.program, ctx, scope, target_expr_id, base_value, assign_args, value, bytecode.program.runtime_stmt_kind(arg0) == asp.compiler.VbsStmtSetAssign);
+                let result: Int = self.evaluator.finish_statement(ctx);
+                if result != 0 || ctx.response.ended {
+                    return result == 0 && ctx.response.ended ? 1 : result;
+                }
+                pc += 1;
+                skip;
+            }
+            pc += 1;
+        }
+        return 0;
+    }
+}

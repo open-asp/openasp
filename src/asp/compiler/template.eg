@@ -1,0 +1,383 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.compiler;
+
+use asp.runtime;
+
+use asp;
+use std;
+use fs;
+use path;
+use strings;
+use strconv;
+use collections;
+
+// Read and write in bounded chunks so large ASP pages do not require the file
+// API to materialize another full-size temporary buffer. These helpers return
+// the filesystem error unchanged; callers attach page/include context.
+func read_text_chunked(file_path: String) -> String, ErrCode {
+    let size, size_err = fs.stat_size(file_path);
+    if size_err != OK {
+        return "", size_err;
+    }
+    if size == 0 {
+        return "", OK;
+    }
+    return fs.read_path_at(file_path, 0, size);
+}
+
+extern func eg_asp_decode_source(input: String) -> String;
+extern func eg_asp_next_markup_line(input: String, start: Int) -> Int;
+extern func eg_asp_count_newlines(input: String, start: Int, end: Int) -> Int;
+
+// Source files share the same chunking policy as generic text reads. Keeping a
+// separate entry point documents that its result participates in line mapping
+// and leaves room for source-specific decoding without changing callers.
+func read_source_text_chunked(file_path: String) -> String, ErrCode {
+    let raw, read_err = read_text_chunked(file_path);
+    if read_err != OK || std.len(raw) == 0 {
+        return raw, read_err;
+    }
+    return eg_asp_decode_source(raw), OK;
+}
+
+func write_text_chunked(file_path: String, data: String) -> Int, ErrCode {
+    let h, open_err = fs.open(file_path, fs.flag_write() + fs.flag_create() + fs.flag_trunc(), 420);
+    if open_err != OK {
+        return 0, open_err;
+    }
+    let offset: Int = 0;
+    loop offset < std.len(data) {
+        let take: Int = std.len(data) - offset;
+        if take > 4096 {
+            take = 4096;
+        }
+        let chunk: String = std.substr(data, offset, take);
+        let written, write_err = fs.write_at(h, offset, chunk);
+        if write_err != OK || written <= 0 {
+            fs.close(h);
+            return offset, write_err != OK ? write_err : ERR_IO;
+        }
+        offset += written;
+    }
+    fs.close(h);
+    return offset, OK;
+}
+
+// A page is reduced to alternating literal HTML and executable VBScript. The
+// distinction is retained until bytecode generation because literal output can
+// use a specialized write instruction and bypass expression evaluation.
+enum PageNodeKind {
+    PageNodeLiteral,
+    PageNodeScript,
+    PageNodeExpr,
+}
+
+// One source-ordered template fragment. `source_file` and `line` refer to the
+// original include file, not the flattened page, so diagnostics remain useful
+// after recursive include expansion.
+class PageNode {
+    var kind: PageNodeKind;
+    var text: String;
+    var source_file: String;
+    var line: Int;
+
+    func init(self: PageNode, kind: PageNodeKind, text: String, source_file: String, line: Int) -> Void {
+        self.kind = kind;
+        self.text = text;
+        self.source_file = source_file;
+        self.line = line;
+    }
+}
+
+// Output of preprocessing. `text` is the flattened source consumed by the
+// template parser; dependency paths and mtimes form the persistent-cache
+// validity contract. Page directives are normalized while includes expand.
+class PreprocessResult {
+    var ok: Bool;
+    var text: String;
+    var primary_file: String;
+    var include_paths: collections.Vector<String>;
+    var errors: collections.Vector<String>;
+    var language: String;
+    var codepage: String;
+    var lcid: String;
+    var enable_session_state: String;
+
+    func init(self: PreprocessResult) -> Void {
+        self.ok = true;
+        self.text = "";
+        self.primary_file = "";
+        self.include_paths = new collections.Vector<String>();
+        self.errors = new collections.Vector<String>();
+        self.language = "VBScript";
+        self.codepage = "";
+        self.lcid = "";
+        self.enable_session_state = "";
+    }
+
+    // Errors are accumulated rather than thrown so one compile reports all
+    // independently detectable include and directive failures.
+    func add_error(self: PreprocessResult, msg: String) -> Void {
+        self.ok = false;
+        _ = self.errors.push(msg);
+    }
+}
+
+// Template parsing succeeds partially: valid nodes are preserved alongside
+// syntax errors, allowing the engine to produce precise diagnostics without a
+// second scan of the page.
+class TemplateParseResult {
+    var ok: Bool;
+    var nodes: collections.Vector<PageNode>;
+    var errors: collections.Vector<String>;
+
+    func init(self: TemplateParseResult) -> Void {
+        self.ok = true;
+        self.nodes = new collections.Vector<PageNode>();
+        self.errors = new collections.Vector<String>();
+    }
+
+    func add_error(self: TemplateParseResult, msg: String) -> Void {
+        self.ok = false;
+        _ = self.errors.push(msg);
+    }
+}
+
+// Counts logical source lines before a byte offset. The native implementation
+// treats CRLF as one newline and must stay consistent with VbsLexer.
+func count_lines_until(text: String, stop: Int) -> Int {
+    return 1 + eg_asp_count_newlines(text, 0, stop);
+}
+
+// Small linear membership helper used for include-cycle detection. Include
+// stacks are shallow, so a map would add allocation and lifetime complexity.
+func vector_contains(items: collections.Vector<String>, target: String) -> Bool {
+    let i: Int = 0;
+    loop i < items.len() {
+        if items.get(i) == target {
+            return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+// Extracts a quoted directive attribute without interpreting entities. ASP
+// directives are compiler syntax, not HTML, and therefore use raw values.
+func extract_quoted_attr(line: String, attr: String) -> String {
+    let lc: String = strings.to_lower_ascii(line);
+    let needle: String = strings.to_lower_ascii(attr) + "=\"";
+    let start: Int = strings.find_substr(lc, needle);
+    if start < 0 {
+        return "";
+    }
+    let value_start: Int = start + std.len(needle);
+    let end: Int = strings.find_substr_from(line, "\"", value_start);
+    if end < 0 {
+        return "";
+    }
+    return std.substr(line, value_start, end - value_start);
+}
+
+// Resolves directives and includes into a single page while retaining the
+// dependency graph needed by the compiled-page cache.
+class Preprocessor {
+    func init(self: Preprocessor) -> Void {
+    }
+
+    func resolve_include(self: Preprocessor, root_dir: String, current_file: String, raw_path: String, is_virtual: Bool) -> String {
+        let normalized_path: String = strings.replace_all(raw_path, "\\", "/");
+        if is_virtual {
+            return path.clean(path.join_path(root_dir, normalized_path));
+        }
+        return path.clean(path.join_path(path.dir(current_file), normalized_path));
+    }
+
+    // Applies page-level directives only; include directives are handled by
+    // expansion because they also affect recursion and dependency tracking.
+    func process_directive(self: Preprocessor, result: PreprocessResult, line: String) -> Void {
+        let lc: String = strings.to_lower_ascii(line);
+        let language: String = extract_quoted_attr(line, "language");
+        let codepage: String = extract_quoted_attr(line, "codepage");
+        let lcid: String = extract_quoted_attr(line, "lcid");
+        let enable_session_state: String = extract_quoted_attr(line, "enablesessionstate");
+        if std.len(language) != 0 {
+            result.language = language;
+        } else if strings.find_substr(lc, "language=vbscript") >= 0 {
+            result.language = "VBScript";
+        }
+        if std.len(codepage) != 0 {
+            result.codepage = codepage;
+        }
+        if std.len(lcid) != 0 {
+            result.lcid = lcid;
+        }
+        if std.len(enable_session_state) != 0 {
+            result.enable_session_state = enable_session_state;
+        }
+    }
+
+    // Public preprocessing transaction. A fresh stack prevents state from one
+    // page compilation leaking into another request.
+    func preprocess_file(self: Preprocessor, root_dir: String, page_path: String) -> PreprocessResult {
+        let result: PreprocessResult = new PreprocessResult();
+        result.primary_file = path.clean(page_path);
+        let stack: collections.Vector<String> = new collections.Vector<String>();
+        let builder: std.StringBuilder = new std.StringBuilder(65536);
+        _ = self.expand_file(root_dir, result.primary_file, result, stack, builder);
+        result.text = builder.to_string();
+        _ = builder.free();
+        return result;
+    }
+
+    // Expands all include directives found on one physical line. Splitting this
+    // from `expand_file` permits literal text around an include to retain order.
+    func expand_inline_includes(self: Preprocessor, root_dir: String, current_file: String, raw_line: String, result: PreprocessResult, stack: collections.Vector<String>, out: std.StringBuilder) -> Void {
+        let lc: String = strings.to_lower_ascii(raw_line);
+        let pos: Int = 0;
+        loop pos < std.len(raw_line) {
+            let compact_start: Int = strings.find_substr_from(lc, "<!--#include", pos);
+            let spaced_start: Int = strings.find_substr_from(lc, "<!-- #include", pos);
+            let include_start: Int = compact_start;
+            if include_start < 0 || (spaced_start >= 0 && spaced_start < include_start) {
+                include_start = spaced_start;
+            }
+            if include_start < 0 {
+                _ = out.append(std.substr(raw_line, pos, std.len(raw_line) - pos));
+                return;
+            }
+            if include_start > pos {
+                _ = out.append(std.substr(raw_line, pos, include_start - pos));
+            }
+            let include_end: Int = strings.find_substr_from(raw_line, "-->", include_start);
+            if include_end < 0 {
+                _ = result.add_error("unclosed include directive in " + current_file);
+                return;
+            }
+            let directive: String = std.substr(raw_line, include_start, include_end + 3 - include_start);
+            let include_file: String = extract_quoted_attr(directive, "file");
+            let include_virtual: String = extract_quoted_attr(directive, "virtual");
+            if std.len(include_file) != 0 {
+                let resolved: String = self.resolve_include(root_dir, current_file, include_file, false);
+                _ = self.expand_file(root_dir, resolved, result, stack, out);
+            } else if std.len(include_virtual) != 0 {
+                let resolved: String = self.resolve_include(root_dir, current_file, include_virtual, true);
+                _ = self.expand_file(root_dir, resolved, result, stack, out);
+            } else {
+                _ = result.add_error("invalid include directive in " + current_file);
+            }
+            pos = include_end + 3;
+        }
+    }
+
+    // Recursively appends one file. `stack` represents only the active include
+    // chain, so repeated non-recursive includes remain legal while cycles fail.
+    func expand_file(self: Preprocessor, root_dir: String, full_path: String, result: PreprocessResult, stack: collections.Vector<String>, out: std.StringBuilder) -> Void {
+        let clean_path: String = path.clean(full_path);
+        if vector_contains(stack, clean_path) {
+            _ = result.add_error("circular include detected: " + clean_path);
+            return;
+        }
+        if !fs.file_exists(clean_path) {
+            _ = result.add_error("file not found: " + clean_path);
+            return;
+        }
+        _ = stack.push(clean_path);
+        if clean_path != result.primary_file {
+            _ = result.include_paths.push(clean_path);
+        }
+        let content: String = "";
+        let read_err: ErrCode = OK;
+        content, read_err = read_source_text_chunked(clean_path);
+        if read_err != OK {
+            _ = result.add_error("failed to read file: " + clean_path);
+            _ = stack.pop_back("");
+            return;
+        }
+        let line_start: Int = 0;
+        let skipping_server_script: Bool = false;
+        loop line_start <= std.len(content) {
+            if !skipping_server_script {
+                let markup_line: Int = eg_asp_next_markup_line(content, line_start);
+                if markup_line > line_start {
+                    _ = out.append(std.substr(content, line_start, markup_line - line_start));
+                    line_start = markup_line;
+                }
+                if line_start >= std.len(content) {
+                    break;
+                }
+            }
+            let line_end: Int = strings.find_substr_from(content, "\n", line_start);
+            if line_end < 0 {
+                line_end = std.len(content);
+            }
+            let raw_line: String = std.substr(content, line_start, line_end - line_start);
+            let line: String = strings.trim_space(raw_line);
+            let lc: String = strings.to_lower_ascii(line);
+            if skipping_server_script {
+                if strings.find_substr(lc, "</script>") >= 0 {
+                    skipping_server_script = false;
+                }
+            } else if strings.find_substr(lc, "<script") >= 0 && strings.find_substr(lc, "runat=\"server\"") >= 0 {
+                skipping_server_script = strings.find_substr(lc, "</script>") < 0;
+            } else if strings.starts_with(lc, "<%@") && strings.ends_with(lc, "%>") {
+                _ = self.process_directive(result, line);
+            } else {
+                _ = self.expand_inline_includes(root_dir, clean_path, raw_line, result, stack, out);
+                if line_end < std.len(content) {
+                    _ = out.append("\n");
+                }
+            }
+            if line_end >= std.len(content) {
+                break;
+            }
+            line_start = line_end + 1;
+        }
+        _ = stack.pop_back("");
+    }
+}
+
+// Splits flattened ASP source at `<% ... %>` boundaries. It does not parse
+// VBScript; executable fragments are passed to VbsParser after source mapping.
+class TemplateParser {
+    func init(self: TemplateParser) -> Void {
+    }
+
+    func parse(self: TemplateParser, source_file: String, text: String) -> TemplateParseResult {
+        let result: TemplateParseResult = new TemplateParseResult();
+        let pos: Int = 0;
+        let line: Int = 1;
+        loop pos < std.len(text) {
+            let open: Int = strings.find_substr_from(text, "<%", pos);
+            if open < 0 {
+                if pos < std.len(text) {
+                    let tail: String = std.substr(text, pos, std.len(text) - pos);
+                    _ = result.nodes.push(new PageNode(PageNodeLiteral, tail, source_file, line));
+                }
+                break;
+            }
+            if open > pos {
+                let literal: String = std.substr(text, pos, open - pos);
+                _ = result.nodes.push(new PageNode(PageNodeLiteral, literal, source_file, line));
+            }
+            line += eg_asp_count_newlines(text, pos, open);
+            let close: Int = strings.find_substr_from(text, "%>", open + 2);
+            if close < 0 {
+                _ = result.add_error("unclosed script block in " + source_file);
+                break;
+            }
+            let block: String = std.substr(text, open + 2, close - open - 2);
+            if std.len(block) != 0 && std.substr(block, 0, 1) == "=" {
+                _ = result.nodes.push(new PageNode(PageNodeExpr, strings.trim_space(std.substr(block, 1, std.len(block) - 1)), source_file, line));
+            } else if std.len(block) != 0 && std.substr(block, 0, 1) == "@" {
+            } else {
+                _ = result.nodes.push(new PageNode(PageNodeScript, block, source_file, line));
+            }
+            line += eg_asp_count_newlines(text, open, close + 2);
+            pos = close + 2;
+        }
+        return result;
+    }
+}

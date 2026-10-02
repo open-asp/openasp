@@ -1,0 +1,449 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.runtime;
+
+use asp.compiler;
+use asp.vm;
+
+use asp;
+use std;
+use fmt;
+use fs;
+use os;
+use sync;
+use strings;
+use strconv;
+use collections;
+use path;
+
+// Derives all persistent locations from the served root. An optional state root
+// is namespaced by the encoded site path so multiple sites cannot collide.
+class PersistencePaths {
+    var root_dir: String;
+    var build_dir: String;
+    var state_dir: String;
+    var cache_dir: String;
+    var sessions_dir: String;
+    var application_file: String;
+
+    func init(self: PersistencePaths, root_dir: String) -> Void {
+        self.root_dir = path.clean(root_dir);
+        let state_root: String = "";
+        state_root, _ = os.getenv("EGRET_ASP_STATE_DIR");
+        if std.len(state_root) != 0 {
+            self.build_dir = path.clean(state_root);
+            self.state_dir = path.join_path(self.build_dir, asp.runtime.hex_encode(self.root_dir));
+        } else {
+            self.build_dir = path.join_path(self.root_dir, "build");
+            self.state_dir = path.join_path(self.build_dir, "egret_asp_state");
+        }
+        self.cache_dir = path.join_path(self.state_dir, "cache");
+        self.sessions_dir = path.join_path(self.state_dir, "sessions");
+        self.application_file = path.join_path(self.state_dir, "application.kv");
+    }
+
+    func ensure_dirs(self: PersistencePaths) -> Void {
+        let _, _ = fs.mkdir_all(self.cache_dir);
+        let _, _ = fs.mkdir_all(self.sessions_dir);
+    }
+
+    func session_file(self: PersistencePaths, session_id: String) -> String {
+        return path.join_path(self.sessions_dir, asp.runtime.hex_encode(session_id) + ".kv");
+    }
+
+    func cache_file(self: PersistencePaths, page_path: String) -> String {
+        return path.join_path(self.cache_dir, asp.runtime.hex_encode(page_path) + ".cache");
+    }
+}
+
+// Mutable Err object state for one execution context. Resume Next changes error
+// propagation but does not erase the last captured diagnostic until `clear`.
+class ScriptErrorState {
+    var error_number: Int;
+    var description: String;
+    var source: String;
+    var resume_next_enabled: Bool;
+    var last_statement_span: String;
+
+    func init(self: ScriptErrorState) -> Void {
+        self.error_number = 0;
+        self.description = "";
+        self.source = "";
+        self.resume_next_enabled = false;
+        self.last_statement_span = "";
+    }
+
+    func clear(self: ScriptErrorState) -> Void {
+        self.error_number = 0;
+        self.description = "";
+        self.source = "";
+        self.last_statement_span = "";
+    }
+
+    func set_error(self: ScriptErrorState, number: Int, description: String, source: String, span: String) -> Void {
+        self.error_number = number;
+        self.description = description;
+        self.source = source;
+        self.last_statement_span = span;
+    }
+}
+
+// Case-insensitive insertion-ordered Variant map.
+//
+// `entries` is authoritative and preserves enumeration order. `entry_indices`
+// maps normalized keys to vector indexes and must be updated with every insert
+// or delete. Values are cloned on ordinary writes to establish ownership;
+// `set_owned` is reserved for fresh deserialization results.
+class KeyValueStore {
+    var entries: collections.Vector<Variant>;
+    var entry_indices: collections.Map<String, Int>;
+
+    func init(self: KeyValueStore) -> Void {
+        self.entries = new collections.Vector<Variant>();
+        self.entry_indices = new collections.Map<String, Int>();
+    }
+
+    func clone(self: KeyValueStore) -> KeyValueStore {
+        let out: KeyValueStore = new KeyValueStore();
+        let i: Int = 0;
+        loop i < self.entries.len() {
+            let stored: Variant = self.entries.get(i).clone();
+            _ = out.entry_indices.set(stored.store_key, i);
+            _ = out.entries.push(stored);
+            i += 1;
+        }
+        return out;
+    }
+
+    func promoted_clone(self: KeyValueStore) -> KeyValueStore {
+        let out: KeyValueStore = new KeyValueStore();
+        let i: Int = 0;
+        loop i < self.entries.len() {
+            let stored: Variant = self.entries.get(i).promoted_clone();
+            _ = out.entry_indices.set(stored.store_key, i);
+            _ = out.entries.push(stored);
+            i += 1;
+        }
+        return out;
+    }
+
+    // Application scalars are immutable after insertion. Arrays share their
+    // snapshot backing until an indexed assignment detaches the written path.
+    func clone_application_request(self: KeyValueStore) -> KeyValueStore {
+        let out: KeyValueStore = new KeyValueStore();
+        let i: Int = 0;
+        loop i < self.entries.len() {
+            let source: Variant = self.entries.get(i);
+            let stored: Variant = source.kind == VariantArray ? source.clone_shared_array() : source;
+            _ = out.entry_indices.set(stored.store_key, i);
+            _ = out.entries.push(stored);
+            i += 1;
+        }
+        return out;
+    }
+
+    func contains_object(self: KeyValueStore) -> Bool {
+        let i: Int = 0;
+        loop i < self.entries.len() {
+            if self.entries.get(i).contains_object() {
+                return true;
+            }
+            i += 1;
+        }
+        return false;
+    }
+
+    func find_index_lower(self: KeyValueStore, lc: String) -> Int {
+        let cached: Int = self.entry_indices.get_or(lc, -1);
+        if cached >= 0 && cached < self.entries.len() && self.entries.get(cached).store_key == lc {
+            return cached;
+        }
+        return -1;
+    }
+
+    // Fast path accepts an already folded key. Only a miss allocates a lowercase
+    // copy, which matters for hot Request/Session lookups.
+    func find_index(self: KeyValueStore, key: String) -> Int {
+        // Compiler-bound identifiers and most ASP keys are already folded.
+        // Avoid allocating a lowercase copy on the overwhelmingly common hit.
+        let direct: Int = self.find_index_lower(key);
+        return direct >= 0
+            ? direct
+            : self.find_index_lower(strings.to_lower_ascii(key));
+    }
+
+    func set(self: KeyValueStore, key: String, value: Variant) -> Void {
+        let lc: String = key;
+        let i: Int = self.find_index_lower(key);
+        if i < 0 {
+            lc = strings.to_lower_ascii(key);
+            i = self.find_index_lower(lc);
+        }
+        if i >= 0 {
+            let stored: Variant = value.clone();
+            stored.store_key = self.entries.get(i).store_key;
+            _ = self.entries.set(i, stored);
+            return;
+        }
+        let stable_key: String = asp.runtime.clone_runtime_string(lc);
+        let stored: Variant = value.clone();
+        stored.store_key = stable_key;
+        _ = self.entries.push(stored);
+        _ = self.entry_indices.set(stable_key, self.entries.len() - 1);
+    }
+
+    // Used only for newly decoded values whose ownership is not shared yet.
+    func set_owned(self: KeyValueStore, key: String, value: Variant) -> Void {
+        let lc: String = key;
+        let i: Int = self.find_index_lower(key);
+        if i < 0 {
+            lc = strings.to_lower_ascii(key);
+            i = self.find_index_lower(lc);
+        }
+        if i >= 0 {
+            value.store_key = self.entries.get(i).store_key;
+            _ = self.entries.set(i, value);
+            return;
+        }
+        let stable_key: String = asp.runtime.clone_runtime_string(lc);
+        value.store_key = stable_key;
+        _ = self.entries.push(value);
+        _ = self.entry_indices.set(stable_key, self.entries.len() - 1);
+    }
+
+    func has(self: KeyValueStore, key: String) -> Bool {
+        return self.find_index(key) >= 0;
+    }
+
+    func is_array(self: KeyValueStore, key: String) -> Bool {
+        let i: Int = self.find_index(key);
+        return i >= 0 && self.entries.get(i).kind == VariantArray;
+    }
+
+    // Indexed array assignment mutates in place only after copy-on-write
+    // detachment. Every dimension is bounds-checked before any write occurs.
+    func array_indexes_valid(self: KeyValueStore, key: String, indexes: collections.Vector<Variant>) -> Bool {
+        let i: Int = self.find_index(key);
+        if i >= 0 {
+            let current: Variant = self.entries.get(i);
+            let dimension: Int = 0;
+            loop dimension < indexes.len() {
+                let index: Int = indexes.get(dimension).kind == VariantInt ? indexes.get(dimension).int_value : strconv.atoi(indexes.get(dimension).to_output_string());
+                if current.kind != VariantArray || index < 0 || index >= current.array_data.items.len() {
+                    return false;
+                }
+                current = current.array_data.items.get(index);
+                dimension += 1;
+            }
+            return indexes.len() > 0;
+        }
+        return false;
+    }
+
+    func set_array_indexed_in_place(self: KeyValueStore, key: String, indexes: collections.Vector<Variant>, value: Variant) -> Bool {
+        if indexes.len() == 0 {
+            return false;
+        }
+        let entry_index: Int = self.find_index(key);
+        if entry_index < 0 {
+            return false;
+        }
+        let current: Variant = self.entries.get(entry_index);
+        let dimension: Int = 0;
+        loop dimension < indexes.len() {
+            let index_value: Variant = indexes.get(dimension);
+            let index: Int = index_value.kind == VariantInt ? index_value.int_value : strconv.atoi(index_value.to_output_string());
+            if current.kind != VariantArray || index < 0 || index >= current.array_data.items.len() {
+                return false;
+            }
+            current.ensure_array_writable();
+            if dimension + 1 == indexes.len() {
+                _ = current.array_data.items.set(index, value.clone());
+                return true;
+            }
+            current = current.array_data.items.get(index);
+            dimension += 1;
+        }
+        return false;
+    }
+
+    func get_array_indexed(self: KeyValueStore, key: String, indexes: collections.Vector<Variant>) -> Variant {
+        let i: Int = self.find_index(key);
+        if i >= 0 {
+            let current: Variant = self.entries.get(i);
+            let dimension: Int = 0;
+            loop dimension < indexes.len() {
+                current = current.array_data.items.get(indexes.get(dimension).kind == VariantInt ? indexes.get(dimension).int_value : strconv.atoi(indexes.get(dimension).to_output_string()));
+                dimension += 1;
+            }
+            // Scalar Variants are immutable after construction/assignment.
+            // Only arrays need a COW read view before they cross a store
+            // boundary; returning scalar handles avoids per-read GC objects.
+            return current.kind == VariantArray ? current.clone_for_read() : current;
+        }
+        return new Variant();
+    }
+
+    func get_or_empty(self: KeyValueStore, key: String) -> Variant {
+        let i: Int = self.find_index(key);
+        if i >= 0 {
+            let stored: Variant = self.entries.get(i);
+            return stored.kind == VariantArray ? stored.clone_for_read() : stored;
+        }
+        return new Variant();
+    }
+
+    func get_first(self: KeyValueStore, names: collections.Vector<String>, fallback: String = "") -> String {
+        let i: Int = 0;
+        loop i < names.len() {
+            if self.has(names.get(i)) {
+                return self.get_or_empty(names.get(i)).to_output_string();
+            }
+            i += 1;
+        }
+        return fallback;
+    }
+
+    func clear(self: KeyValueStore) -> Void {
+        self.entries.dispose();
+        self.entry_indices.dispose();
+        self.entries = new collections.Vector<Variant>();
+        self.entry_indices = new collections.Map<String, Int>();
+    }
+
+    func delete(self: KeyValueStore, key: String) -> Bool {
+        let i: Int = self.find_index(key);
+        if i < 0 {
+            return false;
+        }
+        _ = self.entries.remove(i, new Variant());
+        self.entry_indices = new collections.Map<String, Int>();
+        let entry_index: Int = 0;
+        loop entry_index < self.entries.len() {
+            _ = self.entry_indices.set(self.entries.get(entry_index).store_key, entry_index);
+            entry_index += 1;
+        }
+        return true;
+    }
+}
+
+// URL/form parsing operates on bytes and applies `+` and percent decoding.
+// Duplicate keys are joined according to classic ASP collection behavior while
+// key-name parsing separately preserves first-seen enumeration spelling.
+func hex_nibble(ch: Int) -> Int {
+    if ch >= '0' && ch <= '9' {
+        return ch - '0';
+    }
+    if ch >= 'A' && ch <= 'F' {
+        return ch - 'A' + 10;
+    }
+    if ch >= 'a' && ch <= 'f' {
+        return ch - 'a' + 10;
+    }
+    return -1;
+}
+
+func url_decode_component(s: String) -> String {
+    if std.len(s) == 0 {
+        return "";
+    }
+    // Copy unchanged spans directly from the source view. The old byte-at-a-
+    // time path created one substring plus one concatenation for every input
+    // byte, which made ordinary query strings allocation-heavy.
+    let source: std.StringView = std.view(s);
+    let out: std.StringBuilder = new std.StringBuilder(std.len(s) + 1);
+    let i: Int = 0;
+    loop i < std.len(s) {
+        let span_start: Int = i;
+        loop i < std.len(s) {
+            let span_ch: Int = std.byte_at(s, i);
+            if span_ch == '+' {
+                break;
+            }
+            if span_ch == '%' && i + 2 < std.len(s) {
+                let span_a: Int = asp.runtime.hex_nibble(std.byte_at(s, i + 1));
+                let span_b: Int = asp.runtime.hex_nibble(std.byte_at(s, i + 2));
+                if span_a >= 0 && span_b >= 0 {
+                    break;
+                }
+            }
+            i += 1;
+        }
+        if i > span_start {
+            _ = out.append_view_slice(source, span_start, i - span_start);
+        }
+        if i >= std.len(s) {
+            break;
+        }
+        let ch: Int = std.byte_at(s, i);
+        if ch == '+' {
+            _ = out.append(" ");
+            i += 1;
+            skip;
+        }
+        if ch == '%' && i + 2 < std.len(s) {
+            let a: Int = asp.runtime.hex_nibble(std.byte_at(s, i + 1));
+            let b: Int = asp.runtime.hex_nibble(std.byte_at(s, i + 2));
+            if a >= 0 && b >= 0 {
+                _ = out.append(std.char_from_code(a * 16 + b));
+                i += 3;
+                skip;
+            }
+        }
+    }
+    let decoded: String = out.to_string();
+    _ = out.free();
+    _ = __gc_keepalive(source);
+    _ = __gc_keepalive(s);
+    return decoded;
+}
+
+func parse_kv_pairs(text: String, pair_sep: String, kv_sep: String) -> collections.Map<String, String> {
+    let out: collections.Map<String, String> = new collections.Map<String, String>();
+    if std.len(text) == 0 {
+        return out;
+    }
+    let parts: collections.Vector<String> = strings.split(text, pair_sep);
+    let i: Int = 0;
+    loop i < parts.len() {
+        let part: String = parts.get(i);
+        if std.len(part) != 0 {
+            let eq: Int = strings.find_substr(part, kv_sep);
+            if eq >= 0 {
+                let key: String = asp.runtime.url_decode_component(std.substr(part, 0, eq));
+                let value: String = asp.runtime.url_decode_component(std.substr(part, eq + std.len(kv_sep), std.len(part) - eq - std.len(kv_sep)));
+                _ = out.set(strings.to_lower_ascii(key), value);
+            } else {
+                _ = out.set(strings.to_lower_ascii(asp.runtime.url_decode_component(part)), "");
+            }
+        }
+        i += 1;
+    }
+    return out;
+}
+
+func parse_kv_key_names(text: String, pair_sep: String, kv_sep: String) -> collections.Vector<String> {
+    let out: collections.Vector<String> = new collections.Vector<String>();
+    let seen: collections.Map<String, Int> = new collections.Map<String, Int>();
+    if std.len(text) == 0 {
+        return out;
+    }
+    let parts: collections.Vector<String> = strings.split(text, pair_sep);
+    let i: Int = 0;
+    loop i < parts.len() {
+        let part: String = strings.trim_space(parts.get(i));
+        if std.len(part) != 0 {
+            let eq: Int = strings.find_substr(part, kv_sep);
+            let encoded_key: String = eq >= 0 ? std.substr(part, 0, eq) : part;
+            let key: String = asp.runtime.url_decode_component(strings.trim_space(encoded_key));
+            let lower_key: String = strings.to_lower_ascii(key);
+            if std.len(key) != 0 && !seen.has(lower_key) {
+                _ = out.push(key);
+                _ = seen.set(lower_key, 1);
+            }
+        }
+        i += 1;
+    }
+    return out;
+}

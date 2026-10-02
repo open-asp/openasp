@@ -1,0 +1,138 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.server;
+
+use std;
+use aio.fs;
+use aio.tcp;
+use protocol.fastcgi;
+use collections;
+use runtime;
+use strings;
+use strconv;
+
+extern func __gc_collect() -> Void;
+extern func __gc_get_threshold() -> Int;
+extern func __gc_set_threshold(bytes: Int) -> Void;
+extern func eg_gc_request_quiescent_enter() -> Void;
+extern func eg_gc_request_quiescent_leave() -> Void;
+extern func eg_asp_request_string_arena_leave(handle: Int) -> Void;
+extern func __tcp_send(fd: Int, data: String, timeout_ms: Int) -> Int;
+extern func eg_asp_memory_token_try_acquire(predicted_bytes: Int) -> Int;
+extern func eg_asp_memory_token_release(reservation: Int) -> Void;
+
+// Handles sequential requests on one FastCGI connection.
+//
+// Per request, memory admission happens before GC quiescence. Rendering and the
+// synchronous header send occur while arena-backed response bytes are protected;
+// then quiescence ends and the body is sent with an explicit owner. Every error
+// path after reservation must clear response ownership and release the token.
+class FastcgiConnectionHandler {
+    var runtime_state: FastcgiServerRuntime;
+    var codec: FastcgiCodec;
+    var encoder: FastcgiResponseEncoder;
+    var lifecycle: FastcgiRequestLifecycle;
+
+    func init(self: FastcgiConnectionHandler, runtime_state: FastcgiServerRuntime) -> Void {
+        self.runtime_state = runtime_state;
+        self.codec = new FastcgiCodec();
+        self.encoder = new FastcgiResponseEncoder();
+        self.lifecycle = new FastcgiRequestLifecycle(runtime_state);
+    }
+
+    async func handle(self: FastcgiConnectionHandler, fd: Int, timeout_ms: Int) -> Int {
+        let keep_open: Bool = true;
+        loop keep_open {
+            let req, req_err = await self.codec.read_request(fd, timeout_ms);
+            if req_err != OK {
+                if req_err != ERR_EOF && req_err != ERR_TIMEOUT {
+                    self.runtime_state.logger.warn("request read failed error=" + strconv.itoa(req_err => Int));
+                }
+                break;
+            }
+            let memory_prediction: Int = self.lifecycle.memory_prediction(req);
+            let memory_reservation: Int = eg_asp_memory_token_try_acquire(memory_prediction);
+            loop memory_reservation == 0 {
+                let _, _ = await aio.fs.watch_once(".", 1);
+                memory_reservation = eg_asp_memory_token_try_acquire(memory_prediction);
+            }
+            let request_gc_threshold: Int = __gc_get_threshold();
+            __gc_set_threshold(8589934592);
+            eg_gc_request_quiescent_enter();
+            let rendered: FastcgiRenderedResponse = self.lifecycle.render(req);
+            let stdout_builder: std.StringBuilder = new std.StringBuilder(1024);
+            _ = stdout_builder.append("Status: " + strconv.itoa(rendered.status_code) + " " + rendered.status_text + "\r\n");
+            _ = stdout_builder.append("Content-Type: " + rendered.content_type + "; charset=" + rendered.charset + "\r\n");
+            let response_keys: collections.Vector<String> = rendered.headers.keys();
+            let key_index: Int = 0;
+            loop key_index < response_keys.len() {
+                let key: String = response_keys.get(key_index);
+                if !strings.equal_fold_ascii(key, "content-type") {
+                    _ = stdout_builder.append(self.encoder.header_name(key) + ": " + rendered.headers.get(key) + "\r\n");
+                }
+                key_index += 1;
+            }
+            _ = response_keys.free();
+            _ = stdout_builder.append("\r\n");
+            let stdout_headers: String = stdout_builder.to_string();
+            _ = stdout_builder.free();
+            let stdout_header_record: String = protocol.fastcgi.make_record(protocol.fastcgi.stdout_type(), req.request_id, stdout_headers);
+            let header_sent: Int = __tcp_send(fd, stdout_header_record, timeout_ms);
+            eg_asp_request_string_arena_leave(rendered.response_owner.request_arena_handle);
+            eg_gc_request_quiescent_leave();
+            __gc_set_threshold(request_gc_threshold);
+            if header_sent < 0 {
+                self.runtime_state.logger.warn("response header send failed");
+                rendered.response_owner.clear_request();
+                eg_asp_memory_token_release(memory_reservation);
+                break;
+            }
+            if rendered.body_is_view && rendered.body_view.len() != 0 {
+                let _, body_err = await self.codec.send_record_view_chunks(fd, protocol.fastcgi.stdout_type(), req.request_id, rendered.body_view, rendered.response_owner.body_builder, timeout_ms);
+                if body_err != OK {
+                    self.runtime_state.logger.warn("response body send failed error=" + strconv.itoa(body_err => Int));
+                    rendered.response_owner.clear_request();
+                    eg_asp_memory_token_release(memory_reservation);
+                    break;
+                }
+            } else if std.len(rendered.body) != 0 {
+                let _, body_err = await self.codec.send_record_chunks(fd, protocol.fastcgi.stdout_type(), req.request_id, rendered.body, timeout_ms);
+                if body_err != OK {
+                    self.runtime_state.logger.warn("response body send failed error=" + strconv.itoa(body_err => Int));
+                    rendered.response_owner.clear_request();
+                    eg_asp_memory_token_release(memory_reservation);
+                    break;
+                }
+            }
+            let body_bytes: Int = rendered.body_is_view ? rendered.body_view.len() : std.len(rendered.body);
+            rendered.response_owner.clear_request();
+            eg_asp_memory_token_release(memory_reservation);
+            let _, out_end_err = await self.codec.send_all(fd, protocol.fastcgi.make_empty_record(protocol.fastcgi.stdout_type(), req.request_id), timeout_ms);
+            if out_end_err != OK {
+                break;
+            }
+            let _, end_err = await self.codec.send_all(fd, self.codec.end_request_record(req.request_id), timeout_ms);
+            if end_err != OK {
+                break;
+            }
+            self.runtime_state.logger.access(
+                "method=" + req.params.get_or("REQUEST_METHOD", "GET")
+                + " path=" + req.params.get_or("SCRIPT_NAME", req.params.get_or("SCRIPT_FILENAME", "-"))
+                + " status=" + strconv.itoa(rendered.status_code)
+                + " body_bytes=" + strconv.itoa(body_bytes)
+                + " remote_addr=" + req.params.get_or("REMOTE_ADDR", "-")
+            );
+            if self.runtime_state.request_end_gc {
+                __gc_collect();
+            } else if runtime.gc_effective_heap_bytes() >= __gc_get_threshold() {
+                __gc_collect();
+            }
+            if !req.keep_conn {
+                break;
+            }
+        }
+        _ = aio.tcp.close(fd);
+        return 0;
+    }
+}

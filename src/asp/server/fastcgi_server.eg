@@ -1,0 +1,23 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.server;
+
+use asp;
+
+// Compatibility facade kept intentionally thin: embedding code constructs one
+// server while process supervision remains isolated in FastcgiMaster.
+class FastcgiServer {
+    var runtime_state: FastcgiServerRuntime;
+    var master: FastcgiMaster;
+
+    func init(self: FastcgiServer, root_dir: String, logger: asp.OpenAspLogger) -> Void {
+        self.runtime_state = new FastcgiServerRuntime(root_dir, logger);
+        self.master = new FastcgiMaster(self.runtime_state);
+    }
+
+    // Starts the blocking master lifecycle and returns its process exit status.
+    async func run_tcp(self: FastcgiServer, host: String, port: Int, max_accepts: Int, workers: Int, max_concurrent_connections: Int, aot_enabled: Bool = true) -> Int {
+        return await self.master.run(host, port, max_accepts, workers, max_concurrent_connections, aot_enabled);
+    }
+}

@@ -1,0 +1,248 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.vm;
+
+use asp.compiler;
+
+use std;
+use collections;
+
+// Post-lowering CFG and peephole optimizer. It operates on fixed-width VBC
+// instructions, computes reachability per executable block, removes dead tails,
+// and compacts the stream while remapping every control-flow and block PC.
+class VbsBytecodeOptimizer {
+    func init(self: VbsBytecodeOptimizer) -> Void {
+    }
+
+    func add_work(self: VbsBytecodeOptimizer, work: collections.Vector<Int>, pc: Int, start_pc: Int, end_pc: Int) -> Void {
+        _ = self;
+        if pc >= start_pc && pc < end_pc {
+            _ = work.push(pc);
+        }
+    }
+
+    func mark_range(self: VbsBytecodeOptimizer, bytecode: VbsBytecodeProgram, start_pc: Int, end_pc: Int, reachable: collections.Vector<Int>, visit_marks: collections.Vector<Int>, generation: Int) -> Void {
+        if start_pc < 0 || end_pc <= start_pc || end_pc > bytecode.instruction_count() {
+            return;
+        }
+        let work: collections.Vector<Int> = new collections.Vector<Int>();
+        _ = work.push(start_pc);
+        loop work.len() > 0 {
+            let pc: Int = work.pop_back(-1);
+            if pc < start_pc || pc >= end_pc || visit_marks.get(pc) == generation {
+                skip;
+            }
+            _ = visit_marks.set(pc, generation);
+            _ = reachable.set(pc, 1);
+            let offset: Int = pc * 3;
+            let op: Int = bytecode.insns.get(offset);
+            let arg0: Int = bytecode.insns.get(offset + 1);
+            let arg1: Int = bytecode.insns.get(offset + 2);
+            if op == (VbsBytecodeHalt => Int) || op == (VbsBytecodeReturnSignal => Int) {
+                skip;
+            }
+            if op == (VbsBytecodeJump => Int) {
+                self.add_work(work, arg0, start_pc, end_pc);
+                skip;
+            }
+            if op == (VbsBytecodeJumpIfFalse => Int) {
+                self.add_work(work, pc + 1, start_pc, end_pc);
+                self.add_work(work, arg0, start_pc, end_pc);
+                self.add_work(work, arg1, start_pc, end_pc);
+                skip;
+            }
+            self.add_work(work, pc + 1, start_pc, end_pc);
+        }
+    }
+
+    func mark_targets(self: VbsBytecodeOptimizer, bytecode: VbsBytecodeProgram, targets: collections.Vector<Int>) -> Void {
+        let count: Int = bytecode.instruction_count();
+        let i: Int = 0;
+        loop i < bytecode.block_pcs.len() {
+            let pc: Int = bytecode.block_pcs.get(i);
+            if pc >= 0 && pc < count {
+                _ = targets.set(pc, 1);
+            }
+            i += 1;
+        }
+        if bytecode.root_pc >= 0 && bytecode.root_pc < count {
+            _ = targets.set(bytecode.root_pc, 1);
+        }
+        i = 0;
+        loop i < count {
+            let offset: Int = i * 3;
+            let op: Int = bytecode.insns.get(offset);
+            if op == (VbsBytecodeJump => Int) {
+                let target: Int = bytecode.insns.get(offset + 1);
+                if target >= 0 && target < count {
+                    _ = targets.set(target, 1);
+                }
+            } else if op == (VbsBytecodeJumpIfFalse => Int) {
+                let target0: Int = bytecode.insns.get(offset + 1);
+                let target1: Int = bytecode.insns.get(offset + 2);
+                if target0 >= 0 && target0 < count { _ = targets.set(target0, 1); }
+                if target1 >= 0 && target1 < count { _ = targets.set(target1, 1); }
+            }
+            i += 1;
+        }
+    }
+
+    func pure_literal_push(self: VbsBytecodeOptimizer, bytecode: VbsBytecodeProgram, pc: Int) -> Bool {
+        _ = self;
+        let offset: Int = pc * 3;
+        if bytecode.insns.get(offset) != (VbsBytecodePushExprLeaf => Int) {
+            return false;
+        }
+        let expr_id: Int = bytecode.insns.get(offset + 1);
+        if expr_id < 0 || expr_id >= bytecode.program.exprs.len() {
+            return false;
+        }
+        let kind: asp.compiler.VbsExprKind = bytecode.program.snapshot_expr(expr_id).kind;
+        return kind == asp.compiler.VbsExprString
+            || kind == asp.compiler.VbsExprInteger
+            || kind == asp.compiler.VbsExprFloat
+            || kind == asp.compiler.VbsExprDate
+            || kind == asp.compiler.VbsExprBool
+            || kind == asp.compiler.VbsExprNothing;
+    }
+
+    func mapped_pc(self: VbsBytecodeOptimizer, old_to_new: collections.Vector<Int>, old_pc: Int) -> Int {
+        _ = self;
+        if old_pc < 0 {
+            return old_pc;
+        }
+        if old_pc >= old_to_new.len() {
+            return old_to_new.get(old_to_new.len() - 1);
+        }
+        return old_to_new.get(old_pc);
+    }
+
+    func optimize(self: VbsBytecodeOptimizer, bytecode: VbsBytecodeProgram) -> Void {
+        if bytecode.mapped_image_handle != 0 {
+            return;
+        }
+        let count: Int = bytecode.instruction_count();
+        if count <= 1 {
+            return;
+        }
+        let reachable: collections.Vector<Int> = new collections.Vector<Int>();
+        let keep: collections.Vector<Int> = new collections.Vector<Int>();
+        let targets: collections.Vector<Int> = new collections.Vector<Int>();
+        let visit_marks: collections.Vector<Int> = new collections.Vector<Int>();
+        let i: Int = 0;
+        loop i < count {
+            _ = reachable.push(0);
+            _ = keep.push(0);
+            _ = targets.push(0);
+            _ = visit_marks.push(0);
+            i += 1;
+        }
+        let generation: Int = 1;
+        if bytecode.expr_only {
+            self.mark_range(bytecode, bytecode.root_pc, count, reachable, visit_marks, generation);
+            generation += 1;
+        }
+        i = 0;
+        loop i < bytecode.block_pcs.len() && i < bytecode.block_end_pcs.len() {
+            self.mark_range(bytecode, bytecode.block_pcs.get(i), bytecode.block_end_pcs.get(i), reachable, visit_marks, generation);
+            generation += 1;
+            i += 1;
+        }
+        // The final Halt is an ABI sentinel even when every block has an
+        // explicit execution limit and cannot fall through to it.
+        _ = reachable.set(count - 1, 1);
+        i = 0;
+        loop i < count {
+            _ = keep.set(i, reachable.get(i));
+            i += 1;
+        }
+        self.mark_targets(bytecode, targets);
+
+        // General peepholes: redundant fallthrough jumps, one-part ConcatN,
+        // literal push/pop pairs, and Dup/Pop pairs.
+        i = 0;
+        loop i < count {
+            if keep.get(i) == 0 {
+                i += 1;
+                skip;
+            }
+            let offset: Int = i * 3;
+            let op: Int = bytecode.insns.get(offset);
+            if op == (VbsBytecodeJump => Int)
+            && bytecode.insns.get(offset + 1) == i + 1
+            && targets.get(i) == 0 {
+                _ = keep.set(i, 0);
+            } else if op == (VbsBytecodeConcatN => Int)
+            && bytecode.insns.get(offset + 1) == 1
+            && targets.get(i) == 0 {
+                _ = keep.set(i, 0);
+            } else if i + 1 < count
+            && keep.get(i + 1) != 0
+            && targets.get(i) == 0
+            && targets.get(i + 1) == 0
+            && bytecode.insns.get((i + 1) * 3) == (VbsBytecodePop => Int)
+            && (op == (VbsBytecodeDup => Int) || self.pure_literal_push(bytecode, i)) {
+                _ = keep.set(i, 0);
+                _ = keep.set(i + 1, 0);
+                i += 1;
+            }
+            i += 1;
+        }
+
+        let old_to_new: collections.Vector<Int> = new collections.Vector<Int>();
+        i = 0;
+        let next_pc: Int = 0;
+        loop i <= count {
+            _ = old_to_new.push(0);
+            i += 1;
+        }
+        i = count;
+        next_pc = 0;
+        loop i >= 0 {
+            if i == count {
+                next_pc = 0;
+                let kept_count: Int = 0;
+                let j: Int = 0;
+                loop j < count {
+                    if keep.get(j) != 0 { kept_count += 1; }
+                    j += 1;
+                }
+                next_pc = kept_count;
+            } else if keep.get(i) != 0 {
+                next_pc -= 1;
+            }
+            _ = old_to_new.set(i, next_pc);
+            i -= 1;
+        }
+
+        let compacted: collections.Vector<Int> = new collections.Vector<Int>();
+        i = 0;
+        loop i < count {
+            if keep.get(i) != 0 {
+                let offset: Int = i * 3;
+                let op: Int = bytecode.insns.get(offset);
+                let arg0: Int = bytecode.insns.get(offset + 1);
+                let arg1: Int = bytecode.insns.get(offset + 2);
+                if op == (VbsBytecodeJump => Int) {
+                    arg0 = self.mapped_pc(old_to_new, arg0);
+                } else if op == (VbsBytecodeJumpIfFalse => Int) {
+                    arg0 = self.mapped_pc(old_to_new, arg0);
+                    arg1 = self.mapped_pc(old_to_new, arg1);
+                }
+                _ = compacted.push(op);
+                _ = compacted.push(arg0);
+                _ = compacted.push(arg1);
+            }
+            i += 1;
+        }
+        bytecode.insns = compacted;
+        bytecode.root_pc = self.mapped_pc(old_to_new, bytecode.root_pc);
+        i = 0;
+        loop i < bytecode.block_pcs.len() {
+            _ = bytecode.block_pcs.set(i, self.mapped_pc(old_to_new, bytecode.block_pcs.get(i)));
+            _ = bytecode.block_end_pcs.set(i, self.mapped_pc(old_to_new, bytecode.block_end_pcs.get(i)));
+            i += 1;
+        }
+    }
+}

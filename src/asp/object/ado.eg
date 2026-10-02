@@ -1,0 +1,394 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.object;
+
+use asp;
+use asp.object.database;
+use asp.runtime;
+use asp.vm;
+
+use bytes;
+use collections;
+use fs;
+use std;
+use strconv;
+use strings;
+
+
+// Property setters append their assigned value after any index arguments. This
+// helper makes that calling convention explicit for all ADO component handlers.
+func property_value(values: collections.Vector<asp.runtime.Variant>) -> asp.runtime.Variant {
+    if values.len() == 0 {
+        return asp.runtime.variant_empty();
+    }
+    return values.get(values.len() - 1);
+}
+
+// Expand the limited ADODB.Command parameter model into SQL literals. Native
+// type codes decide whether a value is numeric; string values use SQL quote
+// doubling. This is compatibility substitution, not a general prepared API.
+func command_parameter_sql(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, command: asp.vm.RuntimeObject, sql: String) -> String {
+    _ = evaluator;
+    if std.len(command.class_name) == 0 {
+        return sql;
+    }
+    let parameters: asp.vm.RuntimeObject = ctx.objects.get(strconv.atoi(command.class_name));
+    let parameter_ids: collections.Vector<String> = strings.split(parameters.text_value, ",");
+    let result: String = sql;
+    let i: Int = 0;
+    loop i < parameters.int_value && i < parameter_ids.len() {
+        let parameter: asp.vm.RuntimeObject = ctx.objects.get(strconv.atoi(parameter_ids.get(i)));
+        let literal: String = parameter.cursor == 2 || parameter.cursor == 3 || parameter.cursor == 4 || parameter.cursor == 5 || parameter.cursor == 6 || parameter.cursor == 20 ? parameter.text_value : "'" + strings.replace_all(parameter.text_value, "'", "''") + "'";
+        let name: String = parameter.class_name;
+            if std.len(name) > 1 && (strings.starts_with(name, "@") || strings.starts_with(name, ":")) && strings.contains(result, name) {
+                result = strings.replace_all(result, name, literal);
+            } else {
+                result = strings.replace_first(result, "?", literal);
+            }
+        i += 1;
+    }
+    return result;
+}
+
+// ADODB.Command stores related object ids in scalar RuntimeObject fields:
+// int_value is ActiveConnection and class_name is Parameters. ObjectSpace owns
+// those children and validates them again when Execute is requested.
+func invoke_ado_command(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    if strings.equal_fold_ascii(member, "ActiveConnection") {
+        if is_set {
+            let value: asp.runtime.Variant = property_value(values);
+            if value.kind != asp.runtime.VariantObject {
+                evaluator.raise_runtime_error(ctx, 13, "ActiveConnection must be an ADODB.Connection object", obj.prog_id);
+                return asp.runtime.variant_empty();
+            }
+            obj.int_value = value.object_value;
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return obj.int_value > 0 ? asp.runtime.variant_object(obj.int_value) : asp.runtime.variant_nothing();
+    }
+    if strings.equal_fold_ascii(member, "CommandText") || strings.equal_fold_ascii(member, "CommandType") || strings.equal_fold_ascii(member, "CommandTimeout") || strings.equal_fold_ascii(member, "Prepared") {
+        if is_set {
+            if strings.equal_fold_ascii(member, "CommandText") {
+                obj.text_value = property_value(values).to_output_string();
+            } else if strings.equal_fold_ascii(member, "CommandType") {
+                obj.cursor = asp.variant_to_int(property_value(values));
+            } else if strings.equal_fold_ascii(member, "Prepared") {
+                obj.opened = property_value(values).is_truthy();
+            }
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        if strings.equal_fold_ascii(member, "CommandText") {
+            return asp.runtime.variant_string(obj.text_value);
+        }
+        if strings.equal_fold_ascii(member, "CommandType") {
+            return asp.runtime.variant_int(obj.cursor);
+        }
+        if strings.equal_fold_ascii(member, "Prepared") {
+            return asp.runtime.variant_bool(obj.opened);
+        }
+        return asp.runtime.variant_int(30);
+    }
+    if strings.equal_fold_ascii(member, "Parameters") {
+        if std.len(obj.class_name) > 0 {
+            return asp.runtime.variant_object(strconv.atoi(obj.class_name));
+        }
+        let parameters: asp.vm.RuntimeObject = new asp.vm.RuntimeObject();
+        parameters.component_kind = ComponentAdoParameters;
+        parameters.prog_id = "ADODB.Parameters";
+        parameters.default_member = "Item";
+        let parameters_id: Int = ctx.objects.add(parameters);
+        let result: asp.runtime.Variant = asp.runtime.variant_object(parameters_id);
+        obj.class_name = strconv.itoa(parameters_id);
+        evaluator.set_object(ctx, obj_id, obj);
+        return result;
+    }
+    if strings.equal_fold_ascii(member, "CreateParameter") {
+        let parameter: asp.vm.RuntimeObject = new asp.vm.RuntimeObject();
+        parameter.component_kind = ComponentAdoParameter;
+        parameter.prog_id = "ADODB.Parameter";
+        parameter.default_member = "Value";
+        if values.len() > 0 {
+            parameter.class_name = values.get(0).to_output_string();
+        }
+        if values.len() > 1 {
+            parameter.cursor = asp.variant_to_int(values.get(1));
+        }
+        if values.len() > 2 {
+            parameter.int_value = asp.variant_to_int(values.get(2));
+        }
+        if values.len() > 4 {
+            parameter.text_value = values.get(4).to_output_string();
+        }
+        return asp.runtime.variant_object(ctx.objects.add(parameter));
+    }
+    if strings.equal_fold_ascii(member, "Execute") {
+        if obj.int_value <= 0 {
+            evaluator.raise_runtime_error(ctx, 91, "ActiveConnection is not set", obj.prog_id);
+            return asp.runtime.variant_empty();
+        }
+        let connection: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj.int_value);
+        if asp.object.kind_of(connection) != ComponentAdoConnection {
+            evaluator.raise_runtime_error(ctx, 13, "ActiveConnection is not an ADODB.Connection", obj.prog_id);
+            return asp.runtime.variant_empty();
+        }
+        if connection.database_driver_kind == (asp.object.database.DatabaseDriverMysql => Int) {
+            return asp.object.database.mysql_execute_command(evaluator, ctx, obj.int_value, obj);
+        }
+        let sql: String = command_parameter_sql(evaluator, ctx, obj, obj.text_value);
+        let execute_values: collections.Vector<asp.runtime.Variant> = new collections.Vector<asp.runtime.Variant>();
+        _ = execute_values.push(asp.runtime.variant_string(sql));
+        return evaluator.invoke_ado_connection(ctx, obj.int_value, "Execute", execute_values, false);
+    }
+    evaluator.raise_runtime_error(ctx, 438, "command member not found: " + member, obj.prog_id);
+    return asp.runtime.variant_empty();
+}
+
+func invoke_ado_parameters(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    if strings.equal_fold_ascii(member, "Append") && values.len() > 0 {
+        let value: asp.runtime.Variant = values.get(0);
+        if value.kind != asp.runtime.VariantObject {
+            evaluator.raise_runtime_error(ctx, 13, "parameter object required", obj.prog_id);
+            return asp.runtime.variant_empty();
+        }
+        if obj.int_value > 0 {
+            obj.text_value += ",";
+        }
+        obj.text_value += strconv.itoa(value.object_value);
+        obj.int_value += 1;
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "Count") {
+        return asp.runtime.variant_int(obj.int_value);
+    }
+    if strings.equal_fold_ascii(member, "Delete") && values.len() > 0 {
+        let index: Int = asp.variant_to_int(values.get(0));
+        let ids: collections.Vector<String> = strings.split(obj.text_value, ",");
+        if index >= 0 && index < obj.int_value && index < ids.len() {
+            let updated: String = "";
+            let i: Int = 0;
+            loop i < ids.len() {
+                if i != index && std.len(ids.get(i)) > 0 {
+                    if std.len(updated) > 0 {
+                        updated += ",";
+                    }
+                    updated += ids.get(i);
+                }
+                i += 1;
+            }
+            obj.text_value = updated;
+            obj.int_value -= 1;
+            evaluator.set_object(ctx, obj_id, obj);
+        }
+        return asp.runtime.variant_empty();
+    }
+    if (strings.equal_fold_ascii(member, "Item") || std.len(member) == 0) && values.len() > 0 {
+        let index: Int = asp.variant_to_int(values.get(0));
+        let ids: collections.Vector<String> = strings.split(obj.text_value, ",");
+        if index >= 0 && index < obj.int_value && index < ids.len() {
+            return asp.runtime.variant_object(strconv.atoi(ids.get(index)));
+        }
+    }
+    _ = is_set;
+    evaluator.raise_runtime_error(ctx, 438, "parameters member not found: " + member, obj.prog_id);
+    return asp.runtime.variant_empty();
+}
+
+func invoke_ado_parameter(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    let key: String = std.len(member) == 0 ? "value" : strings.to_lower_ascii(member);
+    if key == "name" || key == "type" || key == "direction" || key == "size" || key == "value" {
+        if is_set {
+            if key == "name" {
+                obj.class_name = property_value(values).to_output_string();
+            } else if key == "type" {
+                obj.cursor = asp.variant_to_int(property_value(values));
+            } else if key == "direction" {
+                obj.int_value = asp.variant_to_int(property_value(values));
+            } else if key == "value" {
+                obj.text_value = property_value(values).to_output_string();
+            }
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        if key == "name" {
+            return asp.runtime.variant_string(obj.class_name);
+        }
+        if key == "type" {
+            return asp.runtime.variant_int(obj.cursor);
+        }
+        if key == "direction" {
+            return asp.runtime.variant_int(obj.int_value);
+        }
+        if key == "size" {
+            return asp.runtime.variant_int(std.len(obj.text_value));
+        }
+        return asp.runtime.variant_string(obj.text_value);
+    }
+    evaluator.raise_runtime_error(ctx, 438, "parameter member not found: " + member, obj.prog_id);
+    return asp.runtime.variant_empty();
+}
+
+// ADODB.Stream writes overwrite from Position and extend at EOF; they do not
+// implicitly truncate bytes after the replacement.
+func stream_replace_range(data: String, position: Int, replacement: String) -> String {
+    let pos: Int = position;
+    if pos < 0 {
+        pos = 0;
+    }
+    if pos > std.len(data) {
+        pos = std.len(data);
+    }
+    let tail_at: Int = pos + std.len(replacement);
+    let out: String = std.substr(data, 0, pos) + replacement;
+    if tail_at < std.len(data) {
+        out += std.substr(data, tail_at, std.len(data) - tail_at);
+    }
+    return out;
+}
+
+// Stream data is owned by the RuntimeObject. Position is a byte offset even in
+// text mode; Charset conversion is delegated to runtime charset helpers.
+func invoke_ado_stream(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    if strings.equal_fold_ascii(member, "Type") || strings.equal_fold_ascii(member, "Charset") {
+        if is_set {
+            if strings.equal_fold_ascii(member, "Type") {
+                obj.int_value = asp.variant_to_int(property_value(values));
+            } else {
+                obj.class_name = property_value(values).to_output_string();
+            }
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        if strings.equal_fold_ascii(member, "Type") {
+            return asp.runtime.variant_int(obj.int_value == 0 ? 2 : obj.int_value);
+        }
+        return asp.runtime.variant_string(std.len(obj.class_name) == 0 ? "utf-8" : obj.class_name);
+    }
+    if strings.equal_fold_ascii(member, "Mode") {
+        if is_set {
+            obj.auxiliary_int = asp.variant_to_int(property_value(values));
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_int(obj.auxiliary_int == 0 ? 3 : obj.auxiliary_int);
+    }
+    if strings.equal_fold_ascii(member, "Position") {
+        if is_set {
+            let position: Int = asp.variant_to_int(property_value(values));
+            obj.cursor = position < 0 ? 0 : (position > std.len(obj.text_value) ? std.len(obj.text_value) : position);
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_int(obj.cursor);
+    }
+    if strings.equal_fold_ascii(member, "Size") {
+        return asp.runtime.variant_int(std.len(obj.text_value));
+    }
+    if strings.equal_fold_ascii(member, "EOS") {
+        return asp.runtime.variant_bool(obj.cursor >= std.len(obj.text_value));
+    }
+    if strings.equal_fold_ascii(member, "State") {
+        return asp.runtime.variant_int(obj.opened ? 1 : 0);
+    }
+    if strings.equal_fold_ascii(member, "Open") {
+        obj.opened = true;
+        obj.text_value = "";
+        obj.cursor = 0;
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "Close") {
+        obj.opened = false;
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "Flush") {
+        if !obj.opened {
+            evaluator.raise_runtime_error(ctx, 3704, "operation is not allowed when the stream is closed", obj.prog_id);
+        }
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "Write") || strings.equal_fold_ascii(member, "WriteText") {
+        let data: String = values.len() > 0 ? values.get(0).to_output_string() : "";
+        let mode: Int = values.len() > 1 ? asp.variant_to_int(values.get(1)) : 0;
+        let payload: String = strings.equal_fold_ascii(member, "WriteText") && mode == 1 ? data + "\r\n" : data;
+        obj.text_value = stream_replace_range(obj.text_value, obj.cursor, payload);
+        obj.cursor += std.len(payload);
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "Read") || strings.equal_fold_ascii(member, "ReadText") {
+        let remaining: Int = std.len(obj.text_value) - obj.cursor;
+        let count: Int = values.len() > 0 ? asp.variant_to_int(values.get(0)) : -1;
+        let take: Int = count < 0 || count > remaining ? remaining : count;
+        let result: String = take > 0 ? std.substr(obj.text_value, obj.cursor, take) : "";
+        obj.cursor += take;
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_string(result);
+    }
+    if strings.equal_fold_ascii(member, "CopyTo") {
+        if values.len() == 0 || values.get(0).kind != asp.runtime.VariantObject {
+            evaluator.raise_runtime_error(ctx, 13, "CopyTo destination must be an ADODB.Stream object", obj.prog_id);
+            return asp.runtime.variant_empty();
+        }
+        if !obj.opened {
+            evaluator.raise_runtime_error(ctx, 3704, "operation is not allowed when the source stream is closed", obj.prog_id);
+            return asp.runtime.variant_empty();
+        }
+        let target_id: Int = values.get(0).object_value;
+        let target: asp.vm.RuntimeObject = evaluator.get_object(ctx, target_id);
+        if asp.object.kind_of(target) != ComponentAdoStream {
+            evaluator.raise_runtime_error(ctx, 13, "CopyTo destination must be an ADODB.Stream object", obj.prog_id);
+            return asp.runtime.variant_empty();
+        }
+        if !target.opened {
+            evaluator.raise_runtime_error(ctx, 3704, "operation is not allowed when the destination stream is closed", obj.prog_id);
+            return asp.runtime.variant_empty();
+        }
+        let remaining: Int = std.len(obj.text_value) - obj.cursor;
+        let requested: Int = values.len() > 1 ? asp.variant_to_int(values.get(1)) : -1;
+        let count: Int = requested < 0 || requested > remaining ? remaining : requested;
+        let payload: String = count > 0 ? std.substr(obj.text_value, obj.cursor, count) : "";
+        target.text_value = stream_replace_range(target.text_value, target.cursor, payload);
+        target.cursor += count;
+        obj.cursor += count;
+        evaluator.set_object(ctx, target_id, target);
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "SetEOS") {
+        obj.text_value = std.substr(obj.text_value, 0, obj.cursor);
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "LoadFromFile") && values.len() > 0 {
+        let file_path: String = asp.asp_host_path(values.get(0).to_output_string());
+        let data, err = fs.read_bytes(file_path, -1);
+        if err != std.OK {
+            evaluator.raise_runtime_error(ctx, 53, "file not found: " + file_path, obj.prog_id);
+            return asp.runtime.variant_empty();
+        }
+        obj.text_value = bytes.to_string(data);
+        obj.cursor = 0;
+        obj.opened = true;
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "SaveToFile") && values.len() > 0 {
+        let file_path: String = asp.asp_host_path(values.get(0).to_output_string());
+        let _, err = fs.write_bytes(file_path, bytes.from_string(obj.text_value));
+        if err != std.OK {
+            evaluator.raise_runtime_error(ctx, 70, "cannot write file: " + file_path, obj.prog_id);
+        }
+        return asp.runtime.variant_empty();
+    }
+    evaluator.raise_runtime_error(ctx, 438, "stream member not found: " + member, obj.prog_id);
+    return asp.runtime.variant_empty();
+}

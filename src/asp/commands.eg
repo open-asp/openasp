@@ -1,0 +1,233 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp;
+
+use asp.object.database;
+use asp.runtime;
+use asp.compiler;
+use asp.vm;
+
+use std;
+use path;
+use strings;
+use strconv;
+use os;
+use os.process;
+use runtime;
+
+extern func __gc_set_threshold(bytes: Int) -> Void;
+
+// Minimal argument reader shared by the standalone executables. It accepts
+// both "--flag value" and "--flag=value"; first_positional must know which
+// flags consume a following token so option values are not mistaken for pages.
+class CommandArgs {
+    func init(self: CommandArgs) -> Void {
+    }
+
+    func value(self: CommandArgs, argc: Int, argv: Int, flag: String, fallback: String) -> String {
+        let prefix: String = flag + "=";
+        loop (let i: Int = 1; i < argc; i += 1) {
+            let arg: String = std.argv_get(argc, argv, i);
+            if arg == flag && i + 1 < argc {
+                return std.argv_get(argc, argv, i + 1);
+            }
+            if strings.starts_with(arg, prefix) {
+                return std.substr(arg, std.len(prefix), std.len(arg) - std.len(prefix));
+            }
+        }
+        return fallback;
+    }
+
+    func has(self: CommandArgs, argc: Int, argv: Int, flag: String) -> Bool {
+        loop (let i: Int = 1; i < argc; i += 1) {
+            if std.argv_get(argc, argv, i) == flag {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    func first_positional(self: CommandArgs, argc: Int, argv: Int) -> String {
+        loop (let i: Int = 1; i < argc; i += 1) {
+            let arg: String = std.argv_get(argc, argv, i);
+            if strings.starts_with(arg, "-") {
+                if arg == "--file"
+                || arg == "--root"
+                || arg == "--query"
+                || arg == "--body"
+                || arg == "--method"
+                || arg == "--session"
+                || arg == "--host"
+                || arg == "--port"
+                || arg == "--max-accepts"
+                || arg == "--workers"
+                || arg == "--worker-connections"
+                || arg == "--aot"
+                || arg == "--optimize"
+                || arg == "--max-request-bytes"
+                || arg == "--log-file"
+                || arg == "--log-level"
+                || arg == "--shell-enable"
+                || arg == "--process-enable" {
+                    i += 1;
+                }
+                skip;
+            }
+            return arg;
+        }
+        return "";
+    }
+}
+
+// Apply process-wide safety options before constructing an engine.
+// Shell/process capabilities default off and are rechecked at invocation time.
+class RuntimeOptions {
+    func init(self: RuntimeOptions) -> Void {
+    }
+
+    func apply(self: RuntimeOptions, argc: Int, argv: Int) -> Void {
+        let args: CommandArgs = new CommandArgs();
+        let optimize_enabled: Bool = strings.equal_fold_ascii(args.value(argc, argv, "--optimize", "on"), "on");
+        let _, optimize_env_err = os.setenv("EGRET_ASP_OPTIMIZE", optimize_enabled ? "on" : "off");
+        _ = optimize_env_err;
+        let shell_enabled: Bool = strings.equal_fold_ascii(args.value(argc, argv, "--shell-enable", "off"), "on");
+        let _, shell_env_err = os.setenv("EGRET_ASP_SHELL_ENABLED", shell_enabled ? "on" : "off");
+        _ = shell_env_err;
+        let process_enabled: Bool = strings.equal_fold_ascii(args.value(argc, argv, "--process-enable", "off"), "on");
+        let _, process_env_err = os.setenv("OPENASP_PROCESS_ENABLED", process_enabled ? "on" : "off");
+        _ = process_env_err;
+        let gc_disable_text, gc_disable_err = os.getenv("EG_GC_DISABLE");
+        if gc_disable_err == OK
+        && std.len(gc_disable_text) > 0
+        && gc_disable_text != "0"
+        && !strings.equal_fold_ascii(gc_disable_text, "off")
+        && !strings.equal_fold_ascii(gc_disable_text, "false")
+        && !strings.equal_fold_ascii(gc_disable_text, "no") {
+            runtime.gc_disable();
+        }
+        let gc_threshold_text, gc_threshold_err = os.getenv("EGRET_ASP_GC_THRESHOLD_BYTES");
+        let gc_threshold: Int = gc_threshold_err == OK ? strconv.atoi(gc_threshold_text) : 0;
+        if gc_threshold > 0 {
+            __gc_set_threshold(gc_threshold);
+        }
+    }
+}
+
+func openasp_optimize_option_valid(args: CommandArgs, argc: Int, argv: Int) -> Bool {
+    let value: String = args.value(argc, argv, "--optimize", "on");
+    return strings.equal_fold_ascii(value, "on") || strings.equal_fold_ascii(value, "off");
+}
+
+// Standalone file frontend. The legacy render/compile words remain accepted for
+// command-line compatibility, while normal invocation treats the first
+// positional argument as the ASP entry page.
+class OpenAspFile {
+    func init(self: OpenAspFile) -> Void {
+    }
+
+    func print_help(self: OpenAspFile) -> Void {
+        print("Usage: openasp <page.asp> [--root <dir>] [--query <a=1>] [--body <x=1>] [--method <GET|POST>] [--session <sid>] [--optimize=on|off (default: on)] [--log-file <path|off>] [--log-level <level|off>] [--shell-enable=on] [--process-enable=on]");
+        print("       openasp --file <page.asp> [options]");
+    }
+
+    // Own the logger and engine for the complete command lifetime. Every return
+    // after construction must close both so native pools and file handles drain.
+    func run(self: OpenAspFile, argc: Int, argv: Int) -> Int {
+        let args: CommandArgs = new CommandArgs();
+        if args.has(argc, argv, "-h") || args.has(argc, argv, "--help") {
+            self.print_help();
+            return 0;
+        }
+        let positional: String = args.first_positional(argc, argv);
+        let legacy_render: Bool = positional == "render";
+        let legacy_compile: Bool = positional == "compile";
+        let file_path: String = args.value(argc, argv, "--file", legacy_render || legacy_compile ? "" : positional);
+        if std.len(file_path) == 0 {
+            self.print_help();
+            return 2;
+        }
+        if !openasp_optimize_option_valid(args, argc, argv) {
+            print("invalid --optimize value; expected on or off");
+            return 2;
+        }
+        (new RuntimeOptions()).apply(argc, argv);
+        let log_level: String = args.value(argc, argv, "--log-level", "info");
+        if !openasp_log_level_valid(log_level) {
+            print("invalid --log-level value; expected info, notice, warn, error, or off");
+            return 2;
+        }
+        let logger: OpenAspLogger = new OpenAspLogger(
+            "openasp",
+            args.value(argc, argv, "--log-file", openasp_default_log_path("openasp")),
+            log_level
+        );
+        let root_dir: String = args.value(argc, argv, "--root", path.dir(path.clean(file_path)));
+        let method: String = args.value(argc, argv, "--method", "GET");
+        logger.info(
+            "starting file=" + file_path
+            + " root=" + root_dir
+            + " mode=" + (legacy_compile ? "compile" : "render")
+            + " method=" + method
+            + " optimize=" + strings.to_lower_ascii(args.value(argc, argv, "--optimize", "on"))
+        );
+        let engine: AspEngine = new AspEngine(root_dir);
+        if legacy_compile {
+            let page, compile_status = engine.compile_page(file_path);
+            let instruction_count: Int = 0;
+            let program_index: Int = 0;
+            loop program_index < page.programs.len() {
+                instruction_count += page.programs.get(program_index).instruction_count();
+                program_index += 1;
+            }
+            print("compile_status=" + strconv.itoa(compile_status => Int));
+            print("compiled_path=" + page.page_path);
+            print("node_count=" + strconv.itoa(page.nodes.len()));
+            print("include_count=" + strconv.itoa(page.include_paths.len()));
+            print("optimize=" + strings.to_lower_ascii(args.value(argc, argv, "--optimize", "on")));
+            print("instruction_count=" + strconv.itoa(instruction_count));
+            logger.info(
+                "compile completed file=" + file_path
+                + " status=" + strconv.itoa(compile_status => Int)
+                + " nodes=" + strconv.itoa(page.nodes.len())
+                + " includes=" + strconv.itoa(page.include_paths.len())
+            );
+            engine.close();
+            logger.close();
+            return compile_status == OK ? 0 : 2;
+        }
+        let ctx: asp.runtime.RequestContext = engine.render_request(
+            file_path,
+            method,
+            args.value(argc, argv, "--query", ""),
+            args.value(argc, argv, "--body", ""),
+            args.value(argc, argv, "--session", "")
+        );
+        let body: String = ctx.response.body_text();
+        let body_bytes: Int = std.len(body);
+        let status: Int = ctx.response.status_code;
+        let error_number: Int = ctx.error_state.error_number;
+        let _, _ = os.process.write_fd(1, body);
+        if legacy_render {
+            print("\n----");
+            print("status=" + strconv.itoa(ctx.response.status_code));
+            print("content_type=" + ctx.response.content_type);
+            print("charset=" + ctx.response.charset);
+            print("error_number=" + strconv.itoa(ctx.error_state.error_number));
+            print("error_source=" + ctx.error_state.source);
+            print("error_description=" + ctx.error_state.description);
+            print("session_id=" + ctx.session_id);
+        }
+        ctx.clear_request();
+        engine.clear_request();
+        engine.close();
+        logger.info(
+            "render completed file=" + file_path
+            + " status=" + strconv.itoa(status)
+            + " body_bytes=" + strconv.itoa(body_bytes)
+            + " error_number=" + strconv.itoa(error_number)
+        );
+        logger.close();
+        return status >= 400 ? 1 : 0;
+    }
+}

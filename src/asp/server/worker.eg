@@ -1,0 +1,187 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.server;
+
+use asp;
+
+use std;
+use aio.fs;
+use aio.tcp;
+use collections;
+use os;
+use runtime;
+use strconv;
+
+extern func __gc_collect() -> Void;
+extern func eg_vbs_prepare_timezone() -> Void;
+extern func eg_asp_request_arena_escape_failures() -> Int;
+
+// Worker-process accept loop and connection-task owner. Completed futures are
+// joined before removal so resources and errors are observed exactly once.
+class FastcgiWorker {
+    var runtime_state: FastcgiServerRuntime;
+    var connection_handler: FastcgiConnectionHandler;
+
+    func init(self: FastcgiWorker, runtime_state: FastcgiServerRuntime) -> Void {
+        self.runtime_state = runtime_state;
+        self.connection_handler = new FastcgiConnectionHandler(runtime_state);
+    }
+
+    async func join_ready_conn_tasks(self: FastcgiWorker, tasks: collections.Vector<FastcgiConnTaskSlot>) -> Int {
+        let retired: Int = 0;
+        let i: Int = 0;
+        loop i < tasks.len() {
+            let slot: FastcgiConnTaskSlot = tasks.get_unchecked(i);
+            if !slot.active {
+                let last_empty: Int = tasks.len() - 1;
+                if i < last_empty {
+                    _ = tasks.set(i, tasks.get_unchecked(last_empty));
+                }
+                _ = tasks.pop_back(slot);
+                skip;
+            }
+            let current: Future(Int) = slot.fut;
+            if !runtime.future_is_ready_int(current) {
+                i += 1;
+                skip;
+            }
+            let handled: Int = join current;
+            _ = handled;
+            _ = slot.deactivate();
+            let last: Int = tasks.len() - 1;
+            if i < last {
+                _ = tasks.set(i, tasks.get_unchecked(last));
+            }
+            _ = tasks.pop_back(slot);
+            retired += 1;
+        }
+        return retired;
+    }
+
+    // Backpressure waits until at least one task retires. The short async watch
+    // yields to the scheduler without blocking the process on a specific future.
+    async func wait_for_conn_capacity(self: FastcgiWorker, tasks: collections.Vector<FastcgiConnTaskSlot>) -> Int {
+        let total: Int = 0;
+        loop total == 0 && tasks.len() > 0 {
+            let ready: Int = await self.join_ready_conn_tasks(tasks);
+            total += ready;
+            if total == 0 && tasks.len() > 0 {
+                let _, _ = await aio.fs.watch_once(".", 1);
+            }
+        }
+        return total;
+    }
+
+    async func join_all_conn_tasks(self: FastcgiWorker, tasks: collections.Vector<FastcgiConnTaskSlot>) -> Int {
+        let total: Int = 0;
+        loop (let i: Int = 0; i < tasks.len(); i += 1) {
+            let slot: FastcgiConnTaskSlot = tasks.get_unchecked(i);
+            if !slot.active {
+                skip;
+            }
+            let handled: Int = join slot.fut;
+            total += handled;
+            _ = slot.deactivate();
+        }
+        tasks.clear();
+        return total;
+    }
+
+    // Configures GC relative to the post-fork resident heap. A worker retires
+    // when collection cannot bring it below the high-water threshold, allowing
+    // the master to replace fragmented or unexpectedly retained heaps.
+    async func run_loop(self: FastcgiWorker, lfd: Int, max_accepts: Int, max_concurrent_connections: Int) -> Int {
+        eg_vbs_prepare_timezone();
+        let resident_heap: Int = runtime.gc_effective_heap_bytes();
+        let adaptive_floor: Int = resident_heap + 134217728;
+        let collection_threshold: Int = resident_heap + 402653184;
+        let memory_limit: Int = resident_heap + 536870912;
+        let retirement_threshold: Int = resident_heap + 503316480;
+        runtime.gc_set_incremental(true);
+        runtime.gc_set_threshold(collection_threshold);
+        runtime.gc_set_adaptive_floor_bytes(adaptive_floor);
+        runtime.gc_set_max_adaptive_threshold_bytes(collection_threshold);
+        runtime.gc_set_memory_limit(memory_limit, 75);
+        runtime.gc_set_mark_step_objects(512);
+        runtime.gc_set_sweep_step_objects(4096);
+        runtime.gc_set_interval_ms(0);
+        let _, _ = runtime.gc_set_alloc_cache(true);
+        let _, _ = runtime.gc_set_alloc_local_bytes(262144);
+        let _, _ = runtime.gc_set_interval_min_alloc_bytes(1048576);
+        let accepted: Int = 0;
+        let serving: Bool = true;
+        let client_tasks: collections.Vector<FastcgiConnTaskSlot> = new collections.Vector<FastcgiConnTaskSlot>();
+        let concurrency_limit: Int = max_concurrent_connections < 1 ? 1 : max_concurrent_connections;
+        loop serving {
+            let retired: Int = await self.join_ready_conn_tasks(client_tasks);
+            loop client_tasks.len() >= concurrency_limit {
+                let capacity_retired: Int = await self.wait_for_conn_capacity(client_tasks);
+                retired += capacity_retired;
+            }
+            if retired > 0 && client_tasks.len() == 0 {
+                client_tasks.clear();
+                if runtime.gc_effective_heap_bytes() >= retirement_threshold {
+                    __gc_collect();
+                    if runtime.gc_effective_heap_bytes() >= retirement_threshold {
+                        serving = false;
+                    }
+                }
+            }
+            if !serving {
+                break;
+            }
+            let cfd, accept_err = await aio.tcp.accept(lfd, 1000);
+            if accept_err == OK && cfd > 0 {
+                accepted += 1;
+                let task: Future(Int) = spawn self.connection_handler.handle(cfd, 15000);
+                _ = client_tasks.push(new FastcgiConnTaskSlot(task));
+            } else if accept_err == ERR_TIMEOUT {
+                self.runtime_state.logger.flush();
+            } else if accept_err != OK {
+                self.runtime_state.logger.error("worker accept failed error=" + strconv.itoa(accept_err => Int));
+                break;
+            }
+            if max_accepts > 0 && accepted >= max_accepts {
+                serving = false;
+            }
+        }
+        _ = await self.join_all_conn_tasks(client_tasks);
+        let escape_failures: Int = eg_asp_request_arena_escape_failures();
+        if escape_failures != 0 {
+            print("request arena generation violations=" + strconv.itoa(escape_failures));
+            self.runtime_state.logger.error("request arena generation violations=" + strconv.itoa(escape_failures));
+            return 2;
+        }
+        self.runtime_state.logger.flush();
+        return 0;
+    }
+
+    async func run_child(self: FastcgiWorker, lfd: Int, max_accepts: Int, max_concurrent_connections: Int, aot_enabled: Bool) -> Int {
+        if aot_enabled {
+            self.runtime_state.engine = new asp.AspEngine(self.runtime_state.root_dir);
+            let aot_rc: Int = self.runtime_state.engine.prepare_aot();
+            if aot_rc != 0 {
+                self.runtime_state.logger.error("worker aot preparation failed status=" + strconv.itoa(aot_rc));
+                self.runtime_state.logger.close();
+                _ = aio.tcp.close(lfd);
+                _ = aio.fs.shutdown();
+                _ = os.exit(aot_rc);
+                return aot_rc;
+            }
+        }
+        self.runtime_state.logger.info(
+            "worker started max_accepts=" + strconv.itoa(max_accepts)
+            + " worker_connections=" + strconv.itoa(max_concurrent_connections < 1 ? 1 : max_concurrent_connections)
+            + " aot=" + (aot_enabled ? "on" : "off")
+        );
+        let rc: Int = await self.run_loop(lfd, max_accepts, max_concurrent_connections);
+        self.runtime_state.logger.info("worker stopped status=" + strconv.itoa(rc));
+        self.runtime_state.engine.close();
+        self.runtime_state.logger.close();
+        _ = aio.tcp.close(lfd);
+        _ = aio.fs.shutdown();
+        _ = os.exit(rc);
+        return rc;
+    }
+}

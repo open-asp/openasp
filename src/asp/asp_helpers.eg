@@ -1,0 +1,720 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp;
+
+use asp.object.database;
+use asp.runtime;
+use asp.compiler;
+use asp.vm;
+
+use std;
+use bytes;
+use fs;
+use path;
+use strings;
+use strconv;
+use collections;
+use os;
+use os.process;
+use time;
+use math;
+
+extern func eg_vbs_parse_date(text: String) -> Int;
+
+// Variant conversion helpers deliberately implement VBScript coercion rather
+// than host-language conversion. In particular True is -1, Date is an OLE
+// Automation day value, and unsupported/Empty values coerce to zero.
+func variant_to_int(v: asp.runtime.Variant) -> Int {
+    if v.kind == asp.runtime.VariantInt {
+        return v.int_value;
+    }
+    if v.kind == asp.runtime.VariantBool {
+        return v.bool_value ? -1 : 0;
+    }
+    if v.kind == asp.runtime.VariantFloat {
+        return v.float_value => Int;
+    }
+    if v.kind == asp.runtime.VariantDate {
+        return ((v.date_value => Float64) / 86400000.0 + 25569.0) => Int;
+    }
+    if v.kind == asp.runtime.VariantString {
+        return strconv.atoi(strings.trim_space(v.string_value));
+    }
+    return 0;
+}
+
+func variant_to_float64(v: asp.runtime.Variant) -> Float64 {
+    if v.kind == asp.runtime.VariantFloat {
+        return v.float_value;
+    }
+    if v.kind == asp.runtime.VariantInt {
+        return v.int_value => Float64;
+    }
+    if v.kind == asp.runtime.VariantBool {
+        return v.bool_value ? -1.0 : 0.0;
+    }
+    if v.kind == asp.runtime.VariantDate {
+        return (v.date_value => Float64) / 86400000.0 + 25569.0;
+    }
+    if v.kind == asp.runtime.VariantString {
+        return strconv.parse_float64(strings.trim_space(v.string_value));
+    }
+    return 0.0;
+}
+
+func string_is_numeric(text: String) -> Bool {
+    let s: String = strings.trim_space(text);
+    if std.len(s) == 0 {
+        return false;
+    }
+    let i: Int = 0;
+    let saw_digit: Bool = false;
+    let saw_dot: Bool = false;
+    loop i < std.len(s) {
+        let ch: Int = std.byte_at(s, i);
+        if i == 0 && (ch == '+' || ch == '-') {
+            i += 1;
+            skip;
+        }
+        if ch >= '0' && ch <= '9' {
+            saw_digit = true;
+            i += 1;
+            skip;
+        }
+        if ch == '.' && !saw_dot {
+            saw_dot = true;
+            i += 1;
+            skip;
+        }
+        return false;
+    }
+    return saw_digit;
+}
+
+func variant_is_numeric(v: asp.runtime.Variant) -> Bool {
+    if v.kind == asp.runtime.VariantInt || v.kind == asp.runtime.VariantFloat || v.kind == asp.runtime.VariantBool || v.kind == asp.runtime.VariantDate {
+        return true;
+    }
+    if v.kind == asp.runtime.VariantString {
+        return string_is_numeric(v.string_value);
+    }
+    return false;
+}
+
+func normalize_random_seed(seed: Int) -> Int {
+    // Keep the LCG state in its positive 31-bit modulus and reserve zero,
+    // which would otherwise become a fixed point.
+    let value: Int = seed % 2147483647;
+    if value < 0 {
+        value = 0 - value;
+    }
+    if value == 0 {
+        return 1;
+    }
+    return value;
+}
+
+func hash_random_seed(text: String) -> Int {
+    let value: Int = 0;
+    let i: Int = 0;
+    loop i < std.len(text) {
+        value = ((value * 131) + std.byte_at(text, i) + 1) % 2147483647;
+        i += 1;
+    }
+    return normalize_random_seed(value);
+}
+
+func random_entropy_seed() -> Int {
+    // OS entropy is preferred; monotonic-enough wall time is a portability
+    // fallback for restricted environments, not a cryptographic guarantee.
+    let raw, err = fs.read_bytes("/dev/urandom", 16);
+    if err == std.OK && std.len(bytes.to_string(raw)) != 0 {
+        return hash_random_seed(bytes.to_string(raw));
+    }
+    return normalize_random_seed(time.now_us());
+}
+
+func variant_compare(left: asp.runtime.Variant, right: asp.runtime.Variant) -> Int {
+    // Dates compare in milliseconds, numeric-compatible pairs numerically, and
+    // all remaining values by their output strings. Null handling belongs to
+    // the caller because VBScript comparisons involving Null return Null.
+    if left.kind == asp.runtime.VariantDate || right.kind == asp.runtime.VariantDate {
+        let left_millis: Int = left.kind == asp.runtime.VariantDate
+            ? left.date_value
+            : (left.kind == asp.runtime.VariantString ? eg_vbs_parse_date(left.string_value) : ((variant_to_float64(left) - 25569.0) * 86400000.0) => Int);
+        let right_millis: Int = right.kind == asp.runtime.VariantDate
+            ? right.date_value
+            : (right.kind == asp.runtime.VariantString ? eg_vbs_parse_date(right.string_value) : ((variant_to_float64(right) - 25569.0) * 86400000.0) => Int);
+        if left_millis < right_millis {
+            return -1;
+        }
+        if left_millis > right_millis {
+            return 1;
+        }
+        return 0;
+    }
+    if (left.kind == asp.runtime.VariantEmpty || left.kind == asp.runtime.VariantInt || left.kind == asp.runtime.VariantBool || left.kind == asp.runtime.VariantFloat || left.kind == asp.runtime.VariantString || left.kind == asp.runtime.VariantDate)
+    && (right.kind == asp.runtime.VariantEmpty || right.kind == asp.runtime.VariantInt || right.kind == asp.runtime.VariantBool || right.kind == asp.runtime.VariantFloat || right.kind == asp.runtime.VariantString || right.kind == asp.runtime.VariantDate) {
+        if left.kind == asp.runtime.VariantFloat || right.kind == asp.runtime.VariantFloat || left.kind == asp.runtime.VariantDate || right.kind == asp.runtime.VariantDate {
+            let af: Float64 = variant_to_float64(left);
+            let bf: Float64 = variant_to_float64(right);
+            if af < bf {
+                return -1;
+            }
+            if af > bf {
+                return 1;
+            }
+            return 0;
+        }
+        let a: Int = variant_to_int(left);
+        let b: Int = variant_to_int(right);
+        if a < b {
+            return -1;
+        }
+        if a > b {
+            return 1;
+        }
+        if left.kind != asp.runtime.VariantString && right.kind != asp.runtime.VariantString {
+            return 0;
+        }
+    }
+    let sa: String = left.to_output_string();
+    let sb: String = right.to_output_string();
+    let i: Int = 0;
+    let limit: Int = std.len(sa) < std.len(sb) ? std.len(sa) : std.len(sb);
+    loop i < limit {
+        let a: Int = std.byte_at(sa, i);
+        let b: Int = std.byte_at(sb, i);
+        if a < b {
+            return -1;
+        }
+        if a > b {
+            return 1;
+        }
+        i += 1;
+    }
+    if std.len(sa) < std.len(sb) {
+        return -1;
+    }
+    if std.len(sa) > std.len(sb) {
+        return 1;
+    }
+    return 0;
+}
+
+func variant_is(left: asp.runtime.Variant, right: asp.runtime.Variant) -> Bool {
+    if left.kind == asp.runtime.VariantNothing || right.kind == asp.runtime.VariantNothing {
+        return left.kind == asp.runtime.VariantNothing && right.kind == asp.runtime.VariantNothing;
+    }
+    return left.kind == asp.runtime.VariantObject
+    && right.kind == asp.runtime.VariantObject
+    && left.object_value == right.object_value;
+}
+
+func variant_numeric_apply_into(result: asp.runtime.Variant, op: Int, left: asp.runtime.Variant, right: asp.runtime.Variant) -> Void {
+    // Write into a caller-provided Variant to reduce temporary allocation in
+    // hot bytecode arithmetic. Operation ids are shared with vm_bytecode.eg.
+    if op == 0 {
+        if left.kind == asp.runtime.VariantFloat {
+            result.kind = asp.runtime.VariantFloat;
+            result.float_value = 0.0 - variant_to_float64(left);
+            return;
+        }
+        result.kind = asp.runtime.VariantInt;
+        result.int_value = 0 - variant_to_int(left);
+        return;
+    }
+    if op == 1 && left.kind == asp.runtime.VariantString && right.kind == asp.runtime.VariantString {
+        result.kind = asp.runtime.VariantString;
+        result.string_value = left.string_value + right.string_value;
+        return;
+    }
+    if op == 2 && left.kind == asp.runtime.VariantDate && right.kind == asp.runtime.VariantDate {
+        result.kind = asp.runtime.VariantFloat;
+        result.float_value = ((left.date_value - right.date_value) => Float64) / 86400000.0;
+        return;
+    }
+    if (op == 1 || op == 2) && left.kind == asp.runtime.VariantDate && right.kind != asp.runtime.VariantDate {
+        result.kind = asp.runtime.VariantDate;
+        let delta: Float64 = variant_to_float64(right) * 86400000.0;
+        result.date_value = left.date_value + (op == 1 ? delta => Int : (0.0 - delta) => Int);
+        return;
+    }
+    if op == 1 && right.kind == asp.runtime.VariantDate && left.kind != asp.runtime.VariantDate {
+        result.kind = asp.runtime.VariantDate;
+        result.date_value = right.date_value + (variant_to_float64(left) * 86400000.0) => Int;
+        return;
+    }
+    if left.kind == asp.runtime.VariantFloat || right.kind == asp.runtime.VariantFloat {
+        result.kind = asp.runtime.VariantFloat;
+        if op == 1 {
+            result.float_value = variant_to_float64(left) + variant_to_float64(right);
+        } else if op == 2 {
+            result.float_value = variant_to_float64(left) - variant_to_float64(right);
+        } else {
+            result.float_value = variant_to_float64(left) * variant_to_float64(right);
+        }
+        return;
+    }
+    result.kind = asp.runtime.VariantInt;
+    if op == 1 {
+        result.int_value = variant_to_int(left) + variant_to_int(right);
+    } else if op == 2 {
+        result.int_value = variant_to_int(left) - variant_to_int(right);
+    } else {
+        result.int_value = variant_to_int(left) * variant_to_int(right);
+    }
+}
+
+func variant_power(left: asp.runtime.Variant, right: asp.runtime.Variant) -> asp.runtime.Variant {
+    let base: Float64 = variant_to_float64(left);
+    let exponent: Float64 = variant_to_float64(right);
+    let integer_exponent: Int = exponent => Int;
+    if exponent != (integer_exponent => Float64) {
+        return asp.runtime.variant_float(math.pow(base, exponent));
+    }
+    let negative: Bool = integer_exponent < 0;
+    let remaining: Int = negative ? 0 - integer_exponent : integer_exponent;
+    let factor: Float64 = base;
+    let value: Float64 = 1.0;
+    loop remaining > 0 {
+        if remaining % 2 != 0 {
+            value = value * factor;
+        }
+        factor = factor * factor;
+        remaining = remaining / 2;
+    }
+    return asp.runtime.variant_float(negative ? 1.0 / value : value);
+}
+
+func split_member_name(name: String) -> collections.Vector<String> {
+    // Split only on the first member boundary at each iteration. VBScript
+    // identifiers themselves cannot contain dots, so no quoting state is needed.
+    let parts: collections.Vector<String> = new collections.Vector<String>();
+    let dot: Int = strings.find_substr(name, ".");
+    if dot < 0 {
+        _ = parts.push(name);
+        return parts;
+    }
+    _ = parts.push(std.substr(name, 0, dot));
+    _ = parts.push(std.substr(name, dot + 1, std.len(name) - dot - 1));
+    return parts;
+}
+
+func member_name_dot(name: String) -> Int {
+    return strings.find_substr(name, ".");
+}
+
+func member_name_left(name: String, dot: Int) -> String {
+    return dot < 0 ? name : std.substr(name, 0, dot);
+}
+
+func member_name_right(name: String, dot: Int) -> String {
+    return dot < 0 ? "" : std.substr(name, dot + 1, std.len(name) - dot - 1);
+}
+
+func shell_quote_arg(s: String) -> String {
+    // Produce one POSIX shell word. This is retained for compatibility helpers;
+    // process execution should prefer argv-based native APIs where available.
+    return "'" + strings.replace_all(s, "'", "'\"'\"'") + "'";
+}
+
+func json_escape_string(s: String) -> String {
+    let out: String = strings.replace_all(s, "\\", "\\\\");
+    out = strings.replace_all(out, "\"", "\\\"");
+    out = strings.replace_all(out, "\n", "\\n");
+    out = strings.replace_all(out, "\r", "\\r");
+    return out;
+}
+
+func access_cache_key(db_path: String, sql: String) -> String {
+    // Cache identity includes the canonical database path and exact SQL text.
+    // SQL normalization is avoided because Jet syntax and string literals make
+    // textual rewriting unsafe without a complete parser.
+    return "v4\n" + db_path + "\n" + strings.trim_space(sql);
+}
+
+func access_sql_is_cacheable(sql: String) -> Bool {
+    // Only read-only SELECT statements enter either cache. DML and DDL always
+    // reach the native driver and invalidate database-scoped entries.
+    let trimmed: String = strings.trim_space(sql);
+    return strings.starts_with(strings.to_lower_ascii(trimmed), "select ");
+}
+
+func access_sql_is_disk_cacheable(sql: String) -> Bool {
+    if !access_sql_is_cacheable(sql) {
+        return false;
+    }
+    let lc: String = strings.to_lower_ascii(strings.trim_space(sql));
+    return strings.find_substr(lc, "rnd(") < 0;
+}
+
+func access_inf_table_cache_key(db_path: String) -> String {
+    return db_path + "\n__inf_table__";
+}
+
+func access_inf_lookup_key(sql: String) -> String {
+    let trimmed: String = strings.trim_space(sql);
+    let lc: String = strings.to_lower_ascii(trimmed);
+    let prefix: String = "select * from [inf] where [key]='";
+    if !strings.starts_with(lc, prefix) {
+        return "";
+    }
+    let start: Int = std.len(prefix);
+    let end_at: Int = strings.find_substr_from(trimmed, "'", start);
+    if end_at <= start {
+        return "";
+    }
+    return std.substr(trimmed, start, end_at - start);
+}
+
+func access_update_inf_key(sql: String) -> String {
+    let trimmed: String = strings.trim_space(sql);
+    let lc: String = strings.to_lower_ascii(trimmed);
+    let prefix: String = "update [inf] set ";
+    if !strings.starts_with(lc, prefix) && !strings.starts_with(lc, "update inf set ") {
+        return "";
+    }
+    let where_at: Int = strings.find_substr(lc, " where ");
+    if where_at < 0 {
+        return "";
+    }
+    let where_clause: String = strings.trim_space(std.substr(trimmed, where_at + 7, std.len(trimmed) - where_at - 7));
+    let where_lc: String = strings.to_lower_ascii(where_clause);
+    let key_prefix: String = "[key]=";
+    if !strings.starts_with(where_lc, key_prefix) && !strings.starts_with(where_lc, "key=") {
+        return "";
+    }
+    let eq_at: Int = strings.find_substr(where_clause, "=");
+    if eq_at < 0 {
+        return "";
+    }
+    let raw_value: String = strings.trim_space(std.substr(where_clause, eq_at + 1, std.len(where_clause) - eq_at - 1));
+    if std.len(raw_value) >= 2 && std.byte_at(raw_value, 0) == '\'' && std.byte_at(raw_value, std.len(raw_value) - 1) == '\'' {
+        return strings.replace_all(std.substr(raw_value, 1, std.len(raw_value) - 2), "''", "'");
+    }
+    return raw_value;
+}
+
+func access_find_update_assignment(sql: String, field_name: String) -> String {
+    let trimmed: String = strings.trim_space(sql);
+    let lc: String = strings.to_lower_ascii(trimmed);
+    let set_at: Int = strings.find_substr(lc, " set ");
+    let where_at: Int = strings.find_substr(lc, " where ");
+    if set_at < 0 {
+        return "";
+    }
+    let end_at: Int = where_at >= 0 ? where_at : std.len(trimmed);
+    let set_clause: String = std.substr(trimmed, set_at + 5, end_at - set_at - 5);
+    let parts: collections.Vector<String> = new collections.Vector<String>();
+    let start: Int = 0;
+    let i: Int = 0;
+    let in_quote: Bool = false;
+    loop i < std.len(set_clause) {
+        let ch: Int = std.byte_at(set_clause, i);
+        if ch == '\'' {
+            if in_quote && i + 1 < std.len(set_clause) && std.byte_at(set_clause, i + 1) == '\'' {
+                i += 2;
+                skip;
+            }
+            in_quote = !in_quote;
+            i += 1;
+            skip;
+        }
+        if ch == ',' && !in_quote {
+            _ = parts.push(strings.trim_space(std.substr(set_clause, start, i - start)));
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if start < std.len(set_clause) {
+        _ = parts.push(strings.trim_space(std.substr(set_clause, start, std.len(set_clause) - start)));
+    }
+    i = 0;
+    loop i < parts.len() {
+        let part: String = parts.get(i);
+        let eq_at: Int = strings.find_substr(part, "=");
+        if eq_at > 0 {
+            let name: String = strings.to_lower_ascii(strings.trim_space(std.substr(part, 0, eq_at)));
+            let rhs: String = strings.trim_space(std.substr(part, eq_at + 1, std.len(part) - eq_at - 1));
+            if name == strings.to_lower_ascii(field_name) || name == "[" + strings.to_lower_ascii(field_name) + "]" {
+                if std.len(rhs) >= 2 && std.byte_at(rhs, 0) == '\'' && std.byte_at(rhs, std.len(rhs) - 1) == '\'' {
+                    return strings.replace_all(std.substr(rhs, 1, std.len(rhs) - 2), "''", "'");
+                }
+                return rhs;
+            }
+        }
+        i += 1;
+    }
+    return "";
+}
+
+func access_apply_inf_update(output: String, sql: String) -> String, ErrCode {
+    // Apply the narrow Inf-table UPDATE shape directly to cached tabular data.
+    // Returning ERR_INVALID forces invalidation when parsing is ambiguous.
+    let target_key: String = access_update_inf_key(sql);
+    if std.len(target_key) == 0 {
+        return output, ERR_NOT_FOUND;
+    }
+    let next_value: String = asp.object.database.mdb_engine_clean_cell(access_find_update_assignment(sql, "Value"));
+    let next_id: String = access_find_update_assignment(sql, "id");
+    let lines: collections.Vector<String> = strings.split(output, "\n");
+    if lines.len() == 0 {
+        return output, ERR_NOT_FOUND;
+    }
+    let headers: collections.Vector<String> = strings.split(lines.get(0), "\t");
+    let key_index: Int = -1;
+    let value_index: Int = -1;
+    let id_index: Int = -1;
+    let i: Int = 0;
+    loop i < headers.len() {
+        let name: String = strings.to_lower_ascii(headers.get(i));
+        if name == "key" {
+            key_index = i;
+        } else if name == "value" {
+            value_index = i;
+        } else if name == "id" {
+            id_index = i;
+        }
+        i += 1;
+    }
+    if key_index < 0 {
+        return output, ERR_NOT_FOUND;
+    }
+    let builder: String = lines.get(0) + "\n";
+    let changed: Bool = false;
+    i = 1;
+    loop i < lines.len() {
+        let line: String = lines.get(i);
+        if std.len(line) == 0 {
+            i += 1;
+            skip;
+        }
+        let cols: collections.Vector<String> = strings.split(line, "\t");
+        if key_index < cols.len() && cols.get(key_index) == target_key {
+            if value_index >= 0 {
+                loop cols.len() <= value_index {
+                    _ = cols.push("");
+                }
+                _ = cols.set(value_index, next_value);
+            }
+            if std.len(next_id) != 0 && id_index >= 0 {
+                loop cols.len() <= id_index {
+                    _ = cols.push("");
+                }
+                _ = cols.set(id_index, next_id);
+            }
+            changed = true;
+        }
+        let j: Int = 0;
+        loop j < cols.len() {
+            if j > 0 {
+                builder += "\t";
+            }
+            builder += cols.get(j);
+            j += 1;
+        }
+        builder += "\n";
+        i += 1;
+    }
+    return builder, changed ? OK : ERR_NOT_FOUND;
+}
+
+func invalidate_access_query_cache(ctx: asp.runtime.RequestContext, db_path: String) -> Void {
+    _ = db_path;
+    ctx.access_query_cache = new collections.Map<String, String>();
+}
+
+func access_disk_cache_file(root_dir: String, db_path: String, sql: String) -> String {
+    let paths: asp.runtime.PersistencePaths = new asp.runtime.PersistencePaths(root_dir);
+    paths.ensure_dirs();
+    return path.join_path(paths.cache_dir, "access-" + asp.runtime.hex_encode(db_path + "\n" + strings.trim_space(sql)) + ".cache");
+}
+
+func access_disk_cache_payload_valid(text: String) -> Bool {
+    let i: Int = 0;
+    loop i < std.len(text) {
+        let ch: Int = std.byte_at(text, i);
+        if ch == '\0' || ch == '\xFF' || ch == '\xFE' {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+func access_disk_cache_read(root_dir: String, db_path: String, sql: String) -> String, ErrCode {
+    // Disk entries are accepted only when their recorded database metadata and
+    // payload framing match. Stale or malformed files are ordinary cache misses.
+    if !access_sql_is_disk_cacheable(sql) {
+        return "", ERR_NOT_FOUND;
+    }
+    let db_mtime: Int = 0;
+    let db_mtime_err: ErrCode = OK;
+    db_mtime, db_mtime_err = fs.stat_mtime(db_path);
+    if db_mtime_err != OK {
+        return "", db_mtime_err;
+    }
+    let cache_file: String = access_disk_cache_file(root_dir, db_path, sql);
+    let text: String = "";
+    let read_err: ErrCode = OK;
+    text, read_err = asp.compiler.read_text_chunked(cache_file);
+    if read_err != OK {
+        return "", read_err;
+    }
+    let nl1: Int = strings.find_substr(text, "\n");
+    if nl1 <= 0 {
+        return "", ERR_INVALID;
+    }
+    let nl2_rel: Int = strings.find_substr(std.substr(text, nl1 + 1, std.len(text) - nl1 - 1), "\n");
+    if nl2_rel <= 0 {
+        return "", ERR_INVALID;
+    }
+    let nl2: Int = nl1 + 1 + nl2_rel;
+    if std.substr(text, 0, nl1) != "v4" {
+        return "", ERR_INVALID;
+    }
+    if strconv.atoi(std.substr(text, nl1 + 1, nl2 - nl1 - 1)) != db_mtime {
+        return "", ERR_INVALID;
+    }
+    let payload: String = std.substr(text, nl2 + 1, std.len(text) - nl2 - 1);
+    return access_disk_cache_payload_valid(payload) ? payload : "", access_disk_cache_payload_valid(payload) ? OK : ERR_INVALID;
+}
+
+func access_disk_cache_write(root_dir: String, db_path: String, sql: String, output: String) -> Void {
+    // Best-effort cache population must never change query success. The
+    // persistence helper uses replacement semantics to avoid torn readers.
+    if !access_sql_is_disk_cacheable(sql) {
+        return;
+    }
+    let db_mtime: Int = 0;
+    let db_mtime_err: ErrCode = OK;
+    db_mtime, db_mtime_err = fs.stat_mtime(db_path);
+    if db_mtime_err != OK {
+        return;
+    }
+    let cache_file: String = access_disk_cache_file(root_dir, db_path, sql);
+    let _, _ = asp.compiler.write_text_chunked(cache_file, "v4\n" + strconv.itoa(db_mtime) + "\n" + output);
+}
+
+func server_map_path_for_request(engine: AspEngine, ctx: asp.runtime.RequestContext, raw_path: String) -> String {
+    // Map virtual paths relative to the application root and physical-looking
+    // paths relative to the current page, then normalize through engine.abs_path.
+    let trimmed: String = strings.trim_space(raw_path);
+    if std.len(trimmed) == 0 {
+        return asp_windows_path(engine.root_dir);
+    }
+    let normalized: String = strings.replace_all(trimmed, "\\", "/");
+    if strings.starts_with(normalized, "/") {
+        return asp_windows_path(path.clean(path.join_path(engine.root_dir, std.substr(normalized, 1, std.len(normalized) - 1))));
+    }
+    return asp_windows_path(path.clean(path.join_path(path.dir(ctx.page_path), normalized)));
+}
+
+func asp_windows_path(file_path: String) -> String {
+    return strings.replace_all(file_path, "/", "\\");
+}
+
+func asp_host_path(file_path: String) -> String {
+    let normalized: String = strings.replace_all(file_path, "\\", "/");
+    let parts: collections.Vector<String> = strings.split(normalized, "/");
+    let resolved: String = strings.starts_with(normalized, "/") ? "/" : ".";
+    let i: Int = 0;
+    loop i < parts.len() {
+        let part: String = parts.get(i);
+        if std.len(part) == 0 || part == "." {
+            i += 1;
+            skip;
+        }
+        if part == ".." {
+            resolved = path.dir(resolved);
+            i += 1;
+            skip;
+        }
+        let candidate: String = path.join_path(resolved, part);
+        let exists, _ = fs.exists(candidate);
+        if exists {
+            resolved = candidate;
+            i += 1;
+            skip;
+        }
+        let entries, read_err = fs.read_dir(resolved);
+        if read_err == OK {
+            let names: collections.Vector<String> = strings.split(entries, "\n");
+            let j: Int = 0;
+            let matched: String = "";
+            loop j < names.len() {
+                if strings.equal_fold_ascii(names.get(j), part) {
+                    matched = names.get(j);
+                    break;
+                }
+                j += 1;
+            }
+            if std.len(matched) != 0 {
+                resolved = path.join_path(resolved, matched);
+                i += 1;
+                skip;
+            }
+        }
+        resolved = candidate;
+        i += 1;
+    }
+    return resolved;
+}
+
+func shell_application_enabled() -> Bool {
+    let value, err = os.getenv("EGRET_ASP_SHELL_ENABLED");
+    return err == OK && strings.equal_fold_ascii(strings.trim_space(value), "on");
+}
+
+func process_component_enabled() -> Bool {
+    let value, err = os.getenv("OPENASP_PROCESS_ENABLED");
+    return err == OK && strings.equal_fold_ascii(strings.trim_space(value), "on");
+}
+
+
+
+
+func parse_connection_string(text: String) -> collections.Map<String, String> {
+    // ADO connection strings are a semicolon-delimited, case-insensitive map.
+    // This compatibility parser intentionally does not interpret provider-
+    // specific quoting beyond trimming surrounding whitespace.
+    let out: collections.Map<String, String> = new collections.Map<String, String>();
+    let parts: collections.Vector<String> = strings.split(text, ";");
+    let i: Int = 0;
+    loop i < parts.len() {
+        let part: String = strings.trim_space(parts.get(i));
+        let eq: Int = strings.find_substr(part, "=");
+        if eq > 0 {
+            let key: String = strings.to_lower_ascii(strings.trim_space(std.substr(part, 0, eq)));
+            let value: String = strings.trim_space(std.substr(part, eq + 1, std.len(part) - eq - 1));
+            _ = out.set(key, value);
+        }
+        i += 1;
+    }
+    return out;
+}
+
+func is_access_data_source(data_source: String) -> Bool {
+    let lc: String = strings.to_lower_ascii(strings.trim_space(data_source));
+    return strings.ends_with(lc, ".mdb") || strings.ends_with(lc, ".accdb");
+}
+
+func host_without_port(host: String) -> String {
+    let clean: String = strings.trim_space(host);
+    let colon: Int = strings.find_substr(clean, ":");
+    if colon > 0 {
+        return std.substr(clean, 0, colon);
+    }
+    return clean;
+}
+
+func host_port_or_default(host: String, fallback: String) -> String {
+    let clean: String = strings.trim_space(host);
+    let colon: Int = strings.find_substr(clean, ":");
+    if colon > 0 && colon + 1 < std.len(clean) {
+        return std.substr(clean, colon + 1, std.len(clean) - colon - 1);
+    }
+    return fallback;
+}

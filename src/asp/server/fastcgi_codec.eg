@@ -1,0 +1,173 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.server;
+
+use std;
+use aio.tcp;
+use protocol.fastcgi;
+use collections;
+
+// Stateless FastCGI record codec. TCP is a byte stream, so all fixed-size
+// protocol structures use recv_exact/send_all loops and never assume one socket
+// operation corresponds to one record.
+class FastcgiCodec {
+    func init(self: FastcgiCodec) -> Void {
+    }
+
+    async func recv_exact(self: FastcgiCodec, fd: Int, n: Int, timeout_ms: Int) -> String, ErrCode {
+        let out: String = "";
+        loop std.len(out) < n {
+            let chunk: String = await aio.tcp.recv(fd, n - std.len(out), timeout_ms)?;
+            if std.len(chunk) == 0 {
+                return out, ERR_EOF;
+            }
+            out += chunk;
+        }
+        return out, OK;
+    }
+
+    async func send_all(self: FastcgiCodec, fd: Int, data: String, timeout_ms: Int) -> Int, ErrCode {
+        let off: Int = 0;
+        loop off < std.len(data) {
+            let n: Int = await aio.tcp.send(fd, std.substr(data, off, std.len(data) - off), timeout_ms)?;
+            if n <= 0 {
+                return off, ERR_IO;
+            }
+            off += n;
+        }
+        return off, OK;
+    }
+
+    // Splits content at the protocol's maximum record payload. The StringView
+    // variant passes `owner` through async I/O to keep borrowed bytes alive.
+    async func send_record_chunks(self: FastcgiCodec, fd: Int, record_type: Int, request_id: Int, content: String, timeout_ms: Int) -> Int, ErrCode {
+        let off: Int = 0;
+        let sent: Int = 0;
+        loop off < std.len(content) {
+            let take: Int = protocol.fastcgi.chunk_len(std.len(content), off);
+            let record: String = protocol.fastcgi.make_record(record_type, request_id, std.substr(content, off, take));
+            let n: Int = await self.send_all(fd, record, timeout_ms)?;
+            sent += n;
+            off += take;
+        }
+        return sent, OK;
+    }
+
+    async func send_record_view_chunks(self: FastcgiCodec, fd: Int, record_type: Int, request_id: Int, content: std.StringView, owner: Any, timeout_ms: Int) -> Int, ErrCode {
+        let off: Int = 0;
+        let sent: Int = 0;
+        loop off < content.len() {
+            let take: Int = protocol.fastcgi.chunk_len(content.len(), off);
+            let header: String = protocol.fastcgi.make_record_header(record_type, request_id, take);
+            let header_sent: Int = await self.send_all(fd, header, timeout_ms)?;
+            let body_sent: Int = await aio.tcp.send_view(fd, content.slice(off, take), owner, timeout_ms)?;
+            sent += header_sent + body_sent;
+            off += take;
+        }
+        return sent, OK;
+    }
+
+    // Decodes FastCGI name/value lengths. Truncated four-byte lengths advance
+    // minimally and leave validation to decode_params, which stops safely.
+    func decode_len(self: FastcgiCodec, s: String, off: Int) -> FastcgiLenDecode {
+        let out: FastcgiLenDecode = new FastcgiLenDecode();
+        if off >= std.len(s) {
+            out.next_off = off;
+            return out;
+        }
+        let b: Int = protocol.fastcgi.byte_at(s, off);
+        if (b & 128) == 0 {
+            out.value = b;
+            out.next_off = off + 1;
+            return out;
+        }
+        if off + 4 > std.len(s) {
+            out.next_off = off + 1;
+            return out;
+        }
+        out.value = ((b & 127) << 24)
+        | (protocol.fastcgi.byte_at(s, off + 1) << 16)
+        | (protocol.fastcgi.byte_at(s, off + 2) << 8)
+        | protocol.fastcgi.byte_at(s, off + 3);
+        out.next_off = off + 4;
+        return out;
+    }
+
+    func decode_params(self: FastcgiCodec, encoded: String) -> collections.Map<String, String> {
+        let out: collections.Map<String, String> = new collections.Map<String, String>();
+        let off: Int = 0;
+        loop off < std.len(encoded) {
+            let name_dec: FastcgiLenDecode = self.decode_len(encoded, off);
+            let value_dec: FastcgiLenDecode = self.decode_len(encoded, name_dec.next_off);
+            if value_dec.next_off + name_dec.value + value_dec.value > std.len(encoded) {
+                break;
+            }
+            let name: String = std.substr(encoded, value_dec.next_off, name_dec.value);
+            let value: String = std.substr(encoded, value_dec.next_off + name_dec.value, value_dec.value);
+            _ = out.set(name, value);
+            off = value_dec.next_off + name_dec.value + value_dec.value;
+        }
+        return out;
+    }
+
+    // Reassembles BEGIN_REQUEST, PARAMS, and STDIN records for one request ID.
+    // Unsupported multiplexing or malformed framing returns ERR_INVALID.
+    async func read_request(self: FastcgiCodec, fd: Int, timeout_ms: Int) -> FastcgiInboundRequest, ErrCode {
+        let req: FastcgiInboundRequest = new FastcgiInboundRequest();
+        let encoded_params: String = "";
+        let saw_begin: Bool = false;
+        loop true {
+            let header: String = await self.recv_exact(fd, 8, timeout_ms)?;
+            if std.len(header) != 8 {
+                return req, ERR_EOF;
+            }
+            if protocol.fastcgi.byte_at(header, 0) != protocol.fastcgi.version_1() {
+                return req, ERR_INVALID;
+            }
+            let typ: Int = protocol.fastcgi.byte_at(header, 1);
+            let rid: Int = protocol.fastcgi.read_u16_be(header, 2);
+            let content_len: Int = protocol.fastcgi.read_u16_be(header, 4);
+            let padding_len: Int = protocol.fastcgi.byte_at(header, 6);
+            let content: String = "";
+            if content_len > 0 {
+                content = await self.recv_exact(fd, content_len, timeout_ms)?;
+            }
+            if padding_len > 0 {
+                let _, pad_err = await self.recv_exact(fd, padding_len, timeout_ms);
+                if pad_err != OK {
+                    return req, pad_err;
+                }
+            }
+            if typ == protocol.fastcgi.begin_request_type() {
+                saw_begin = true;
+                req.request_id = rid;
+                if std.len(content) >= 3 {
+                    req.keep_conn = (protocol.fastcgi.byte_at(content, 2) & 1) != 0;
+                }
+            } else if typ == protocol.fastcgi.params_type() && rid == req.request_id {
+                if content_len != 0 {
+                    encoded_params += content;
+                }
+            } else if typ == protocol.fastcgi.stdin_type() && rid == req.request_id {
+                if content_len == 0 {
+                    req.params = self.decode_params(encoded_params);
+                    return req, saw_begin ? OK : ERR_INVALID;
+                }
+                req.stdin_data += content;
+            } else if typ == protocol.fastcgi.abort_request_type() && rid == req.request_id {
+                return req, ERR_IO;
+            }
+        }
+        return req, ERR_INVALID;
+    }
+
+    func end_request_record(self: FastcgiCodec, request_id: Int) -> String {
+        let content: String = protocol.fastcgi.u32_be(0)
+        + protocol.fastcgi.byte(protocol.fastcgi.request_complete())
+        + protocol.fastcgi.byte(0)
+        + protocol.fastcgi.byte(0)
+        + protocol.fastcgi.byte(0);
+        return protocol.fastcgi.make_record(protocol.fastcgi.end_request_type(), request_id, content);
+    }
+}

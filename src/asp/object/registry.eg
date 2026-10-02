@@ -1,0 +1,138 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.object;
+
+use std;
+use strings;
+
+enum ComponentKind {
+    ComponentUnknown,
+    ComponentDictionary,
+    ComponentAdoConnection,
+    ComponentAdoRecordset,
+    ComponentAdoCommand,
+    ComponentAdoStream,
+    ComponentFileSystemObject,
+    ComponentRegExp,
+    ComponentDomDocument,
+    ComponentServerXmlHttp,
+    ComponentXmlHttp,
+    ComponentTextStream,
+    ComponentFile,
+    ComponentFolder,
+    ComponentFileCollection,
+    ComponentFolderCollection,
+    ComponentMatch,
+    ComponentMatchCollection,
+    ComponentXmlNode,
+    ComponentXmlNodeList,
+    ComponentParseError,
+    ComponentAdoParameters,
+    ComponentAdoParameter,
+    ComponentRedis,
+    ComponentSocket,
+    ComponentShellApplication,
+    ComponentSubMatches,
+    ComponentProcess,
+    ComponentJson,
+    ComponentHttpClient,
+    ComponentCrypto,
+    ComponentOpenAI,
+    ComponentWebSocket,
+    ComponentMemcache,
+    ComponentJsonObject,
+}
+
+// Canonical metadata for one supported COM-compatible ProgID. Runtime objects
+// cache kind to avoid repeated string resolution; default_member implements the
+// invocation semantics used when VBScript omits a member name.
+class ComponentDescriptor {
+    var kind: ComponentKind;
+    var prog_id: String;
+    var default_member: String;
+
+    func init(self: ComponentDescriptor, kind: ComponentKind = ComponentUnknown, prog_id: String = "", default_member: String = "") -> Void {
+        self.kind = kind;
+        self.prog_id = prog_id;
+        self.default_member = default_member;
+    }
+}
+
+func descriptor(kind: ComponentKind, prog_id: String, default_member: String = "") -> ComponentDescriptor {
+    return new ComponentDescriptor(kind, prog_id, default_member);
+}
+
+// Resolve aliases case-insensitively while returning canonical names. Unknown
+// providers stay explicit so CreateObject can raise error 429.
+func resolve(prog_id: String) -> ComponentDescriptor {
+    let name: String = strings.to_lower_ascii(strings.trim_space(prog_id));
+    if name == "scripting.dictionary" {
+        return descriptor(ComponentDictionary, "Scripting.Dictionary", "Item");
+    }
+    if name == "adodb.connection" {
+        return descriptor(ComponentAdoConnection, "ADODB.Connection");
+    }
+    if name == "adodb.recordset" {
+        return descriptor(ComponentAdoRecordset, "ADODB.Recordset", "Fields");
+    }
+    if name == "adodb.command" {
+        return descriptor(ComponentAdoCommand, "ADODB.Command");
+    }
+    if name == "adodb.stream" {
+        return descriptor(ComponentAdoStream, "ADODB.Stream");
+    }
+    if name == "scripting.filesystemobject" {
+        return descriptor(ComponentFileSystemObject, "Scripting.FileSystemObject");
+    }
+    if name == "vbscript.regexp" {
+        return descriptor(ComponentRegExp, "VBScript.RegExp");
+    }
+    if name == "msxml2.domdocument" || name == "msxml2.domdocument.3.0" || name == "msxml2.domdocument.6.0" || name == "microsoft.xmldom" {
+        return descriptor(ComponentDomDocument, "MSXML2.DOMDocument");
+    }
+    if name == "msxml2.serverxmlhttp" || name == "msxml2.serverxmlhttp.3.0" || name == "msxml2.serverxmlhttp.6.0" {
+        return descriptor(ComponentServerXmlHttp, "MSXML2.ServerXMLHTTP");
+    }
+    if name == "msxml2.xmlhttp" || name == "msxml2.xmlhttp.3.0" || name == "msxml2.xmlhttp.6.0" || name == "microsoft.xmlhttp" {
+        return descriptor(ComponentXmlHttp, "MSXML2.XMLHTTP");
+    }
+    if name == "openasp.redis" || name == "redis.client" {
+        return descriptor(ComponentRedis, "OpenASP.Redis");
+    }
+    if name == "openasp.socket" {
+        return descriptor(ComponentSocket, "OpenASP.Socket");
+    }
+    if name == "shell.application" {
+        return descriptor(ComponentShellApplication, "Shell.Application");
+    }
+    if name == "openasp.process" {
+        return descriptor(ComponentProcess, "OpenASP.Process");
+    }
+    if name == "openasp.json" {
+        return descriptor(ComponentJson, "OpenASP.JSON");
+    }
+    if name == "openasp.httpclient" {
+        return descriptor(ComponentHttpClient, "OpenASP.HttpClient");
+    }
+    if name == "openasp.crypto" {
+        return descriptor(ComponentCrypto, "OpenASP.Crypto");
+    }
+    if name == "openasp.openai" {
+        return descriptor(ComponentOpenAI, "OpenASP.OpenAI");
+    }
+    if name == "openasp.websocket" {
+        return descriptor(ComponentWebSocket, "OpenASP.WebSocket");
+    }
+    if name == "openasp.memcache" || name == "openasp.memcached" {
+        return descriptor(ComponentMemcache, "OpenASP.Memcache");
+    }
+    if name == "openasp.json.object" {
+        return descriptor(ComponentJsonObject, "OpenASP.JSON.Object", "Item");
+    }
+    return new ComponentDescriptor();
+}
+
+func is_registered(prog_id: String) -> Bool {
+    return resolve(prog_id).kind != ComponentUnknown;
+}

@@ -1,0 +1,42 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.object;
+
+use asp;
+use asp.runtime;
+
+use collections;
+use std;
+use strings;
+
+extern func eg_shell_execute(file_name: String, arguments: String, directory: String) -> String;
+
+// Shell.Application is intentionally a narrow compatibility adapter. Permission
+// is checked on every call, including objects restored from persistent stores;
+// the native wrapper uses argv execution and reports startup errors as text.
+func invoke_shell_application(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    if is_set || !strings.equal_fold_ascii(member, "ShellExecute") {
+        evaluator.raise_runtime_error(ctx, 438, "Shell.Application member not supported: " + member, "Shell.Application");
+        return asp.runtime.variant_empty();
+    }
+    if values.len() < 1 || std.len(strings.trim_space(values.get(0).to_output_string())) == 0 {
+        evaluator.raise_runtime_error(ctx, 5, "ShellExecute requires a non-empty executable path", "Shell.Application");
+        return asp.runtime.variant_empty();
+    }
+    let operation: String = values.len() >= 4 ? strings.trim_space(values.get(3).to_output_string()) : "";
+    if std.len(operation) != 0 && !strings.equal_fold_ascii(operation, "open") {
+        evaluator.raise_runtime_error(ctx, 5, "ShellExecute only supports the open operation; received: " + operation, "Shell.Application");
+        return asp.runtime.variant_empty();
+    }
+    let file_name: String = asp.asp_host_path(values.get(0).to_output_string());
+    let arguments: String = values.len() >= 2 ? values.get(1).to_output_string() : "";
+    let directory: String = values.len() >= 3 && std.len(strings.trim_space(values.get(2).to_output_string())) != 0
+        ? asp.asp_host_path(values.get(2).to_output_string())
+        : "";
+    let error_text: String = eg_shell_execute(file_name, arguments, directory);
+    if std.len(error_text) != 0 {
+        evaluator.raise_runtime_error(ctx, 5, "ShellExecute failed: " + error_text, "Shell.Application");
+    }
+    return asp.runtime.variant_empty();
+}

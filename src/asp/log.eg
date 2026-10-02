@@ -1,0 +1,191 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp;
+
+use fs;
+use os.process;
+use std;
+use strconv;
+use strings;
+use time;
+
+// Process-local daily logger shared by all OpenASP command surfaces.
+// command/base_path/level are immutable configuration; daily_path/handle track
+// the currently open rotation target; access_buffer batches only request lines.
+// Runtime diagnostics bypass that buffer so a crash does not hide the cause.
+class OpenAspLogger {
+    var command: String;
+    var base_path: String;
+    var level: String;
+    var daily_path: String;
+    var handle: Int;
+    var access_buffer: String;
+    var access_buffer_second: Int;
+
+    func init(self: OpenAspLogger, command: String, base_path: String, level: String) -> Void {
+        self.command = command;
+        self.base_path = strings.trim_space(base_path);
+        self.level = strings.to_lower_ascii(strings.trim_space(level));
+        self.daily_path = "";
+        self.handle = 0;
+        self.access_buffer = "";
+        self.access_buffer_second = 0;
+    }
+
+    func deinit(self: OpenAspLogger) -> Void {
+        self.close();
+    }
+
+    func level_value(self: OpenAspLogger, level: String) -> Int {
+        return match strings.to_lower_ascii(level) {
+            "info" => 1,
+            "notice" => 2,
+            "warn" => 3,
+            "error" => 4,
+            "off" => 100,
+            _ => 4,
+        };
+    }
+
+    func enabled(self: OpenAspLogger, level: String) -> Bool {
+        return std.len(self.base_path) != 0
+            && self.base_path != "off"
+            && self.level_value(level) >= self.level_value(self.level);
+    }
+
+    func parent_dir(self: OpenAspLogger, file_path: String) -> String {
+        let slash: Int = strings.last_index(file_path, "/");
+        if slash <= 0 {
+            return "";
+        }
+        return std.substr(file_path, 0, slash);
+    }
+
+    func dated_path(self: OpenAspLogger) -> String {
+        let suffix, suffix_err = time.date("%Y%m%d");
+        if suffix_err != OK {
+            return self.base_path;
+        }
+        return self.base_path + "-" + suffix;
+    }
+
+    // Lazily rotate when the date-derived path changes. Returning zero disables
+    // the write without turning a logging failure into an application failure.
+    func open_current(self: OpenAspLogger) -> Int {
+        if std.len(self.base_path) == 0 || self.base_path == "off" {
+            return 0;
+        }
+        let current_path: String = self.dated_path();
+        if self.handle > 0 && self.daily_path == current_path {
+            return self.handle;
+        }
+        self.close_handle();
+        let dir: String = self.parent_dir(current_path);
+        if std.len(dir) != 0 {
+            let _, _ = fs.mkdir_all(dir);
+        }
+        let h, open_err = fs.open(current_path, fs.flag_write() + fs.flag_create() + fs.flag_append(), 420);
+        if open_err != OK {
+            return 0;
+        }
+        self.daily_path = current_path;
+        self.handle = h;
+        return h;
+    }
+
+    func close_handle(self: OpenAspLogger) -> Void {
+        if self.handle > 0 {
+            _ = fs.close(self.handle);
+        }
+        self.daily_path = "";
+        self.handle = 0;
+    }
+
+    // Keep each event on one physical line so user-controlled messages cannot
+    // forge timestamps or levels in line-oriented log consumers.
+    func sanitize(self: OpenAspLogger, text: String) -> String {
+        return strings.replace_all(strings.replace_all(text, "\r", "\\r"), "\n", "\\n");
+    }
+
+    func format_line(self: OpenAspLogger, level: String, message: String) -> String {
+        let timestamp, timestamp_err = time.date("%Y/%m/%d %H:%M:%S");
+        let ts: String = timestamp_err == OK ? timestamp : "0000/00/00 00:00:00";
+        return ts
+            + " [" + strings.to_lower_ascii(level) + "] "
+            + strconv.itoa(os.process.pid()) + ": "
+            + self.command + " "
+            + self.sanitize(message);
+    }
+
+    // Flush is idempotent and always drops the in-memory batch, even if opening
+    // the log failed; otherwise an unavailable disk could grow memory forever.
+    func flush(self: OpenAspLogger) -> Void {
+        if std.len(self.access_buffer) != 0 {
+            let h: Int = self.open_current();
+            if h > 0 {
+                let _, _ = fs.write_raw(h, self.access_buffer);
+            }
+        }
+        self.access_buffer = "";
+        self.access_buffer_second = 0;
+    }
+
+    // Runtime events are flushed immediately so startup and failure details
+    // survive abrupt process termination.
+    func write(self: OpenAspLogger, level: String, message: String) -> Void {
+        if !self.enabled(level) {
+            return;
+        }
+        self.flush();
+        let h: Int = self.open_current();
+        if h > 0 {
+            let _, _ = fs.write_raw(h, self.format_line(level, message) + "\n");
+        }
+    }
+
+    // Request records are batched by size or second to reduce hot-path writes.
+    func access(self: OpenAspLogger, message: String) -> Void {
+        if !self.enabled("info") {
+            return;
+        }
+        let now: Int = time.unix_sec();
+        if self.access_buffer_second == 0 {
+            self.access_buffer_second = now;
+        }
+        self.access_buffer += self.format_line("info", "request " + message) + "\n";
+        if std.len(self.access_buffer) >= 65536 || now != self.access_buffer_second {
+            self.flush();
+        }
+    }
+
+    func info(self: OpenAspLogger, message: String) -> Void {
+        self.write("info", message);
+    }
+
+    func warn(self: OpenAspLogger, message: String) -> Void {
+        self.write("warn", message);
+    }
+
+    func error(self: OpenAspLogger, message: String) -> Void {
+        self.write("error", message);
+    }
+
+    func close(self: OpenAspLogger) -> Void {
+        self.flush();
+        self.close_handle();
+    }
+}
+
+func openasp_log_level_valid(level: String) -> Bool {
+    let normalized: String = strings.to_lower_ascii(strings.trim_space(level));
+    return normalized == "info"
+        || normalized == "notice"
+        || normalized == "warn"
+        || normalized == "error"
+        || normalized == "off";
+}
+
+func openasp_default_log_path(command: String) -> String {
+    return "logs/" + command + ".log";
+}

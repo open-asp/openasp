@@ -1,0 +1,413 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.runtime;
+
+use asp.compiler;
+use asp.vm;
+
+use asp;
+use std;
+use fmt;
+use fs;
+use os;
+use sync;
+use strings;
+use strconv;
+use collections;
+use path;
+extern func eg_asp_hex_encode(input: String) -> String;
+extern func eg_asp_hex_decode(input: String) -> String;
+extern func eg_asp_parse_decimal_range(text: String, start: Int, length: Int) -> Int;
+extern func eg_vbs_format_date(millis: Int, mode: Int) -> String;
+extern func eg_asp_pack_string_parts(parts: collections.Vector<String>) -> String;
+extern func eg_asp_request_string_promote(value: String) -> String;
+
+// Runtime value tags model VBScript's distinctions, including Empty versus
+// Null and object handles versus Nothing. Numeric values keep integer and
+// floating representations separate until an operation requires coercion.
+enum VariantKind {
+    VariantEmpty,
+    VariantNull,
+    VariantBool,
+    VariantInt,
+    VariantFloat,
+    VariantString,
+    VariantObject,
+    VariantArray,
+    VariantNothing,
+    VariantDate,
+}
+
+// Shared backing for Variant arrays. `copy_on_write` means at least two logical
+// values may reference `items`; a writer must detach through
+// `ensure_array_writable` before mutating any element.
+class VariantArrayData {
+    var items: collections.Vector<Variant>;
+    var copy_on_write: Bool;
+
+    func init(self: VariantArrayData) -> Void {
+        self.items = new collections.Vector<Variant>();
+        self.copy_on_write = false;
+    }
+}
+
+// Tagged VBScript value. Only the field selected by `kind` is semantically
+// active. `store_key` belongs to KeyValueStore indexing and travels with the
+// value so entries remain compact. Object values are ObjectSpace integer IDs,
+// never copied native resources.
+class Variant {
+    var kind: VariantKind;
+    var store_key: String;
+    var bool_value: Bool;
+    var int_value: Int;
+    var float_value: Float64;
+    var string_value: String;
+    var object_value: Int;
+    var date_value: Int;
+    var date_mode: Int;
+    var array_data: VariantArrayData?;
+
+    func init(self: Variant) -> Void {
+        self.kind = VariantEmpty;
+        self.store_key = "";
+        self.bool_value = false;
+        self.int_value = 0;
+        self.float_value = 0.0;
+        self.string_value = "";
+        self.object_value = 0;
+        self.date_value = 0;
+        self.date_mode = 0;
+        self.array_data = nil;
+    }
+
+    func is_truthy(self: Variant) -> Bool {
+        if self.kind == VariantBool {
+            return self.bool_value;
+        }
+        if self.kind == VariantInt {
+            return self.int_value != 0;
+        }
+        if self.kind == VariantFloat {
+            return self.float_value != 0.0;
+        }
+        if self.kind == VariantDate {
+            return true;
+        }
+        if self.kind == VariantString {
+            return std.len(self.string_value) != 0;
+        }
+        return false;
+    }
+
+    func is_object(self: Variant) -> Bool {
+        return self.kind == VariantObject;
+    }
+
+    // Produces classic ASP response text. Null, Empty, and Nothing render as an
+    // empty string here; expression coercion rules are implemented separately.
+    func to_output_string(self: Variant) -> String {
+        if self.kind == VariantString {
+            return self.string_value;
+        }
+        if self.kind == VariantBool {
+            return self.bool_value ? "True" : "False";
+        }
+        if self.kind == VariantInt {
+            return strconv.itoa(self.int_value);
+        }
+        if self.kind == VariantFloat {
+            return strconv.format_float64(self.float_value);
+        }
+        if self.kind == VariantDate {
+            return eg_vbs_format_date(self.date_value, self.date_mode);
+        }
+        if self.kind == VariantNull {
+            return "";
+        }
+        if self.kind == VariantEmpty {
+            return "";
+        }
+        if self.kind == VariantNothing {
+            return "";
+        }
+        return "[object]";
+    }
+
+    // Full clone used across ownership boundaries. Arrays recurse and strings
+    // are promoted/copied so request-arena storage cannot escape.
+    func clone(self: Variant) -> Variant {
+        let out: Variant = new Variant();
+        out.kind = self.kind;
+        out.store_key = asp.runtime.clone_runtime_string(self.store_key);
+        out.bool_value = self.bool_value;
+        out.int_value = self.int_value;
+        out.float_value = self.float_value;
+        out.string_value = asp.runtime.clone_runtime_string(self.string_value);
+        out.object_value = self.object_value;
+        out.date_value = self.date_value;
+        out.date_mode = self.date_mode;
+        if self.kind == VariantArray {
+            out.array_data = new VariantArrayData();
+            let i: Int = 0;
+            loop i < self.array_data.items.len() {
+                let item: Variant = self.array_data.items.get(i);
+                let cloned_item: Variant = item.clone();
+                _ = out.array_data.items.push(cloned_item);
+                i += 1;
+            }
+        }
+        return out;
+    }
+
+    // Read clones can retain copy-on-write array backing; promoted clones force
+    // all request-owned strings into GC-managed storage.
+    func clone_for_read(self: Variant) -> Variant {
+        if self.kind == VariantArray && self.array_data.copy_on_write {
+            return self.clone_shared_array();
+        }
+        let out: Variant = new Variant();
+        out.kind = self.kind;
+        out.store_key = asp.runtime.clone_runtime_string(self.store_key);
+        out.bool_value = self.bool_value;
+        out.int_value = self.int_value;
+        out.float_value = self.float_value;
+        out.string_value = asp.runtime.clone_runtime_string(self.string_value);
+        out.object_value = self.object_value;
+        out.date_value = self.date_value;
+        out.date_mode = self.date_mode;
+        if self.kind == VariantArray {
+            out.array_data = new VariantArrayData();
+            let i: Int = 0;
+            loop i < self.array_data.items.len() {
+                let item: Variant = self.array_data.items.get(i);
+                _ = out.array_data.items.push(item);
+                i += 1;
+            }
+        }
+        return out;
+    }
+
+    func promoted_clone(self: Variant) -> Variant {
+        let out: Variant = new Variant();
+        out.kind = self.kind;
+        out.store_key = asp.runtime.promote_runtime_string(self.store_key);
+        out.bool_value = self.bool_value;
+        out.int_value = self.int_value;
+        out.float_value = self.float_value;
+        out.string_value = asp.runtime.promote_runtime_string(self.string_value);
+        out.object_value = self.object_value;
+        out.date_value = self.date_value;
+        out.date_mode = self.date_mode;
+        if self.kind == VariantArray {
+            out.array_data = new VariantArrayData();
+            let i: Int = 0;
+            loop i < self.array_data.items.len() {
+                _ = out.array_data.items.push(
+                    self.array_data.items.get(i).promoted_clone()
+                );
+                i += 1;
+            }
+        }
+        return out;
+    }
+
+    // Application snapshots keep immutable arrays shared across requests.
+    // Each request owns the Variant shell; the backing data is detached only
+    // when an indexed assignment reaches it.
+    func clone_shared_array(self: Variant) -> Variant {
+        let out: Variant = new Variant();
+        out.kind = self.kind;
+        out.store_key = self.store_key;
+        out.bool_value = self.bool_value;
+        out.int_value = self.int_value;
+        out.float_value = self.float_value;
+        out.string_value = self.string_value;
+        out.object_value = self.object_value;
+        out.date_value = self.date_value;
+        out.date_mode = self.date_mode;
+        if self.kind == VariantArray {
+            self.array_data.copy_on_write = true;
+            out.array_data = self.array_data;
+        }
+        return out;
+    }
+
+    func ensure_array_writable(self: Variant) -> Void {
+        if self.kind != VariantArray || !self.array_data.copy_on_write {
+            return;
+        }
+        let source_items: collections.Vector<Variant> = self.array_data.items;
+        let detached: VariantArrayData = new VariantArrayData();
+        detached.items.reserve(source_items.len());
+        let i: Int = 0;
+        loop i < source_items.len() {
+            let item: Variant = source_items.get(i);
+            _ = detached.items.push(item.kind == VariantArray ? item.clone_shared_array() : item);
+            i += 1;
+        }
+        self.array_data = detached;
+    }
+
+    func contains_object(self: Variant) -> Bool {
+        if self.kind == VariantObject {
+            return true;
+        }
+        if self.kind == VariantArray {
+            let i: Int = 0;
+            loop i < self.array_data.items.len() {
+                if self.array_data.items.get(i).contains_object() {
+                    return true;
+                }
+                i += 1;
+            }
+        }
+        return false;
+    }
+}
+
+// Constructors establish the tag/payload invariant in one place. Callers
+// should not construct partially initialized Variants by hand.
+func variant_empty() -> Variant {
+    return new Variant();
+}
+
+func variant_null() -> Variant {
+    let v: Variant = new Variant();
+    v.kind = VariantNull;
+    return v;
+}
+
+func variant_bool(x: Bool) -> Variant {
+    let v: Variant = new Variant();
+    v.kind = VariantBool;
+    v.bool_value = x;
+    return v;
+}
+
+func variant_int(x: Int) -> Variant {
+    let v: Variant = new Variant();
+    v.kind = VariantInt;
+    v.int_value = x;
+    return v;
+}
+
+func variant_float(x: Float64) -> Variant {
+    let v: Variant = new Variant();
+    v.kind = VariantFloat;
+    v.float_value = x;
+    return v;
+}
+
+// String lifetime helpers distinguish an ordinary managed clone from promotion
+// out of the request arena.
+func clone_runtime_string(x: String) -> String {
+    return x;
+}
+
+func promote_runtime_string(x: String) -> String {
+    return eg_asp_request_string_promote(x);
+}
+
+func variant_string(x: String) -> Variant {
+    let v: Variant = new Variant();
+    v.kind = VariantString;
+    v.string_value = asp.runtime.clone_runtime_string(x);
+    return v;
+}
+
+func variant_object(id: Int) -> Variant {
+    let v: Variant = new Variant();
+    v.kind = VariantObject;
+    v.object_value = id;
+    return v;
+}
+
+func variant_array(items: collections.Vector<Variant>) -> Variant {
+    let v: Variant = new Variant();
+    v.kind = VariantArray;
+    v.array_data = new VariantArrayData();
+    let i: Int = 0;
+    loop i < items.len() {
+        let item: Variant = items.get(i);
+        let cloned_item: Variant = item.clone_for_read();
+        _ = v.array_data.items.push(cloned_item);
+        i += 1;
+    }
+    return v;
+}
+
+// Takes freshly deserialized items without cloning them a second time.
+func variant_array_owned(items: collections.Vector<Variant>) -> Variant {
+    let v: Variant = new Variant();
+    v.kind = VariantArray;
+    v.array_data = new VariantArrayData();
+    v.array_data.items = items;
+    return v;
+}
+
+func variant_nothing() -> Variant {
+    let v: Variant = new Variant();
+    v.kind = VariantNothing;
+    return v;
+}
+
+func variant_date(millis: Int, mode: Int = 0) -> Variant {
+    let v: Variant = new Variant();
+    v.kind = VariantDate;
+    v.date_value = millis;
+    v.date_mode = mode;
+    return v;
+}
+
+// Persistence framing helpers delegate byte-oriented work to native code and
+// use length prefixes so arbitrary string contents remain reversible.
+func hex_digit(n: Int) -> String {
+    if n >= 0 && n <= 9 {
+        return std.char_from_code(48 + n);
+    }
+    return std.char_from_code(97 + n - 10);
+}
+
+func hex_encode(s: String) -> String {
+    return eg_asp_hex_encode(s);
+}
+
+func hex_decode_string(s: String) -> String {
+    return eg_asp_hex_decode(s);
+}
+
+func pack_string_parts(parts: collections.Vector<String>) -> String {
+    return eg_asp_pack_string_parts(parts);
+}
+
+func parse_packed_decimal(text: String, start: Int, length: Int) -> Int {
+    return eg_asp_parse_decimal_range(text, start, length);
+}
+
+func unpack_string_parts(text: String) -> collections.Vector<String> {
+    let out: collections.Vector<String> = new collections.Vector<String>();
+    let first_colon: Int = strings.find_substr(text, ":");
+    if first_colon <= 0 {
+        return out;
+    }
+    let count: Int = parse_packed_decimal(text, 0, first_colon);
+    out.reserve(count);
+    let pos: Int = first_colon + 1;
+    let i: Int = 0;
+    loop i < count && pos < std.len(text) {
+        let next_colon: Int = strings.find_substr_from(text, ":", pos);
+        if next_colon < pos {
+            break;
+        }
+        let part_len: Int = parse_packed_decimal(text, pos, next_colon - pos);
+        let start: Int = next_colon + 1;
+        if start + part_len > std.len(text) {
+            break;
+        }
+        _ = out.push(std.substr(text, start, part_len));
+        pos = start + part_len;
+        i += 1;
+    }
+    return out;
+}

@@ -1,0 +1,179 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp;
+
+use asp.runtime;
+
+use std;
+use fs;
+use path;
+use strings;
+use strconv;
+use collections;
+use os.process;
+use time;
+
+// The REPL keeps one RequestContext so variables, Session, Application, and
+// dynamically defined routines survive between lines. Each line is compiled as
+// a temporary ASP page; only response/error state is reset between iterations.
+class OpenAspRepl {
+    func init(self: OpenAspRepl) -> Void {
+    }
+
+    func print_help(self: OpenAspRepl) -> Void {
+        print("openasp-cli: interactive ASP command line");
+        print("Usage: openasp-cli [--root <dir>] [--session <sid>] [--no-prompt] [--optimize=on|off (default: on)] [--log-file <path|off>] [--log-level <level|off>] [--shell-enable=on] [--process-enable=on]");
+        print("Enter VBScript statements, '= expression', or a complete <% ... %> ASP fragment.");
+        print("Commands: .help, .quit, .exit");
+    }
+
+    // Accept full ASP fragments, shorthand "= expression", or plain VBScript
+    // statements without requiring users to type delimiters.
+    func source_for_line(self: OpenAspRepl, line: String) -> String {
+        let trimmed: String = strings.trim_space(line);
+        if strings.contains(trimmed, "<%") {
+            return line;
+        }
+        if strings.starts_with(trimmed, "=") {
+            return "<%=" + std.substr(trimmed, 1, std.len(trimmed) - 1) + "%>";
+        }
+        return "<% " + line + " %>";
+    }
+
+    // Preserve execution state while replacing response-owned collections.
+    // Reusing headers after dispose would retain native resources incorrectly.
+    func reset_response(self: OpenAspRepl, ctx: asp.runtime.RequestContext) -> Void {
+        ctx.response.clear();
+        ctx.response.status_code = 200;
+        ctx.response.status_text = "OK";
+        ctx.response.content_type = "text/plain";
+        ctx.response.charset = "utf-8";
+        ctx.response.ended = false;
+        ctx.response.redirected_to = "";
+        ctx.response.headers.dispose();
+        ctx.response.headers = new collections.Map<String, String>();
+        ctx.error_state.clear();
+    }
+
+    // Own temporary fragments, engine, context, and logger for the whole
+    // session. Two empty reads are treated as EOF for line-reader portability.
+    func run(self: OpenAspRepl, argc: Int, argv: Int) -> Int {
+        let args: CommandArgs = new CommandArgs();
+        if args.has(argc, argv, "-h") || args.has(argc, argv, "--help") {
+            self.print_help();
+            return 0;
+        }
+        if !openasp_optimize_option_valid(args, argc, argv) {
+            print("invalid --optimize value; expected on or off");
+            return 2;
+        }
+        (new RuntimeOptions()).apply(argc, argv);
+        let log_level: String = args.value(argc, argv, "--log-level", "info");
+        if !openasp_log_level_valid(log_level) {
+            print("invalid --log-level value; expected info, notice, warn, error, or off");
+            return 2;
+        }
+        let logger: OpenAspLogger = new OpenAspLogger(
+            "openasp-cli",
+            args.value(argc, argv, "--log-file", openasp_default_log_path("openasp-cli")),
+            log_level
+        );
+        let root_dir: String = args.value(argc, argv, "--root", ".");
+        logger.info(
+            "starting root=" + root_dir
+            + " prompt=" + (args.has(argc, argv, "--no-prompt") ? "off" : "on")
+            + " optimize=" + strings.to_lower_ascii(args.value(argc, argv, "--optimize", "on"))
+        );
+        let temp_root, temp_err = fs.temp_dir();
+        if temp_err != OK {
+            print("openasp-cli: cannot locate temporary directory");
+            logger.error("cannot locate temporary directory");
+            logger.close();
+            return 2;
+        }
+        let fragment_base: String = path.join_path(
+            temp_root,
+            "openasp-cli-" + strconv.itoa(os.process.pid()) + "-" + strconv.itoa(time.now_ms())
+        );
+        let first_fragment: String = fragment_base + "-0.asp";
+        let engine: AspEngine = new AspEngine(root_dir);
+        let ctx: asp.runtime.RequestContext = engine.new_context(
+            first_fragment,
+            "CLI",
+            "",
+            "",
+            args.value(argc, argv, "--session", "")
+        );
+        let prompt_enabled: Bool = !args.has(argc, argv, "--no-prompt");
+        if prompt_enabled {
+            print("OpenASP interactive CLI. Use .help for commands.");
+        }
+        let sequence: Int = 0;
+        let empty_reads: Int = 0;
+        loop true {
+            if prompt_enabled {
+                let _, _ = os.process.write_fd(1, "OpenASP> ");
+            }
+            let raw: String = std.stdin_read_line();
+            let line: String = strings.trim_space(raw);
+            if std.len(line) == 0 {
+                empty_reads += 1;
+                if empty_reads >= 2 {
+                    break;
+                }
+                skip;
+            }
+            empty_reads = 0;
+            if line == ".quit" || line == ".exit" {
+                break;
+            }
+            if line == ".help" {
+                self.print_help();
+                skip;
+            }
+            sequence += 1;
+            let fragment_path: String = fragment_base + "-" + strconv.itoa(sequence) + ".asp";
+            let _, write_err = fs.write_text(fragment_path, self.source_for_line(raw));
+            if write_err != OK {
+                print("openasp-cli: cannot write temporary ASP fragment");
+                logger.error("cannot write temporary fragment sequence=" + strconv.itoa(sequence));
+                break;
+            }
+            self.reset_response(ctx);
+            _ = engine.render_page_into_context(ctx, fragment_path);
+            let output: String = ctx.response.body_text();
+            if std.len(output) != 0 {
+                let _, _ = os.process.write_fd(1, output);
+                if !strings.ends_with(output, "\n") {
+                    let _, _ = os.process.write_fd(1, "\n");
+                }
+            }
+            if ctx.error_state.error_number != 0 {
+                logger.warn(
+                    "statement failed sequence=" + strconv.itoa(sequence)
+                    + " error_number=" + strconv.itoa(ctx.error_state.error_number)
+                    + " source=" + ctx.error_state.source
+                );
+                print(
+                    "ASP error " + strconv.itoa(ctx.error_state.error_number)
+                    + " [" + ctx.error_state.source + "]: "
+                    + ctx.error_state.description
+                );
+            } else {
+                logger.info(
+                    "statement completed sequence=" + strconv.itoa(sequence)
+                    + " output_bytes=" + strconv.itoa(std.len(output))
+                );
+            }
+            let _, _ = fs.remove(fragment_path);
+        }
+        engine.commit_context(ctx);
+        ctx.clear_request();
+        engine.clear_request();
+        engine.close();
+        logger.info("stopped statements=" + strconv.itoa(sequence));
+        logger.close();
+        return 0;
+    }
+}

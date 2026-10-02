@@ -1,0 +1,712 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp;
+
+use asp.object.database;
+use asp.runtime;
+use asp.compiler;
+use asp.vm;
+
+use std;
+use bytes;
+use fs;
+use path;
+use strings;
+use strconv;
+use collections;
+use os;
+use os.process;
+use runtime;
+
+extern func __gc_keepalive(obj: Any) -> Void;
+extern func __gc_collect() -> Void;
+extern func __gc_is_enabled() -> Int;
+extern func __gc_get_threshold() -> Int;
+extern func __gc_set_threshold(bytes: Int) -> Void;
+extern func eg_gc_promote_immortal(object: Any) -> Int;
+extern func eg_gc_preempt_guard_leave() -> Void;
+extern func eg_asp_gc_pin_compiled_page(object: asp.runtime.CompiledPage) -> Int;
+extern func eg_asp_gc_pin_page_nodes(object: collections.Vector<asp.compiler.PageNode>) -> Int;
+extern func eg_asp_gc_pin_program_blobs(object: collections.Vector<String>) -> Int;
+extern func eg_asp_gc_pin_programs(object: collections.Vector<asp.vm.VbsBytecodeProgram>) -> Int;
+extern func eg_asp_gc_pin_program(object: asp.vm.VbsBytecodeProgram) -> Int;
+extern func eg_asp_gc_pin_page_nodes_data(object: collections.Vector<asp.compiler.PageNode>) -> Int;
+extern func eg_asp_gc_pin_programs_data(object: collections.Vector<asp.vm.VbsBytecodeProgram>) -> Int;
+extern func eg_asp_gc_pin_object(object: Any) -> Int;
+extern func eg_asp_gc_unpin_object(pin: Int) -> Void;
+extern func eg_asp_request_string_arena_enter(handle: Int) -> Int;
+extern func eg_asp_request_string_arena_leave(handle: Int) -> Void;
+extern func eg_asp_aot_build_try_lock(path: String) -> Int;
+extern func eg_asp_aot_build_unlock(handle: Int) -> Void;
+extern func eg_asp_mmap_open(path: String) -> Int;
+extern func eg_asp_mmap_close(handle: Int) -> Void;
+extern func eg_asp_mmap_length(handle: Int) -> Int;
+extern func eg_asp_mmap_matches(handle: Int, offset: Int, expected: String) -> Int;
+extern func eg_asp_mmap_read_u32(handle: Int, offset: Int) -> Int;
+extern func eg_asp_mmap_checksum(handle: Int, offset: Int, length: Int) -> Int;
+
+// AspEngine is worker-owned and survives many requests. It owns immutable page
+// caches, application state, pooled database connections, and the optional AOT
+// mapping. RequestContext owns all per-request mutable state and arena memory.
+// Consequently no object retained here may contain a pointer into a request
+// arena, and close must run before the worker process exits.
+class AspEngine {
+    // root_dir is canonical and anchors every virtual path.
+    var root_dir: String;
+    // app serializes process-local access to the persisted Application store.
+    var app: asp.runtime.ApplicationState;
+    // paths is the single source of cache/session/application file locations.
+    var paths: asp.runtime.PersistencePaths;
+    // cache retains immutable CompiledPage objects across requests.
+    var cache: asp.runtime.PageCache;
+    // mysql_pools owns reusable native connections and closes them at teardown.
+    var mysql_pools: asp.object.database.MysqlPoolRegistry;
+    // Nonzero while pages in cache borrow spans from the mapped AOT image.
+    var aot_mapping_handle: Int;
+
+    // Normalize the root before deriving persistence paths; later path checks
+    // rely on this stable representation to prevent traversal outside the app.
+    func init(self: AspEngine, root_dir: String) -> Void {
+        self.root_dir = path.clean(root_dir);
+        self.app = new asp.runtime.ApplicationState();
+        self.paths = new asp.runtime.PersistencePaths(self.root_dir);
+        self.paths.ensure_dirs();
+        self.cache = new asp.runtime.PageCache(self.paths);
+        self.mysql_pools = new asp.object.database.MysqlPoolRegistry(4);
+        self.aot_mapping_handle = 0;
+    }
+
+    func clear_request(self: AspEngine) -> Void {
+        // PageCache is worker-owned. Request state lives in RequestContext and must
+        // not discard immutable compiled programs at the end of every request.
+    }
+
+    func close(self: AspEngine) -> Void {
+        self.mysql_pools.close();
+        if self.aot_mapping_handle != 0 {
+            eg_asp_mmap_close(self.aot_mapping_handle);
+            self.aot_mapping_handle = 0;
+        }
+    }
+
+    func scan_aot_dir(self: AspEngine, dir_path: String, pages: collections.Vector<String>) -> ErrCode {
+        // Only routable application entry pages belong in the eagerly resident
+        // image. Includes and admin/plugin implementation files are already
+        // folded into those programs or stay on the dynamic cache slow path.
+        // Large legacy roots can opt into an explicit startup set; every other
+        // page keeps the normal validated on-demand fallback.
+        let entry_filter, entry_filter_err = os.getenv("EGRET_ASP_AOT_ENTRY_PAGES");
+        let normalized_filter: String = entry_filter_err == OK && std.len(entry_filter) != 0
+            ? "," + strings.to_lower_ascii(strings.replace_all(entry_filter, " ", "")) + ","
+            : "";
+        let entries, read_err = fs.read_dir(dir_path);
+        if read_err != OK {
+            return read_err;
+        }
+        let names: collections.Vector<String> = strings.split(entries, "\n");
+        let i: Int = 0;
+        loop i < names.len() {
+            let name: String = names.get(i);
+            if std.len(name) != 0 {
+                let child: String = path.join_path(dir_path, name);
+                let kind, kind_err = fs.stat_kind(child);
+                if kind_err != OK {
+                    return kind_err;
+                }
+                if kind == fs.KIND_FILE {
+                    let lower_name: String = strings.to_lower_ascii(name);
+                    let selected: Bool = std.len(normalized_filter) == 0
+                        || strings.find_substr(normalized_filter, "," + lower_name + ",") >= 0;
+                    if selected && (strings.ends_with(lower_name, ".asp") || lower_name == "global.asa") {
+                        _ = pages.push(path.clean(child));
+                    }
+                } else if kind == fs.KIND_DIR
+                && name != "build"
+                && !strings.starts_with(name, ".") {
+                    let child_err: ErrCode = self.scan_aot_dir(child, pages);
+                    if child_err != OK {
+                        return child_err;
+                    }
+                }
+            }
+            i += 1;
+        }
+        return OK;
+    }
+
+    func aot_image_path(self: AspEngine) -> String {
+        return path.join_path(self.paths.state_dir, "pages.aot");
+    }
+
+    func aot_contains_path(self: AspEngine, pages: collections.Vector<String>, page_path: String) -> Bool {
+        _ = self;
+        let i: Int = 0;
+        loop i < pages.len() {
+            if pages.get(i) == page_path {
+                return true;
+            }
+            i += 1;
+        }
+        return false;
+    }
+
+    // Validate magic, schema, checksum, exact source set, and nanosecond mtimes
+    // before publishing any page. Staging makes failure atomic: a partially
+    // decoded image never contaminates the live PageCache.
+    func load_aot_image(self: AspEngine, expected_pages: collections.Vector<String>) -> Bool {
+        let mapping: Int = eg_asp_mmap_open(self.aot_image_path());
+        let image_length: Int = eg_asp_mmap_length(mapping);
+        if mapping == 0 || image_length < 20
+        || eg_asp_mmap_matches(mapping, 0, "EGAOT001") == 0
+        || eg_asp_mmap_read_u32(mapping, 8) != 6 {
+            eg_asp_mmap_close(mapping);
+            return false;
+        }
+        let payload_len: Int = eg_asp_mmap_read_u32(mapping, 12);
+        let checksum: Int = eg_asp_mmap_read_u32(mapping, 16);
+        if payload_len != image_length - 20
+        || eg_asp_mmap_checksum(mapping, 20, payload_len) != checksum {
+            eg_asp_mmap_close(mapping);
+            return false;
+        }
+        let reader: asp.runtime.MappedBinaryReader = new asp.runtime.MappedBinaryReader(
+            mapping, 20, payload_len
+        );
+        let reader_pin: Int = eg_asp_gc_pin_object(reader);
+        if reader_pin == 0 {
+            eg_asp_mmap_close(mapping);
+            return false;
+        }
+        let scanned_count: Int = reader.read_u32();
+        let count: Int = reader.read_u32();
+        if scanned_count != expected_pages.len() || count < 0 || count > scanned_count {
+            eg_asp_gc_unpin_object(reader_pin);
+            eg_asp_mmap_close(mapping);
+            return false;
+        }
+        let staged_pages: collections.Vector<asp.runtime.CompiledPage> = new collections.Vector<asp.runtime.CompiledPage>();
+        let staged_pages_pin: Int = eg_asp_gc_pin_object(staged_pages);
+        if staged_pages_pin == 0 {
+            eg_asp_gc_unpin_object(reader_pin);
+            eg_asp_mmap_close(mapping);
+            return false;
+        }
+        // The image remains mapped for the worker lifetime. Page and bytecode
+        // readers retain offsets only; no outer payload or per-page cache
+        // strings are allocated.
+        let i: Int = 0;
+        loop i < count {
+            let page_path: String = reader.read_string();
+            let page_path_pin: Int = eg_asp_gc_pin_object(page_path);
+            let image_mtime: Int = reader.read_i64();
+            let cache_start: Int = reader.read_span();
+            let cache_length: Int = reader.last_span_length;
+            if page_path_pin == 0 || !reader.valid
+            || !self.aot_contains_path(expected_pages, page_path) {
+                eg_asp_gc_unpin_object(page_path_pin);
+                eg_asp_gc_unpin_object(staged_pages_pin);
+                eg_asp_gc_unpin_object(reader_pin);
+                eg_asp_mmap_close(mapping);
+                return false;
+            }
+            let mtime_sec, mtime_err = fs.stat_mtime(page_path);
+            let mtime_nsec, mtime_nsec_err = fs.stat_mtime_nsec(page_path);
+            if mtime_err != OK || mtime_nsec_err != OK
+            || image_mtime != (mtime_sec * 1000000000) + mtime_nsec {
+                eg_asp_gc_unpin_object(page_path_pin);
+                eg_asp_gc_unpin_object(staged_pages_pin);
+                eg_asp_gc_unpin_object(reader_pin);
+                eg_asp_mmap_close(mapping);
+                return false;
+            }
+            let page, page_err = self.cache.parse_mapped_data(
+                mapping, cache_start, cache_length
+            );
+            let page_pin: Int = page_err == OK ? eg_asp_gc_pin_compiled_page(page) : 0;
+            if page_err != OK || page_pin == 0 || page.page_path != page_path
+            || !self.cache.hydrate_programs(page) {
+                eg_asp_gc_unpin_object(page_pin);
+                eg_asp_gc_unpin_object(page_path_pin);
+                eg_asp_gc_unpin_object(staged_pages_pin);
+                eg_asp_gc_unpin_object(reader_pin);
+                eg_asp_mmap_close(mapping);
+                return false;
+            }
+            _ = staged_pages.push(page);
+            eg_asp_gc_unpin_object(page_pin);
+            eg_asp_gc_unpin_object(page_path_pin);
+            i += 1;
+        }
+        let valid: Bool = reader.valid && reader.offset == reader.end;
+        eg_asp_gc_unpin_object(reader_pin);
+        if !valid {
+            eg_asp_gc_unpin_object(staged_pages_pin);
+            eg_asp_mmap_close(mapping);
+            return false;
+        }
+        i = 0;
+        loop i < staged_pages.len() {
+            if __gc_is_enabled() != 0
+            && eg_gc_promote_immortal(staged_pages.get(i)) <= 0 {
+                eg_asp_gc_unpin_object(staged_pages_pin);
+                eg_asp_mmap_close(mapping);
+                return false;
+            }
+            i += 1;
+        }
+        if self.aot_mapping_handle != 0 {
+            eg_asp_mmap_close(self.aot_mapping_handle);
+        }
+        self.aot_mapping_handle = mapping;
+        i = 0;
+        loop i < staged_pages.len() {
+            _ = self.cache.remember_aot(staged_pages.get(i));
+            i += 1;
+        }
+        eg_asp_gc_unpin_object(staged_pages_pin);
+        return true;
+    }
+
+    // Serialize a complete replacement image and publish it atomically through
+    // the persistence layer. Readers never observe a half-written cache.
+    func write_aot_image(self: AspEngine, pages: collections.Vector<String>, scanned_count: Int) -> ErrCode {
+        let payload_out: bytes.Buffer = new bytes.Buffer();
+        asp.runtime.page_cache_write_u32(payload_out, scanned_count);
+        asp.runtime.page_cache_write_u32(payload_out, pages.len());
+        let i: Int = 0;
+        loop i < pages.len() {
+            let page_path: String = pages.get(i);
+            let cache_bytes, read_err = fs.read_bytes(self.paths.cache_file(page_path), -1);
+            if read_err != OK {
+                payload_out.dispose();
+                return read_err;
+            }
+            let mtime_sec, mtime_err = fs.stat_mtime(page_path);
+            let mtime_nsec, mtime_nsec_err = fs.stat_mtime_nsec(page_path);
+            if mtime_err != OK || mtime_nsec_err != OK {
+                payload_out.dispose();
+                return mtime_err != OK ? mtime_err : mtime_nsec_err;
+            }
+            asp.runtime.page_cache_write_string(payload_out, page_path);
+            asp.runtime.page_cache_write_i64(payload_out, (mtime_sec * 1000000000) + mtime_nsec);
+            asp.runtime.page_cache_write_string(payload_out, cache_bytes);
+            i += 1;
+        }
+        let payload: String = payload_out.str();
+        payload_out.dispose();
+        let image_out: bytes.Buffer = new bytes.Buffer();
+        image_out.write_string("EGAOT001");
+        // v6 is mmap-native: embedded v8 bytecode instruction tables are
+        // executed in place and all mutable VM state lives in sidecars.
+        asp.runtime.page_cache_write_u32(image_out, 6);
+        asp.runtime.page_cache_write_u32(image_out, std.len(payload));
+        asp.runtime.page_cache_write_u32(image_out, asp.runtime.page_cache_checksum(payload));
+        image_out.write_string(payload);
+        let image: String = image_out.str();
+        image_out.dispose();
+        let target: String = self.aot_image_path();
+        let temporary: String = target + ".tmp";
+        let _, write_err = fs.write_bytes(temporary, bytes.from_string(image));
+        if write_err != OK {
+            return write_err;
+        }
+        let _, rename_err = fs.rename(temporary, target);
+        return rename_err;
+    }
+
+    // Load an existing valid image or let one process rebuild it under the
+    // cross-process build lock. Contenders continue with normal page caching.
+    func prepare_aot(self: AspEngine) -> Int {
+        self.paths.ensure_dirs();
+        self.cache.enable_aot_residency();
+        let pages: collections.Vector<String> = new collections.Vector<String>();
+        let scan_err: ErrCode = self.scan_aot_dir(self.root_dir, pages);
+        if scan_err != OK {
+            print("aot scan failed");
+            return 2;
+        }
+        // The packed image, reader slices and partially hydrated pages form a
+        // transient graph that is not publishable until every page has been
+        // installed in PageCache's pinned resident set. Prevent a threshold
+        // collection in that transaction, then restore the caller's policy and
+        // immediately verify the published graph with a full collection.
+        let prior_gc_threshold: Int = __gc_get_threshold();
+        __gc_set_threshold(8589934592);
+        let aot_loaded: Bool = self.load_aot_image(pages);
+        __gc_set_threshold(prior_gc_threshold);
+        if aot_loaded {
+            __gc_collect();
+            print("aot loaded pages=" + strconv.itoa(pages.len()));
+            return 0;
+        }
+        __gc_collect();
+        // Multiple recycled workers may discover the same stale image. Only
+        // one rebuilds it; lock contention must not consume every worker while
+        // that rebuild is in progress. Contenders keep serving through the
+        // validated per-page cache and pick up the image on their next recycle.
+        let aot_lock: Int = eg_asp_aot_build_try_lock(self.aot_image_path() + ".lock");
+        if aot_lock == -2 {
+            print("aot rebuild busy; using dynamic page cache");
+            return 0;
+        }
+        if aot_lock < 0 {
+            print("aot image lock failed");
+            return 2;
+        }
+        __gc_set_threshold(8589934592);
+        let refreshed_aot_loaded: Bool = self.load_aot_image(pages);
+        __gc_set_threshold(prior_gc_threshold);
+        if refreshed_aot_loaded {
+            eg_asp_aot_build_unlock(aot_lock);
+            __gc_collect();
+            print("aot loaded after rebuild wait pages=" + strconv.itoa(pages.len()));
+            return 0;
+        }
+        __gc_collect();
+        let compiled_pages: collections.Vector<String> = new collections.Vector<String>();
+        let skipped: Int = 0;
+        let i: Int = 0;
+        loop i < pages.len() {
+            let _, compile_err = self.compile_page(pages.get(i));
+            if compile_err != OK {
+                // Third-party/admin trees can contain platform-specific ASP
+                // dialects. Keep them on the existing on-demand slow path
+                // instead of preventing the whole site from starting.
+                skipped += 1;
+            } else {
+                _ = compiled_pages.push(pages.get(i));
+            }
+            i += 1;
+        }
+        let write_err: ErrCode = self.write_aot_image(compiled_pages, pages.len());
+        if write_err != OK {
+            eg_asp_aot_build_unlock(aot_lock);
+            print("aot image write failed");
+            return 2;
+        }
+        eg_asp_aot_build_unlock(aot_lock);
+        print("aot rebuilt pages=" + strconv.itoa(compiled_pages.len()) + " skipped=" + strconv.itoa(skipped));
+        return 0;
+    }
+
+    // Resolve application-relative and include-relative paths under root_dir.
+    // Callers still perform existence checks because normalization alone does
+    // not imply that a route maps to a regular file.
+    func abs_path(self: AspEngine, page_path: String, current_page: String = "") -> String {
+        let clean: String = path.clean(strings.replace_all(page_path, "\\", "/"));
+        if strings.starts_with(clean, "/") {
+            return clean;
+        }
+        if fs.file_exists(clean) {
+            return clean;
+        }
+        if std.len(current_page) != 0 {
+            return path.clean(path.join_path(path.dir(current_page), clean));
+        }
+        return path.clean(path.join_path(self.root_dir, clean));
+    }
+
+    func session_meta_timeout_key(self: AspEngine) -> String {
+        return "__asp_meta_timeout";
+    }
+
+    func prepare_loaded_session(self: AspEngine, ctx: asp.runtime.RequestContext) -> Void {
+        if ctx.session.has(self.session_meta_timeout_key()) {
+            ctx.session_timeout_minutes = variant_to_int(ctx.session.get_or_empty(self.session_meta_timeout_key()));
+            _ = ctx.session.delete(self.session_meta_timeout_key());
+        }
+    }
+
+    func populate_server_variables(self: AspEngine, ctx: asp.runtime.RequestContext, page_path: String, method: String, query_string: String) -> Void {
+        let host_header: String = ctx.request.headers.get_or("host", "");
+        let https_on: Bool = strings.equal_fold_ascii(ctx.request.headers.get_or("x-forwarded-proto", ""), "https");
+        let server_name: String = std.len(host_without_port(host_header)) != 0 ? host_without_port(host_header) : "localhost";
+        let server_port: String = host_port_or_default(host_header, https_on ? "443" : "80");
+        let remote_addr: String = ctx.request.headers.get_or("x-forwarded-for", ctx.request.headers.get_or("remote-addr", "127.0.0.1"));
+        let remote_port: String = ctx.request.headers.get_or("x-forwarded-port", ctx.request.headers.get_or("remote-port", ""));
+        let virtual_path: String = page_path;
+        if strings.starts_with(page_path, self.root_dir)
+            && (std.len(page_path) == std.len(self.root_dir) || std.byte_at(page_path, std.len(self.root_dir)) == '/') {
+            virtual_path = std.substr(page_path, std.len(self.root_dir), std.len(page_path) - std.len(self.root_dir));
+        }
+        if !strings.starts_with(virtual_path, "/") {
+            virtual_path = "/" + virtual_path;
+        }
+        _ = ctx.request.server_variables.set("path_info", virtual_path);
+        _ = ctx.request.server_variables.set("path_translated", ctx.page_path);
+        _ = ctx.request.server_variables.set("request_method", method);
+        _ = ctx.request.server_variables.set("query_string", query_string);
+        _ = ctx.request.server_variables.set("script_name", virtual_path);
+        _ = ctx.request.server_variables.set("script_filename", ctx.page_path);
+        _ = ctx.request.server_variables.set("url", virtual_path);
+        _ = ctx.request.server_variables.set("document_uri", virtual_path);
+        _ = ctx.request.server_variables.set("document_root", self.root_dir);
+        _ = ctx.request.server_variables.set("appl_md_path", "/");
+        _ = ctx.request.server_variables.set("appl_physical_path", self.root_dir + "/");
+        _ = ctx.request.server_variables.set("request_uri", virtual_path + (std.len(query_string) != 0 ? "?" + query_string : ""));
+        _ = ctx.request.server_variables.set("content_length", strconv.itoa(std.len(ctx.request.body)));
+        _ = ctx.request.server_variables.set("content_type", ctx.request.headers.get_or("content-type", ""));
+        _ = ctx.request.server_variables.set("gateway_interface", "CGI/1.1");
+        _ = ctx.request.server_variables.set("server_protocol", "HTTP/1.1");
+        _ = ctx.request.server_variables.set("server_software", "OpenASP/0.1");
+        _ = ctx.request.server_variables.set("server_name", server_name);
+        _ = ctx.request.server_variables.set("server_port", server_port);
+        _ = ctx.request.server_variables.set("server_port_secure", https_on ? "1" : "0");
+        _ = ctx.request.server_variables.set("https", https_on ? "on" : "off");
+        _ = ctx.request.server_variables.set("request_scheme", https_on ? "https" : "http");
+        _ = ctx.request.server_variables.set("local_addr", "127.0.0.1");
+        _ = ctx.request.server_variables.set("server_addr", "127.0.0.1");
+        _ = ctx.request.server_variables.set("remote_addr", remote_addr);
+        _ = ctx.request.server_variables.set("remote_host", remote_addr);
+        _ = ctx.request.server_variables.set("remote_port", remote_port);
+        let keys: collections.Vector<String> = ctx.request.headers.keys();
+        let i: Int = 0;
+        loop i < keys.len() {
+            let key: String = keys.get(i);
+            let env_key: String = "http_" + strings.replace_all(strings.to_lower_ascii(key), "-", "_");
+            _ = ctx.request.server_variables.set(env_key, ctx.request.headers.get(key));
+            i += 1;
+        }
+        _ = keys.free();
+    }
+
+    // Run global.asa startup once under the application mutex. Publication of
+    // the started flag follows state persistence so other requests cannot see
+    // a half-initialized Application snapshot.
+    func ensure_application_started(self: AspEngine) -> Void {
+        if self.app.initialized || self.app.starting {
+            return;
+        }
+        self.app.starting = true;
+        self.paths.ensure_dirs();
+        let app_exists, _ = fs.exists(self.paths.application_file);
+        if !app_exists {
+            let global_path: String = path.join_path(self.root_dir, "global.asa");
+            if fs.file_exists(global_path) {
+                let bootstrap_ctx: asp.runtime.RequestContext = new asp.runtime.RequestContext(self.root_dir, global_path, new asp.runtime.KeyValueStore(), new asp.runtime.KeyValueStore(), "");
+                bootstrap_ctx.application = new asp.runtime.KeyValueStore();
+                bootstrap_ctx.session = new asp.runtime.KeyValueStore();
+                _ = self.render_page_into_context(bootstrap_ctx, global_path);
+                let _ = asp.runtime.save_store_file(self.paths.application_file, bootstrap_ctx.application, bootstrap_ctx.objects);
+                self.app.snapshot_from(bootstrap_ctx.application, self.paths.application_file);
+            }
+        }
+        self.app.starting = false;
+        self.app.initialized = true;
+    }
+
+    // Compile or retrieve one page after validating source/include mtimes.
+    // Returned programs are immutable and may be promoted for worker lifetime.
+    func compile_page(self: AspEngine, page_path: String) -> asp.runtime.CompiledPage, ErrCode {
+        let abs: String = self.abs_path(page_path);
+        let cached_page, cache_err = self.cache.get_fresh(abs);
+        if cache_err == OK {
+            return cached_page, OK;
+        }
+        let pre: asp.compiler.PreprocessResult = (new asp.compiler.Preprocessor()).preprocess_file(self.root_dir, abs);
+        if !pre.ok {
+            let msg: String = pre.errors.len() > 0 ? pre.errors.get(0) : "unknown preprocess error";
+            return make_error_page(abs, "preprocess error: " + msg), ERR_INVALID;
+        }
+        let parsed: asp.compiler.TemplateParseResult = (new asp.compiler.TemplateParser()).parse(abs, pre.text);
+        if !parsed.ok {
+            let msg: String = parsed.errors.len() > 0 ? parsed.errors.get(0) : "unknown template parse error";
+            return make_error_page(abs, "template parse error: " + msg), ERR_INVALID;
+        }
+        let page: asp.runtime.CompiledPage = new asp.runtime.CompiledPage();
+        page.page_path = abs;
+        page.source_text = "";
+        let mtime_sec, _ = fs.stat_mtime(abs);
+        let mtime_nsec, _ = fs.stat_mtime_nsec(abs);
+        page.mtime_sec = (mtime_sec * 1000000000) + mtime_nsec;
+        page.include_paths = pre.include_paths;
+        let i: Int = 0;
+        loop i < pre.include_paths.len() {
+            let inc_mtime_sec, _ = fs.stat_mtime(pre.include_paths.get(i));
+            let inc_mtime_nsec, _ = fs.stat_mtime_nsec(pre.include_paths.get(i));
+            _ = page.include_mtimes.push((inc_mtime_sec * 1000000000) + inc_mtime_nsec);
+            i += 1;
+        }
+        let lowered_nodes: collections.Vector<asp.compiler.PageNode> = lower_template_nodes_to_script(abs, parsed.nodes);
+        let node_index: Int = 0;
+        loop node_index < lowered_nodes.len() {
+            let node: asp.compiler.PageNode = lowered_nodes.get(node_index);
+            if !should_cache_page_node_bytecode(node) {
+                let direct_program, direct_err = compile_page_node_program(abs, node);
+                if direct_err != OK {
+                    let failed: asp.compiler.VbsProgram = direct_program.program;
+                    let msg: String = failed.errors.len() > 0 ? failed.errors.get(0) : "unknown parse error";
+                    return make_error_page(abs, (node.kind == asp.compiler.PageNodeScript ? "script" : "expr") + " parse error: " + msg), ERR_INVALID;
+                }
+                _ = page.nodes.push(node);
+                _ = page.program_blobs.push("");
+                _ = page.programs.push(direct_program);
+                node_index += 1;
+                skip;
+            }
+            let compiled_program, bytecode_err = compile_page_node_program(abs, node);
+            let bytecode_blob: String = "";
+            if bytecode_err != OK {
+                let failed: asp.compiler.VbsProgram = compiled_program.program;
+                let msg: String = failed.errors.len() > 0 ? failed.errors.get(0) : "unknown parse error";
+                return make_error_page(abs, (node.kind == asp.compiler.PageNodeScript ? "script" : "expr") + " parse error: " + msg), ERR_INVALID;
+            }
+            // Retain the freshly compiled program for this request. Disk
+            // serialization must not force a second AST allocation and decode.
+            _ = page.programs.push(compiled_program);
+            bytecode_blob = asp.vm.serialize_vbs_bytecode_program(page.programs.get(node_index));
+            _ = page.nodes.push(node);
+            _ = page.program_blobs.push(node.kind == asp.compiler.PageNodeLiteral ? "" : bytecode_blob);
+            node_index += 1;
+        }
+        let resident: asp.runtime.CompiledPage = self.cache.put(abs, page);
+        return resident, OK;
+    }
+
+    func session_id_from_cookie(self: AspEngine, cookie_header: String) -> String {
+        let request: asp.runtime.RequestData = new asp.runtime.RequestData();
+        _ = request.parse_cookies(cookie_header);
+        let key: String = "egret_asp_session";
+        if request.cookies.has(key) {
+            return request.cookies.get(key);
+        }
+        return "";
+    }
+
+    func load_application_store(self: AspEngine, objects: asp.vm.ObjectSpace) -> asp.runtime.KeyValueStore {
+        self.paths.ensure_dirs();
+        return self.app.new_globals_store(self.paths.application_file, objects);
+    }
+
+    func load_session_store(self: AspEngine, session_id: String, objects: asp.vm.ObjectSpace) -> asp.runtime.KeyValueStore {
+        self.paths.ensure_dirs();
+        return asp.runtime.load_store_file(self.paths.session_file(session_id), objects);
+    }
+
+    // Commit dirty Session and Application snapshots at the request boundary.
+    // An explicit Application.Lock retains ownership until here only as an
+    // exception-safety fallback; normal Unlock commits and releases eagerly.
+    func commit_context(self: AspEngine, ctx: asp.runtime.RequestContext) -> Void {
+        _ = eg_asp_request_string_arena_enter(ctx.request_arena_handle);
+        if ctx.application_locked {
+            if ctx.application_dirty {
+                let _ = asp.runtime.save_store_file(self.paths.application_file, ctx.application, ctx.objects);
+                self.app.snapshot_from(ctx.application, self.paths.application_file);
+            }
+            asp.runtime.application_state_unlock(ctx.application_process_lock);
+            ctx.application_process_lock = -1;
+            _ = self.app.lock_mu.unlock();
+            ctx.application_locked = false;
+            ctx.application_lock_depth = 0;
+            if __gc_is_enabled() != 0 {
+                eg_gc_preempt_guard_leave();
+            }
+        } else if ctx.application_dirty {
+            let _ = asp.runtime.save_store_file(self.paths.application_file, ctx.application, ctx.objects);
+            self.app.snapshot_from(ctx.application, self.paths.application_file);
+        }
+        if ctx.session_abandoned {
+            let _, _ = fs.remove(self.paths.session_file(ctx.session_id));
+        } else if ctx.session_dirty {
+            _ = ctx.session.set(self.session_meta_timeout_key(), asp.runtime.variant_int(ctx.session_timeout_minutes));
+            let _ = asp.runtime.save_store_file(self.paths.session_file(ctx.session_id), ctx.session, ctx.objects);
+            _ = ctx.session.delete(self.session_meta_timeout_key());
+            let session_cookie: String = "egret_asp_session=" + ctx.session_id + "; Path=/; HttpOnly";
+            let existing_cookies: String = ctx.response.headers.get_or("set-cookie", "");
+            _ = ctx.response.add_header("Set-Cookie", std.len(existing_cookies) == 0
+                ? session_cookie
+                : existing_cookies + "\r\nSet-Cookie: " + session_cookie);
+        }
+        eg_asp_request_string_arena_leave(ctx.request_arena_handle);
+    }
+
+    // Construct an isolated request, then hydrate persisted stores into its
+    // object space. The context owns the arena handle and all response buffers.
+    func new_context(self: AspEngine, page_path: String, method: String, query_string: String, body: String, session_id: String) -> asp.runtime.RequestContext {
+        _ = self.ensure_application_started();
+        let sid: String = std.len(session_id) == 0 ? self.app.sessions.create_id() : session_id;
+        let ctx: asp.runtime.RequestContext = new asp.runtime.RequestContext(self.root_dir, self.abs_path(page_path), new asp.runtime.KeyValueStore(), new asp.runtime.KeyValueStore(), sid);
+        ctx.request.method = method;
+        ctx.request.path = page_path;
+        ctx.request.query_string = query_string;
+        ctx.request.body = body;
+        _ = ctx.request.parse_query();
+        ctx.application = self.load_application_store(ctx.objects);
+        ctx.session = self.load_session_store(sid, ctx.objects);
+        self.prepare_loaded_session(ctx);
+        self.populate_server_variables(ctx, page_path, method, query_string);
+        return ctx;
+    }
+
+    // Render a page into an existing context for top-level requests and
+    // Server.Execute/Transfer. Included execution shares ASP state but restores
+    // page identity and execution bookkeeping before returning.
+    func render_page_into_context(self: AspEngine, ctx: asp.runtime.RequestContext, page_path: String) -> Int {
+        // Page compilation populates worker-owned caches, so it must allocate
+        // managed Strings even when the surrounding request uses its arena.
+        eg_asp_request_string_arena_leave(ctx.request_arena_handle);
+        let target: String = self.abs_path(page_path, ctx.page_path);
+        let compiled_page, compile_err = self.compile_page(target);
+        let compiled_page_pin: Int = eg_asp_gc_pin_compiled_page(compiled_page);
+        self.cache.pin(target);
+        if compile_err != OK {
+            ctx.response.status_code = 500;
+            ctx.response.status_text = "Internal Server Error";
+        }
+        let saved: String = ctx.page_path;
+        ctx.page_path = target;
+        _ = eg_asp_request_string_arena_enter(ctx.request_arena_handle);
+        let evaluator: Evaluator = new Evaluator(self);
+        let runner: asp.vm.VbsBytecodeRunner = new asp.vm.VbsBytecodeRunner(evaluator);
+        let i: Int = 0;
+        loop i < compiled_page.node_count() {
+            let node: asp.compiler.PageNode = compiled_page.node_at(i);
+            let program_blob: String = i < compiled_page.program_blob_count() ? compiled_page.program_blob_at(i) : "";
+            let has_resident_program: Bool = i < compiled_page.program_count()
+                && (node.kind == asp.compiler.PageNodeScript || node.kind == asp.compiler.PageNodeExpr);
+            if node.kind == asp.compiler.PageNodeLiteral {
+                _ = ctx.response.write(node.text);
+            } else if node.kind == asp.compiler.PageNodeExpr {
+                let bytecode: asp.vm.VbsBytecodeProgram = has_resident_program
+                    ? compiled_page.program_at(i)
+                    : load_cached_page_node_bytecode(node, program_blob);
+                let bytecode_pin: Int = eg_asp_gc_pin_program(bytecode);
+                _ = ctx.response.write(runner.eval_root_expr(bytecode, ctx).to_output_string());
+                __gc_keepalive(bytecode);
+                eg_asp_gc_unpin_object(bytecode_pin);
+            } else if node.kind == asp.compiler.PageNodeScript {
+                let bytecode: asp.vm.VbsBytecodeProgram = has_resident_program
+                    ? compiled_page.program_at(i)
+                    : load_cached_page_node_bytecode(node, program_blob);
+                let bytecode_pin: Int = eg_asp_gc_pin_program(bytecode);
+                let stop: Int = runner.execute_root(bytecode, ctx);
+                __gc_keepalive(bytecode);
+                eg_asp_gc_unpin_object(bytecode_pin);
+                if stop != 0 || ctx.response.ended {
+                    break;
+                }
+            }
+            i += 1;
+        }
+        ctx.page_path = saved;
+        evaluator.release_dynamic_bytecodes();
+        __gc_keepalive(compiled_page);
+        eg_asp_gc_unpin_object(compiled_page_pin);
+        self.cache.unpin(target);
+        eg_asp_request_string_arena_leave(ctx.request_arena_handle);
+        return 0;
+    }
+
+    // Top-level transaction boundary: create context, render, commit persistent
+    // state, leave the request string arena, and return the finalized response.
+    func render_request(self: AspEngine, page_path: String, method: String, query_string: String, body: String, session_id: String) -> asp.runtime.RequestContext {
+        let ctx: asp.runtime.RequestContext = self.new_context(page_path, method, query_string, body, session_id);
+        // Direct render callers do not provide a FastCGI CONTENT_TYPE map.
+        // Preserve their historical URL-encoded form behavior.
+        _ = ctx.request.parse_form();
+        _ = self.render_page_into_context(ctx, page_path);
+        self.commit_context(ctx);
+        return ctx;
+    }
+}

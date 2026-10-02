@@ -1,0 +1,272 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.object;
+
+use asp;
+use asp.runtime;
+use asp.vm;
+
+use collections;
+use net.redis;
+use protocol.redis;
+use std;
+use strconv;
+use strings;
+
+// Redis component state follows the same split as other network components:
+// RuntimeObject stores reconnectable configuration and ObjectSpace owns the
+// live protocol connection for request lifetime.
+func redis_apply_connection_string(obj: asp.vm.RuntimeObject, text: String) -> Void {
+    let parts: collections.Map<String, String> = asp.parse_connection_string(text);
+    if parts.has("server") {
+        obj.text_value = parts.get("server");
+    } else if parts.has("host") {
+        obj.text_value = parts.get("host");
+    }
+    if parts.has("port") {
+        obj.int_value = strconv.atoi(parts.get("port"));
+    }
+    if parts.has("username") {
+        obj.auxiliary_text = parts.get("username");
+    } else if parts.has("user") {
+        obj.auxiliary_text = parts.get("user");
+    }
+    if parts.has("password") {
+        obj.secondary_text = parts.get("password");
+    }
+    if parts.has("database") {
+        obj.cursor = strconv.atoi(parts.get("database"));
+    } else if parts.has("db") {
+        obj.cursor = strconv.atoi(parts.get("db"));
+    }
+    if parts.has("timeout") {
+        obj.class_name = parts.get("timeout");
+    }
+}
+
+func redis_config(obj: asp.vm.RuntimeObject) -> protocol.redis.Config {
+    let cfg: protocol.redis.Config = new protocol.redis.Config();
+    if std.len(obj.text_value) > 0 {
+        cfg.host = obj.text_value;
+    }
+    if obj.int_value > 0 {
+        cfg.port = obj.int_value;
+    }
+    cfg.username = obj.auxiliary_text;
+    cfg.password = obj.secondary_text;
+    cfg.database = obj.cursor;
+    cfg.client_name = "";
+    if std.len(obj.class_name) > 0 {
+        cfg.timeout_ms = strconv.atoi(obj.class_name);
+        cfg.read_timeout_ms = cfg.timeout_ms;
+        cfg.write_timeout_ms = cfg.timeout_ms;
+    }
+    return cfg;
+}
+
+func redis_open(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject, values: collections.Vector<asp.runtime.Variant>) -> Bool {
+    if ctx.objects.has_redis_connection(obj_id) {
+        ctx.objects.close_redis_connection(obj_id);
+    }
+    if values.len() > 0 {
+        let first: String = values.get(0).to_output_string();
+        if strings.contains(first, "=") {
+            redis_apply_connection_string(obj, first);
+        } else {
+            obj.text_value = first;
+            if values.len() > 1 {
+                obj.int_value = asp.variant_to_int(values.get(1));
+            }
+            if values.len() > 2 {
+                obj.secondary_text = values.get(2).to_output_string();
+            }
+            if values.len() > 3 {
+                obj.cursor = asp.variant_to_int(values.get(3));
+            }
+            if values.len() > 4 {
+                obj.auxiliary_text = values.get(4).to_output_string();
+            }
+        }
+    }
+    let conn, err = net.redis.connect(redis_config(obj));
+    if err != std.OK {
+        evaluator.raise_runtime_error(ctx, 3709, "Redis connection failed with protocol error " + strconv.itoa(err => Int), obj.prog_id);
+        return false;
+    }
+    ctx.objects.put_redis_connection(obj_id, conn);
+    obj.opened = true;
+    evaluator.set_object(ctx, obj_id, obj);
+    return true;
+}
+
+// Preserve RESP null, integer, scalar, and array distinctions when translating
+// into Variants; error replies are handled before this conversion.
+func redis_resp_variant(value: protocol.redis.RespValue) -> asp.runtime.Variant {
+    if value.kind == protocol.redis.RESP_NULL {
+        return asp.runtime.variant_null();
+    }
+    if value.kind == protocol.redis.RESP_INTEGER {
+        return asp.runtime.variant_int(value.int_value);
+    }
+    if value.kind == protocol.redis.RESP_BOOL {
+        return asp.runtime.variant_bool(value.bool_value);
+    }
+    if value.kind == protocol.redis.RESP_ARRAY || value.kind == protocol.redis.RESP_SET || value.kind == protocol.redis.RESP_PUSH || value.kind == protocol.redis.RESP_MAP || value.kind == protocol.redis.RESP_ATTRIBUTE {
+        let items: collections.Vector<asp.runtime.Variant> = new collections.Vector<asp.runtime.Variant>();
+        let i: Int = 0;
+        loop i < value.items.len() {
+            _ = items.push(redis_resp_variant(value.items.get(i)));
+            i += 1;
+        }
+        return asp.runtime.variant_array(items);
+    }
+    return asp.runtime.variant_string(value.text);
+}
+
+// Temporarily take the connection from ObjectSpace to guarantee exclusive use,
+// then return it on both success and failure paths.
+func redis_command(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, args: collections.Vector<String>) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    if !ctx.objects.has_redis_connection(obj_id) || !obj.opened {
+        evaluator.raise_runtime_error(ctx, 91, "Redis connection is not open", obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    if args.len() == 0 {
+        evaluator.raise_runtime_error(ctx, 5, "Redis command name is required", obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    let conn: net.redis.Conn = ctx.objects.take_redis_connection(obj_id);
+    let response, err = conn.command(args);
+    ctx.objects.put_redis_connection(obj_id, conn);
+    if err != std.OK {
+        evaluator.raise_runtime_error(ctx, 3000, "Redis protocol error " + strconv.itoa(err => Int), obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    if response.is_error() {
+        evaluator.raise_runtime_error(ctx, 3000, response.text, obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    return redis_resp_variant(response);
+}
+
+func redis_values_as_args(command: String, values: collections.Vector<asp.runtime.Variant>, start: Int = 0) -> collections.Vector<String> {
+    let args: collections.Vector<String> = new collections.Vector<String>();
+    _ = args.push(command);
+    let i: Int = start;
+    loop i < values.len() {
+        if values.get(i).kind == asp.runtime.VariantArray {
+            let j: Int = 0;
+            loop j < values.get(i).array_data.items.len() {
+                _ = args.push(values.get(i).array_data.items.get(j).to_output_string());
+                j += 1;
+            }
+        } else {
+            _ = args.push(values.get(i).to_output_string());
+        }
+        i += 1;
+    }
+    return args;
+}
+
+func redis_require_args(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj: asp.vm.RuntimeObject, member: String, actual: Int, minimum: Int) -> Bool {
+    if actual >= minimum {
+        return true;
+    }
+    evaluator.raise_runtime_error(ctx, 450, member + " requires at least " + strconv.itoa(minimum) + " argument(s)", obj.prog_id);
+    return false;
+}
+
+// Translate the friendly component methods into exact RESP argument vectors.
+// Arity is checked before network I/O to keep errors deterministic.
+func invoke_redis(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    let name: String = strings.to_lower_ascii(member);
+    if name == "open" {
+        _ = redis_open(evaluator, ctx, obj_id, obj, values);
+        return asp.runtime.variant_empty();
+    }
+    if name == "close" {
+        ctx.objects.close_redis_connection(obj_id);
+        obj.opened = false;
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if name == "state" {
+        return asp.runtime.variant_int(obj.opened && ctx.objects.has_redis_connection(obj_id) ? 1 : 0);
+    }
+    if name == "host" || name == "port" || name == "username" || name == "password" || name == "database" || name == "timeout" {
+        if is_set && values.len() > 0 {
+            if name == "host" {
+                obj.text_value = values.get(values.len() - 1).to_output_string();
+            } else if name == "port" {
+                obj.int_value = asp.variant_to_int(values.get(values.len() - 1));
+            } else if name == "username" {
+                obj.auxiliary_text = values.get(values.len() - 1).to_output_string();
+            } else if name == "password" {
+                obj.secondary_text = values.get(values.len() - 1).to_output_string();
+            } else if name == "database" {
+                obj.cursor = asp.variant_to_int(values.get(values.len() - 1));
+            } else {
+                obj.class_name = values.get(values.len() - 1).to_output_string();
+            }
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        if name == "host" {
+            return asp.runtime.variant_string(std.len(obj.text_value) > 0 ? obj.text_value : "127.0.0.1");
+        }
+        if name == "port" {
+            return asp.runtime.variant_int(obj.int_value > 0 ? obj.int_value : 6379);
+        }
+        if name == "username" {
+            return asp.runtime.variant_string(obj.auxiliary_text);
+        }
+        if name == "password" {
+            return asp.runtime.variant_string(obj.secondary_text);
+        }
+        if name == "database" {
+            return asp.runtime.variant_int(obj.cursor);
+        }
+        return asp.runtime.variant_int(std.len(obj.class_name) > 0 ? strconv.atoi(obj.class_name) : 5000);
+    }
+    if name == "execute" {
+        if !redis_require_args(evaluator, ctx, obj, member, values.len(), 1) {
+            return asp.runtime.variant_empty();
+        }
+        return redis_command(evaluator, ctx, obj_id, redis_values_as_args(strings.to_upper_ascii(values.get(0).to_output_string()), values, 1));
+    }
+    let minimum: Int = name == "ping" ? 0
+        : name == "get" || name == "del" || name == "exists" || name == "ttl" || name == "incr" || name == "decr" || name == "hgetall" || name == "lpop" || name == "rpop" || name == "smembers" ? 1
+        : name == "set" || name == "expire" || name == "lpush" || name == "rpush" || name == "sadd" || name == "hget" ? 2
+        : name == "hset" || name == "setex" || name == "lrange" ? 3
+        : name == "select" || name == "auth" ? 1
+        : -1;
+    if minimum < 0 {
+        evaluator.raise_runtime_error(ctx, 438, "Redis member not found: " + member, obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    if !redis_require_args(evaluator, ctx, obj, member, values.len(), minimum) {
+        return asp.runtime.variant_empty();
+    }
+    let command: String = name == "setex" ? "SETEX" : strings.to_upper_ascii(name);
+    let args: collections.Vector<String> = new collections.Vector<String>();
+    _ = args.push(command);
+    if name == "setex" {
+        _ = args.push(values.get(0).to_output_string());
+        _ = args.push(values.get(2).to_output_string());
+        _ = args.push(values.get(1).to_output_string());
+    } else {
+        let i: Int = 0;
+        loop i < values.len() {
+            _ = args.push(values.get(i).to_output_string());
+            i += 1;
+        }
+    }
+    let result: asp.runtime.Variant = redis_command(evaluator, ctx, obj_id, args);
+    if ctx.error_state.error_number == 0 && name == "select" {
+        obj.cursor = asp.variant_to_int(values.get(0));
+        evaluator.set_object(ctx, obj_id, obj);
+    }
+    return result;
+}

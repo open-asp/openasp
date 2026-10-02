@@ -1,0 +1,615 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.object;
+
+use asp;
+use asp.runtime;
+use asp.vm;
+
+use collections;
+use encoding.xml;
+use fs;
+use std;
+use strconv;
+use strings;
+
+// Byte ranges identify elements inside the document's current XML snapshot.
+// start/end_at cover the whole element; open_end/close_start delimit content;
+// self_closing distinguishes an empty tag from an explicit empty body.
+class XmlRange {
+    var start: Int;
+    var open_end: Int;
+    var close_start: Int;
+    var end: Int;
+    var name: String;
+    var found: Bool;
+
+    func init(self: XmlRange) -> Void {
+        self.start = -1;
+        self.open_end = -1;
+        self.close_start = -1;
+        self.end = -1;
+        self.name = "";
+        self.found = false;
+    }
+}
+
+func xml_name_end(xml: String, start: Int) -> Int {
+    let i: Int = start;
+    loop i < std.len(xml) {
+        let ch: Int = std.byte_at(xml, i);
+        if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '/' || ch == '>' {
+            return i;
+        }
+        i += 1;
+    }
+    return i;
+}
+
+func xml_tag_end(xml: String, start: Int) -> Int {
+    let quote: Int = 0;
+    let i: Int = start;
+    loop i < std.len(xml) {
+        let ch: Int = std.byte_at(xml, i);
+        if quote == '\0' && (ch == '"' || ch == '\'') {
+            quote = ch;
+        } else if quote != '\0' && ch == quote {
+            quote = 0;
+        } else if quote == '\0' && ch == '>' {
+            return i;
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+func xml_is_self_closing(xml: String, tag_end: Int) -> Bool {
+    let i: Int = tag_end - 1;
+    loop i >= 0 && (std.byte_at(xml, i) == ' ' || std.byte_at(xml, i) == '\t' || std.byte_at(xml, i) == '\n' || std.byte_at(xml, i) == '\r') {
+        i -= 1;
+    }
+    return i >= 0 && std.byte_at(xml, i) == '/';
+}
+
+// Scan tags while tracking same-name nesting. Comments, declarations, quoted
+// attributes, and self-closing tags are skipped so returned ranges are balanced.
+func xml_find_element(xml: String, wanted_name: String, search_start: Int = 0) -> XmlRange {
+    let wanted: String = strings.to_lower_ascii(wanted_name);
+    let pos: Int = search_start;
+    loop pos < std.len(xml) {
+        let lt: Int = strings.index_from(xml, "<", pos);
+        if lt < 0 || lt + 1 >= std.len(xml) {
+            return new XmlRange();
+        }
+        let marker: Int = std.byte_at(xml, lt + 1);
+        if marker == '/' || marker == '!' || marker == '?' {
+            let skip_end: Int = xml_tag_end(xml, lt + 1);
+            if skip_end < 0 {
+                return new XmlRange();
+            }
+            pos = skip_end + 1;
+            skip;
+        }
+        let name_end: Int = xml_name_end(xml, lt + 1);
+        let name: String = std.substr(xml, lt + 1, name_end - lt - 1);
+        let open_end: Int = xml_tag_end(xml, name_end);
+        if open_end < 0 {
+            return new XmlRange();
+        }
+        if std.len(wanted) == 0 || wanted == "*" || strings.equal_fold_ascii(name, wanted) {
+            let result: XmlRange = new XmlRange();
+            result.start = lt;
+            result.open_end = open_end;
+            result.name = name;
+            result.found = true;
+            if xml_is_self_closing(xml, open_end) {
+                result.close_start = open_end;
+                result.end = open_end + 1;
+                return result;
+            }
+            let depth: Int = 1;
+            let scan: Int = open_end + 1;
+            loop scan < std.len(xml) {
+                let next_lt: Int = strings.index_from(xml, "<", scan);
+                if next_lt < 0 || next_lt + 1 >= std.len(xml) {
+                    return new XmlRange();
+                }
+                let closing: Bool = std.byte_at(xml, next_lt + 1) == '/';
+                let tag_start: Int = next_lt + (closing ? 2 : 1);
+                if std.byte_at(xml, tag_start) == '!' || std.byte_at(xml, tag_start) == '?' {
+                    let special_end: Int = xml_tag_end(xml, tag_start);
+                    if special_end < 0 {
+                        return new XmlRange();
+                    }
+                    scan = special_end + 1;
+                    skip;
+                }
+                let nested_name_end: Int = xml_name_end(xml, tag_start);
+                let nested_name: String = std.substr(xml, tag_start, nested_name_end - tag_start);
+                let nested_end: Int = xml_tag_end(xml, nested_name_end);
+                if nested_end < 0 {
+                    return new XmlRange();
+                }
+                if strings.equal_fold_ascii(nested_name, name) {
+                    if closing {
+                        depth -= 1;
+                        if depth == 0 {
+                            result.close_start = next_lt;
+                            result.end = nested_end + 1;
+                            return result;
+                        }
+                    } else if !xml_is_self_closing(xml, nested_end) {
+                        depth += 1;
+                    }
+                }
+                scan = nested_end + 1;
+            }
+            return new XmlRange();
+        }
+        pos = open_end + 1;
+    }
+    return new XmlRange();
+}
+
+func xml_last_path_name(xpath: String) -> String {
+    let query: String = strings.trim_space(xpath);
+    let slash: Int = strings.last_index(query, "/");
+    let name: String = slash >= 0 ? std.substr(query, slash + 1, std.len(query) - slash - 1) : query;
+    let predicate: Int = strings.index(name, "[");
+    return predicate >= 0 ? std.substr(name, 0, predicate) : name;
+}
+
+func xml_plain_text(xml: String) -> String {
+    let out: String = "";
+    let in_tag: Bool = false;
+    let i: Int = 0;
+    loop i < std.len(xml) {
+        let ch: Int = std.byte_at(xml, i);
+        if ch == '<' {
+            in_tag = true;
+        } else if ch == '>' {
+            in_tag = false;
+        } else if !in_tag {
+            out += std.substr(xml, i, 1);
+        }
+        i += 1;
+    }
+    return encoding.xml.unescape(out);
+}
+
+func xml_replace_span(source: String, start: Int, end_at: Int, replacement: String) -> String {
+    let out: String = std.substr(source, 0, start) + replacement;
+    if end_at < std.len(source) {
+        out += std.substr(source, end_at, std.len(source) - end_at);
+    }
+    return out;
+}
+
+func xml_cdata(value: String) -> String {
+    return "<![CDATA[" + strings.replace_all(value, "]]>", "]]]]><![CDATA[>") + "]]>";
+}
+
+// Nodes retain their owner document id and cursor range. Mutations rebase all
+// sibling ranges through update_node_owner before publishing new XML.
+func create_xml_node(ctx: asp.runtime.RequestContext, document_id: Int, xml: String, range: XmlRange) -> asp.runtime.Variant {
+    if !range.found {
+        return asp.runtime.variant_nothing();
+    }
+    let obj: asp.vm.RuntimeObject = new asp.vm.RuntimeObject();
+    obj.component_kind = ComponentXmlNode;
+    obj.prog_id = "MSXML2.DOMNode";
+    obj.text_value = std.substr(xml, range.start, range.end - range.start);
+    obj.class_name = range.name;
+    obj.int_value = document_id;
+    obj.auxiliary_int = 1;
+    obj.cursor = range.start;
+    return asp.runtime.variant_object(ctx.objects.add(obj));
+}
+
+func create_xml_nodes(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, document_id: Int, xml: String, xpath: String, single: Bool) -> asp.runtime.Variant {
+    let name: String = xml_last_path_name(xpath);
+    let list: asp.vm.RuntimeObject = new asp.vm.RuntimeObject();
+    list.component_kind = ComponentXmlNodeList;
+    list.prog_id = "MSXML2.DOMNodeList";
+    list.default_member = "Item";
+    let pos: Int = 0;
+    loop pos < std.len(xml) {
+        let range: XmlRange = xml_find_element(xml, name, pos);
+        if !range.found {
+            break;
+        }
+        let node_value: asp.runtime.Variant = create_xml_node(ctx, document_id, xml, range);
+        if single {
+            return node_value;
+        }
+        if list.int_value > 0 {
+            list.text_value += ",";
+        }
+        list.text_value += strconv.itoa(node_value.object_value);
+        list.int_value += 1;
+        pos = range.end > pos ? range.end : pos + 1;
+    }
+    if single {
+        return asp.runtime.variant_nothing();
+    }
+    return asp.runtime.variant_object(ctx.objects.add(list));
+}
+
+func create_parse_error(ctx: asp.runtime.RequestContext, code: Int, reason: String) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = new asp.vm.RuntimeObject();
+    obj.component_kind = ComponentParseError;
+    obj.prog_id = "MSXML2.DOMParseError";
+    obj.int_value = code;
+    obj.text_value = reason;
+    obj.cursor = code == 0 ? 0 : 1;
+    return asp.runtime.variant_object(ctx.objects.add(obj));
+}
+
+// Validate enough structure for the supported DOM subset and publish either a
+// complete document or a parse-error object; stale nodes are not reused.
+func dom_load_xml(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, xml: String) -> Bool {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    let root: XmlRange = xml_find_element(xml, "", 0);
+    let valid: Bool = root.found && root.end > root.start;
+    obj.text_value = valid ? xml : "";
+    obj.int_value = create_parse_error(ctx, valid ? 0 : -1072896680, valid ? "" : "invalid XML document").object_value;
+    evaluator.set_object(ctx, obj_id, obj);
+    return valid;
+}
+
+func invoke_dom_document(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    if strings.equal_fold_ascii(member, "async") || strings.equal_fold_ascii(member, "validateOnParse") || strings.equal_fold_ascii(member, "resolveExternals") || strings.equal_fold_ascii(member, "preserveWhiteSpace") {
+        let bit: Int = strings.equal_fold_ascii(member, "async") ? 1 : (strings.equal_fold_ascii(member, "validateOnParse") ? 2 : (strings.equal_fold_ascii(member, "resolveExternals") ? 4 : 8));
+        if is_set {
+            if property_value(values).is_truthy() {
+                obj.cursor = obj.cursor | bit;
+            } else {
+                obj.cursor = obj.cursor & (15 - bit);
+            }
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_bool((obj.cursor & bit) != 0);
+    }
+    if strings.equal_fold_ascii(member, "loadXML") && values.len() > 0 {
+        return asp.runtime.variant_bool(dom_load_xml(evaluator, ctx, obj_id, values.get(0).to_output_string()));
+    }
+    if strings.equal_fold_ascii(member, "load") && values.len() > 0 {
+        let file_path: String = asp.asp_host_path(values.get(0).to_output_string());
+        let xml, err = fs.read_text(file_path);
+        if err != std.OK {
+            let current: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+            current.int_value = create_parse_error(ctx, -1, "file not found").object_value;
+            evaluator.set_object(ctx, obj_id, current);
+            return asp.runtime.variant_bool(false);
+        }
+        return asp.runtime.variant_bool(dom_load_xml(evaluator, ctx, obj_id, xml));
+    }
+    if strings.equal_fold_ascii(member, "save") && values.len() > 0 {
+        let file_path: String = asp.asp_host_path(values.get(0).to_output_string());
+        let _, err = fs.write_text(file_path, obj.text_value);
+        if err != std.OK {
+            evaluator.raise_runtime_error(ctx, 70, "cannot save XML document: " + file_path, obj.prog_id);
+        }
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "xml") {
+        return asp.runtime.variant_string(obj.text_value);
+    }
+    if strings.equal_fold_ascii(member, "text") {
+        return asp.runtime.variant_string(xml_plain_text(obj.text_value));
+    }
+    if strings.equal_fold_ascii(member, "parseError") {
+        return obj.int_value > 0 ? asp.runtime.variant_object(obj.int_value) : create_parse_error(ctx, 0, "");
+    }
+    if strings.equal_fold_ascii(member, "documentElement") {
+        return create_xml_node(ctx, obj_id, obj.text_value, xml_find_element(obj.text_value, "", 0));
+    }
+    if strings.equal_fold_ascii(member, "selectSingleNode") && values.len() > 0 {
+        return create_xml_nodes(evaluator, ctx, obj_id, obj.text_value, values.get(0).to_output_string(), true);
+    }
+    if strings.equal_fold_ascii(member, "selectNodes") && values.len() > 0 {
+        return create_xml_nodes(evaluator, ctx, obj_id, obj.text_value, values.get(0).to_output_string(), false);
+    }
+    if strings.equal_fold_ascii(member, "createElement") && values.len() > 0 {
+        let name: String = values.get(0).to_output_string();
+        let fragment: String = "<" + name + "></" + name + ">";
+        return create_xml_node(ctx, obj_id, fragment, xml_find_element(fragment, name, 0));
+    }
+    if strings.equal_fold_ascii(member, "createNode") && values.len() > 0 {
+        let node_type: String = strings.to_lower_ascii(strings.trim_space(values.get(0).to_output_string()));
+        if node_type == "cdatasection" || node_type == "4" {
+            let node: asp.vm.RuntimeObject = new asp.vm.RuntimeObject();
+            node.component_kind = ComponentXmlNode;
+            node.prog_id = "MSXML2.DOMNode";
+            node.class_name = "#cdata-section";
+            node.text_value = xml_cdata("");
+            node.int_value = obj_id;
+            node.auxiliary_int = 4;
+            node.cursor = -1;
+            return asp.runtime.variant_object(ctx.objects.add(node));
+        }
+        if node_type == "element" || node_type == "1" {
+            let name: String = values.len() > 1 ? values.get(1).to_output_string() : "";
+            let fragment: String = "<" + name + "></" + name + ">";
+            return create_xml_node(ctx, obj_id, fragment, xml_find_element(fragment, name, 0));
+        }
+        evaluator.raise_runtime_error(ctx, 5, "unsupported XML node type: " + node_type, obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "createCDATASection") {
+        let value: String = values.len() > 0 ? values.get(0).to_output_string() : "";
+        let node: asp.vm.RuntimeObject = new asp.vm.RuntimeObject();
+        node.component_kind = ComponentXmlNode;
+        node.prog_id = "MSXML2.DOMNode";
+        node.class_name = "#cdata-section";
+        node.text_value = xml_cdata(value);
+        node.auxiliary_text = value;
+        node.int_value = obj_id;
+        node.auxiliary_int = 4;
+        node.cursor = -1;
+        return asp.runtime.variant_object(ctx.objects.add(node));
+    }
+    if strings.equal_fold_ascii(member, "createProcessingInstruction") && values.len() > 0 {
+        let target: String = values.get(0).to_output_string();
+        let data: String = values.len() > 1 ? values.get(1).to_output_string() : "";
+        let instruction: asp.vm.RuntimeObject = new asp.vm.RuntimeObject();
+        instruction.component_kind = ComponentXmlNode;
+        instruction.prog_id = "MSXML2.DOMNode";
+        instruction.class_name = target;
+        instruction.text_value = "<?" + target + (std.len(data) > 0 ? " " + data : "") + "?>";
+        instruction.int_value = obj_id;
+        instruction.auxiliary_int = 7;
+        instruction.cursor = 0;
+        let instruction_id: Int = ctx.objects.add(instruction);
+        return asp.runtime.variant_object(instruction_id);
+    }
+    if strings.equal_fold_ascii(member, "childNodes") {
+        return create_xml_nodes(evaluator, ctx, obj_id, obj.text_value, "*", false);
+    }
+    if strings.equal_fold_ascii(member, "insertBefore") && values.len() > 0 && values.get(0).kind == asp.runtime.VariantObject {
+        let child: asp.vm.RuntimeObject = evaluator.get_object(ctx, values.get(0).object_value);
+        let insert_at: Int = 0;
+        if values.len() > 1 && values.get(1).kind == asp.runtime.VariantObject {
+            let reference: asp.vm.RuntimeObject = evaluator.get_object(ctx, values.get(1).object_value);
+            if reference.cursor >= 0 && reference.cursor <= std.len(obj.text_value) {
+                insert_at = reference.cursor;
+            }
+        }
+        obj.text_value = xml_replace_span(obj.text_value, insert_at, insert_at, child.text_value);
+        evaluator.set_object(ctx, obj_id, obj);
+        let attached_child: asp.vm.RuntimeObject = evaluator.get_object(ctx, values.get(0).object_value);
+        attached_child.int_value = obj_id;
+        attached_child.cursor = insert_at;
+        evaluator.set_object(ctx, values.get(0).object_value, attached_child);
+        return values.get(0);
+    }
+    if strings.equal_fold_ascii(member, "appendChild") && values.len() > 0 && values.get(0).kind == asp.runtime.VariantObject {
+        let child: asp.vm.RuntimeObject = evaluator.get_object(ctx, values.get(0).object_value);
+        let attached_cursor: Int = 0;
+        if std.len(obj.text_value) == 0 {
+            obj.text_value = child.text_value;
+            attached_cursor = 0;
+        } else {
+            let root: XmlRange = xml_find_element(obj.text_value, "", 0);
+            if root.found {
+                obj.text_value = xml_replace_span(obj.text_value, root.close_start, root.close_start, child.text_value);
+                attached_cursor = root.close_start;
+            } else {
+                attached_cursor = std.len(obj.text_value);
+                obj.text_value += child.text_value;
+            }
+        }
+        evaluator.set_object(ctx, obj_id, obj);
+        let attached_child: asp.vm.RuntimeObject = evaluator.get_object(ctx, values.get(0).object_value);
+        attached_child.int_value = obj_id;
+        attached_child.cursor = attached_cursor;
+        evaluator.set_object(ctx, values.get(0).object_value, attached_child);
+        return values.get(0);
+    }
+    evaluator.raise_runtime_error(ctx, 438, "DOMDocument member not found: " + member, obj.prog_id);
+    return asp.runtime.variant_empty();
+}
+
+func xml_node_attribute(xml: String, name: String) -> String {
+    let tag_end: Int = xml_tag_end(xml, 1);
+    if tag_end < 0 {
+        return "";
+    }
+    let opening: String = std.substr(xml, 0, tag_end + 1);
+    let lower: String = strings.to_lower_ascii(opening);
+    let needle: String = strings.to_lower_ascii(name) + "=";
+    let at: Int = strings.index(lower, needle);
+    if at < 0 {
+        return "";
+    }
+    let value_at: Int = at + std.len(needle);
+    if value_at >= std.len(opening) {
+        return "";
+    }
+    let quote: String = std.substr(opening, value_at, 1);
+    let end_at: Int = strings.index_from(opening, quote, value_at + 1);
+    if (quote != "\"" && quote != "'") || end_at < 0 {
+        return "";
+    }
+    return encoding.xml.unescape(std.substr(opening, value_at + 1, end_at - value_at - 1));
+}
+
+func xml_node_set_attribute(xml: String, name: String, value: String) -> String {
+    let tag_end: Int = xml_tag_end(xml, 1);
+    if tag_end < 0 {
+        return xml;
+    }
+    let opening: String = std.substr(xml, 0, tag_end + 1);
+    let lower: String = strings.to_lower_ascii(opening);
+    let needle: String = strings.to_lower_ascii(name) + "=";
+    let at: Int = strings.index(lower, needle);
+    let escaped: String = encoding.xml.escape(value);
+    if at >= 0 {
+        let value_at: Int = at + std.len(needle);
+        let quote: String = std.substr(opening, value_at, 1);
+        let end_at: Int = strings.index_from(opening, quote, value_at + 1);
+        if end_at >= 0 {
+            return xml_replace_span(xml, value_at + 1, end_at, escaped);
+        }
+    }
+    return xml_replace_span(xml, tag_end, tag_end, " " + name + "=\"" + escaped + "\"");
+}
+
+// Replace one node span in the owner document and adjust every registered node
+// cursor after it. This preserves object identity across local DOM mutations.
+func update_node_owner(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, document_id: Int, node_cursor: Int, old_text: String, replacement: String) -> Void {
+    if document_id <= 0 {
+        return;
+    }
+    let document: asp.vm.RuntimeObject = evaluator.get_object(ctx, document_id);
+    let document_old_text: String = document.text_value;
+    let start: Int = -1;
+    if node_cursor >= 0 && node_cursor + std.len(old_text) <= std.len(document.text_value)
+        && std.substr(document.text_value, node_cursor, std.len(old_text)) == old_text {
+        start = node_cursor;
+    } else {
+        start = strings.index(document.text_value, old_text);
+    }
+    let end_at: Int = start + std.len(old_text);
+    if start >= 0 && end_at >= start && end_at <= std.len(document.text_value) {
+        document.text_value = xml_replace_span(document.text_value, start, end_at, replacement);
+        let parent_is_node: Bool = asp.object.kind_of(document) == ComponentXmlNode;
+        let parent_id: Int = document.int_value;
+        let parent_cursor: Int = document.cursor;
+        let document_replacement: String = document.text_value;
+        evaluator.set_object(ctx, document_id, document);
+        if parent_is_node {
+            update_node_owner(evaluator, ctx, parent_id, parent_cursor, document_old_text, document_replacement);
+        }
+    }
+}
+
+func update_node_document(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, node: asp.vm.RuntimeObject, old_text: String, replacement: String) -> Void {
+    update_node_owner(evaluator, ctx, node.int_value, node.cursor, old_text, replacement);
+}
+
+func invoke_xml_node(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    let range: XmlRange = xml_find_element(obj.text_value, "", 0);
+    if strings.equal_fold_ascii(member, "nodeName") {
+        return asp.runtime.variant_string(obj.class_name);
+    }
+    if strings.equal_fold_ascii(member, "nodeType") {
+        return asp.runtime.variant_int(obj.auxiliary_int > 0 ? obj.auxiliary_int : 1);
+    }
+    if strings.equal_fold_ascii(member, "xml") {
+        return asp.runtime.variant_string(obj.text_value);
+    }
+    if strings.equal_fold_ascii(member, "nodeValue") && obj.auxiliary_int == 4 {
+        if is_set {
+            let old_text: String = obj.text_value;
+            obj.auxiliary_text = property_value(values).to_output_string();
+            obj.text_value = xml_cdata(obj.auxiliary_text);
+            update_node_document(evaluator, ctx, obj, old_text, obj.text_value);
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_string(obj.auxiliary_text);
+    }
+    if strings.equal_fold_ascii(member, "text") {
+        if is_set && range.found {
+            let old_text: String = obj.text_value;
+            let replacement: String = encoding.xml.escape(property_value(values).to_output_string());
+            obj.text_value = xml_replace_span(obj.text_value, range.open_end + 1, range.close_start, replacement);
+            update_node_document(evaluator, ctx, obj, old_text, obj.text_value);
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_string(xml_plain_text(obj.text_value));
+    }
+    if strings.equal_fold_ascii(member, "getAttribute") && values.len() > 0 {
+        return asp.runtime.variant_string(xml_node_attribute(obj.text_value, values.get(0).to_output_string()));
+    }
+    if strings.equal_fold_ascii(member, "setAttribute") && values.len() > 1 {
+        let old_text: String = obj.text_value;
+        obj.text_value = xml_node_set_attribute(obj.text_value, values.get(0).to_output_string(), values.get(1).to_output_string());
+        update_node_document(evaluator, ctx, obj, old_text, obj.text_value);
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "selectSingleNode") && values.len() > 0 {
+        return create_xml_nodes(evaluator, ctx, obj_id, obj.text_value, values.get(0).to_output_string(), true);
+    }
+    if strings.equal_fold_ascii(member, "selectNodes") && values.len() > 0 {
+        return create_xml_nodes(evaluator, ctx, obj_id, obj.text_value, values.get(0).to_output_string(), false);
+    }
+    if strings.equal_fold_ascii(member, "childNodes") {
+        return create_xml_nodes(evaluator, ctx, obj_id, range.found ? std.substr(obj.text_value, range.open_end + 1, range.close_start - range.open_end - 1) : "", "*", false);
+    }
+    if strings.equal_fold_ascii(member, "appendChild") && values.len() > 0 && values.get(0).kind == asp.runtime.VariantObject && range.found {
+        let child: asp.vm.RuntimeObject = evaluator.get_object(ctx, values.get(0).object_value);
+        let old_text: String = obj.text_value;
+        obj.text_value = xml_replace_span(obj.text_value, range.close_start, range.close_start, child.text_value);
+        update_node_document(evaluator, ctx, obj, old_text, obj.text_value);
+        evaluator.set_object(ctx, obj_id, obj);
+        let attached_child: asp.vm.RuntimeObject = evaluator.get_object(ctx, values.get(0).object_value);
+        attached_child.int_value = obj_id;
+        attached_child.cursor = range.close_start;
+        evaluator.set_object(ctx, values.get(0).object_value, attached_child);
+        return values.get(0);
+    }
+    evaluator.raise_runtime_error(ctx, 438, "XML node member not found: " + member, obj.prog_id);
+    return asp.runtime.variant_empty();
+}
+
+func invoke_xml_node_list(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    _ = is_set;
+    if strings.equal_fold_ascii(member, "length") {
+        return asp.runtime.variant_int(obj.int_value);
+    }
+    if strings.equal_fold_ascii(member, "nextNode") {
+        let ids: collections.Vector<String> = strings.split(obj.text_value, ",");
+        if obj.cursor >= obj.int_value || obj.cursor >= ids.len() {
+            return asp.runtime.variant_nothing();
+        }
+        let result: asp.runtime.Variant = asp.runtime.variant_object(strconv.atoi(ids.get(obj.cursor)));
+        obj.cursor += 1;
+        evaluator.set_object(ctx, obj_id, obj);
+        return result;
+    }
+    if strings.equal_fold_ascii(member, "reset") {
+        obj.cursor = 0;
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if (strings.equal_fold_ascii(member, "item") || std.len(member) == 0) && values.len() > 0 {
+        let index: Int = asp.variant_to_int(values.get(0));
+        let ids: collections.Vector<String> = strings.split(obj.text_value, ",");
+        if index >= 0 && index < obj.int_value && index < ids.len() {
+            return asp.runtime.variant_object(strconv.atoi(ids.get(index)));
+        }
+        return asp.runtime.variant_nothing();
+    }
+    evaluator.raise_runtime_error(ctx, 438, "XML node list member not found: " + member, obj.prog_id);
+    return asp.runtime.variant_empty();
+}
+
+func invoke_parse_error(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    _ = values;
+    _ = is_set;
+    let key: String = strings.to_lower_ascii(member);
+    if key == "errorcode" {
+        return asp.runtime.variant_int(obj.int_value);
+    }
+    if key == "reason" {
+        return asp.runtime.variant_string(obj.text_value);
+    }
+    if key == "line" {
+        return asp.runtime.variant_int(obj.cursor);
+    }
+    if key == "linepos" || key == "filepos" {
+        return asp.runtime.variant_int(0);
+    }
+    evaluator.raise_runtime_error(ctx, 438, "parse error member not found: " + member, obj.prog_id);
+    return asp.runtime.variant_empty();
+}

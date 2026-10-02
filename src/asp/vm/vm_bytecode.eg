@@ -1,0 +1,2575 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.vm;
+
+use asp.runtime;
+use asp.compiler;
+
+use asp;
+use std;
+use bytes;
+use strconv;
+use strings;
+use collections;
+use time;
+use os;
+
+extern func eg_gc_preempt_guard_enter() -> Void;
+extern func eg_gc_preempt_guard_leave() -> Void;
+extern func eg_asp_mmap_matches(handle: Int, offset: Int, expected: String) -> Int;
+extern func eg_asp_mmap_read_u32(handle: Int, offset: Int) -> Int;
+extern func eg_asp_mmap_read_i64(handle: Int, offset: Int) -> Int;
+extern func eg_asp_mmap_checksum(handle: Int, offset: Int, length: Int) -> Int;
+
+// Compiler optimizations are enabled unless the process-wide command option is
+// explicitly off. Dynamic Eval/Execute compilation uses the same policy.
+func vbs_compiler_optimizations_enabled() -> Bool {
+    let value, value_err = os.getenv("EGRET_ASP_OPTIMIZE");
+    if value_err != OK || std.len(value) == 0 {
+        return true;
+    }
+    return !strings.equal_fold_ascii(value, "off")
+        && !strings.equal_fold_ascii(value, "false")
+        && value != "0";
+}
+
+// Structured non-local control flow returned by statement execution. Signals
+// travel through nested blocks until the matching routine or loop consumes one.
+enum ExecSignal {
+    ExecSignalNone,
+    ExecSignalStopPage,
+    ExecSignalExitFunction,
+    ExecSignalExitSub,
+    ExecSignalExitFor,
+    ExecSignalExitDo,
+}
+
+// Compatibility result used where statement execution also needs a return
+// value or recoverable-error marker.
+class ExecResult {
+    var signal: ExecSignal;
+    var value: asp.runtime.Variant;
+    var had_error: Bool;
+
+    func init(self: ExecResult) -> Void {
+        self.signal = ExecSignalNone;
+        self.value = asp.runtime.variant_empty();
+        self.had_error = false;
+    }
+}
+
+func exec_result_none() -> ExecResult {
+    return new ExecResult();
+}
+
+func exec_result_signal(signal: ExecSignal) -> ExecResult {
+    let out: ExecResult = new ExecResult();
+    out.signal = signal;
+    return out;
+}
+
+func exec_result_error() -> ExecResult {
+    let out: ExecResult = new ExecResult();
+    out.had_error = true;
+    return out;
+}
+
+// Bytecode values are persisted and mirrored by the native C dispatcher.
+// Existing opcode numbers are therefore ABI: append operations, never reorder.
+enum VbsBytecodeOp {
+    VbsBytecodeHalt,
+    VbsBytecodeExecStmt,
+    VbsBytecodeJump,
+    VbsBytecodeJumpIfFalse,
+    VbsBytecodePop,
+    VbsBytecodeDup,
+    VbsBytecodeReturnSignal,
+    VbsBytecodeForLoop,
+    VbsBytecodeForEachLoop,
+    VbsBytecodeSelectDispatch,
+    VbsBytecodePushExprLeaf,
+    VbsBytecodeNeg,
+    VbsBytecodeConcat,
+    VbsBytecodeEq,
+    VbsBytecodeNe,
+    VbsBytecodeLt,
+    VbsBytecodeLe,
+    VbsBytecodeGt,
+    VbsBytecodeGe,
+    VbsBytecodeAdd,
+    VbsBytecodeSub,
+    VbsBytecodeMul,
+    VbsBytecodeDiv,
+    VbsBytecodeIntDiv,
+    VbsBytecodeMod,
+    VbsBytecodeNot,
+    VbsBytecodeAnd,
+    VbsBytecodeOr,
+    VbsBytecodeXor,
+    VbsBytecodeCallExpr,
+    VbsBytecodeTargetAccessExpr,
+    VbsBytecodeMemberAccessExpr,
+    VbsBytecodeAssignStmt,
+    VbsBytecodeAssignIdentifier,
+    VbsBytecodeAssignSessionValue,
+    VbsBytecodeAssignApplicationValue,
+    VbsBytecodeAssignSessionTimeout,
+    VbsBytecodeAssignResponseContentType,
+    VbsBytecodeAssignResponseCharset,
+    VbsBytecodeAssignResponseBuffer,
+    VbsBytecodeAssignResponseStatus,
+    VbsBytecodeAssignTargetDefault,
+    VbsBytecodeAssignTargetMember,
+    VbsBytecodeCallStmt,
+    VbsBytecodeIs,
+    VbsBytecodeInlineEnter,
+    VbsBytecodeInlineExit,
+    VbsBytecodePushInlineParam,
+    VbsBytecodePushGlobalExprLeaf,
+    VbsBytecodePushScalarSlot,
+    VbsBytecodeAssignScalarSlot,
+    VbsBytecodeInitScalarArray,
+    VbsBytecodeReDimScalarArray,
+    VbsBytecodePow,
+    VbsBytecodeWriteLiteral,
+    VbsBytecodeConcatN,
+    VbsBytecodePushGlobalSlot,
+    VbsBytecodeAssignGlobalSlot,
+    VbsBytecodeReDimIdentifier,
+    VbsBytecodeObjectCallStmt,
+    VbsBytecodeOnErrorResumeNext,
+    VbsBytecodeOnErrorGoto0,
+}
+
+// Compiler-derived capabilities for a routine frame. C-safe is deliberately
+// separate from metadata availability because known frames can still require
+// managed error handling or dynamic execution.
+enum VbsRoutineFrameFlag {
+    VbsRoutineFrameHasMetadata = 1,
+    VbsRoutineFrameCSafe = 2,
+    VbsRoutineFrameOnError = 4,
+    VbsRoutineFrameExecute = 8,
+    VbsRoutineFrameRecursiveSafe = 16,
+}
+
+// Lazy cache for decoded slot names. The descriptor is immutable, so one
+// hydration can be shared by every invocation of the routine.
+class VbsRoutineSlotNameCache {
+    var hydrated: Bool;
+    var names: collections.Vector<String>;
+
+    func init(self: VbsRoutineSlotNameCache) -> Void {
+        self.hydrated = false;
+        self.names = new collections.Vector<String>();
+    }
+}
+
+// Executable program plus immutable compiler metadata.
+//
+// Instructions use three Int words `[opcode, arg0, arg1]`; PCs count
+// instructions, not words. A program may source words from `insns` or directly
+// from an mmap image. All metadata vectors are indexed by IDs in instructions.
+class VbsBytecodeProgram {
+    var program: asp.compiler.VbsProgram;
+    var serialized_program: String;
+    // Lazily-created immutable C instruction view. It has the same lifetime as
+    // the resident bytecode program and avoids rebuilding/copying it per call.
+    var native_program_handle: Int;
+    var expr_only: Bool;
+    var root_pc: Int;
+    var root_expr_id: Int;
+    // Packed instruction stream: [op, arg0, arg1, op, arg0, arg1, ...].
+    // Keeping one contiguous vector improves VM locality and makes the
+    // serialized representation directly executable after one linear read.
+    var insns: collections.Vector<Int>;
+    var mapped_image_handle: Int;
+    var mapped_insn_offset: Int;
+    var mapped_instruction_count: Int;
+    var block_pcs: collections.Vector<Int>;
+    var block_end_pcs: collections.Vector<Int>;
+    var routine_slot_counts: collections.Vector<Int>;
+    var routine_slot_names: collections.Vector<String>;
+    // Decoded frame names are immutable. Keep one rooted vector per routine
+    // instead of unpacking the descriptor (and allocating every name substring)
+    // on every call/copy-back operation.
+    var routine_slot_name_cache: collections.Vector<VbsRoutineSlotNameCache>;
+    var routine_block_ids: collections.Vector<Int>;
+    var routine_writes_masks: collections.Vector<Int>;
+    var routine_param_counts: collections.Vector<Int>;
+    var routine_owners: collections.Vector<String>;
+    var literal_strings: collections.Vector<String>;
+    // ABI-stable, case-folded names addressed by the global slot opcodes.
+    // An empty vector means legacy/slow global binding.
+    var global_slot_names: collections.Vector<String>;
+    var errors: collections.Vector<String>;
+
+    func init(self: VbsBytecodeProgram) -> Void {
+        self.program = new asp.compiler.VbsProgram();
+        self.serialized_program = "";
+        self.native_program_handle = 0;
+        self.expr_only = false;
+        self.root_pc = -1;
+        self.root_expr_id = -1;
+        self.insns = new collections.Vector<Int>();
+        self.mapped_image_handle = 0;
+        self.mapped_insn_offset = 0;
+        self.mapped_instruction_count = 0;
+        self.block_pcs = new collections.Vector<Int>();
+        self.block_end_pcs = new collections.Vector<Int>();
+        self.routine_slot_counts = new collections.Vector<Int>();
+        self.routine_slot_names = new collections.Vector<String>();
+        self.routine_slot_name_cache = new collections.Vector<VbsRoutineSlotNameCache>();
+        self.routine_block_ids = new collections.Vector<Int>();
+        self.routine_writes_masks = new collections.Vector<Int>();
+        self.routine_param_counts = new collections.Vector<Int>();
+        self.routine_owners = new collections.Vector<String>();
+        self.literal_strings = new collections.Vector<String>();
+        self.global_slot_names = new collections.Vector<String>();
+        self.errors = new collections.Vector<String>();
+    }
+
+    func ok(self: VbsBytecodeProgram) -> Bool {
+        return self.errors.len() == 0 && self.program.ok();
+    }
+
+    func add_error(self: VbsBytecodeProgram, msg: String) -> Void {
+        _ = self.errors.push(msg);
+    }
+
+    // Accessors hide managed versus mapped instruction storage. Mapped reads
+    // are guarded against concurrent preemption-driven image release.
+    func instruction_count(self: VbsBytecodeProgram) -> Int {
+        return self.mapped_image_handle != 0
+            ? self.mapped_instruction_count
+            : self.insns.len() / 3;
+    }
+
+    func instruction_word(self: VbsBytecodeProgram, index: Int) -> Int {
+        if self.mapped_image_handle != 0 {
+            return index >= 0 && index < self.mapped_instruction_count * 3
+                ? eg_asp_mmap_read_i64(
+                    self.mapped_image_handle,
+                    self.mapped_insn_offset + index * 8
+                )
+                : 0;
+        }
+        return self.insns.get_unchecked(index);
+    }
+
+    // Constructs the C instruction view only after vectors and metadata stop
+    // mutating. Callers must not emit or patch instructions after this point.
+    func prepare_immutable(self: VbsBytecodeProgram) -> Void {
+        let routine_id: Int = 0;
+        loop routine_id < self.routine_slot_names.len() {
+            let _ = vbs_routine_slot_names(self, routine_id);
+            routine_id += 1;
+        }
+    }
+}
+
+// Frame descriptors pack flags and slot names into one cache-friendly string.
+func vbs_routine_frame_descriptor(flags: Int, names: collections.Vector<String>) -> String {
+    return "G" + std.char_from_code(64 + flags) + asp.runtime.pack_string_parts(names);
+}
+
+// Decodes and memoizes routine frame metadata while accepting old bytecode that
+// lacks descriptors.
+func vbs_routine_frame_flags(bytecode: VbsBytecodeProgram, routine_id: Int) -> Int {
+    if routine_id < 0 || routine_id >= bytecode.routine_slot_names.len() {
+        return 0;
+    }
+    let descriptor: String = bytecode.routine_slot_names.get_unchecked(routine_id);
+    if std.len(descriptor) >= 2 && std.byte_at(descriptor, 0) == 'G' {
+        return std.byte_at(descriptor, 1) - 64;
+    }
+    if std.len(descriptor) == 0 || std.byte_at(descriptor, 0) != 'F' {
+        return routine_id < bytecode.routine_slot_counts.len() && bytecode.routine_slot_counts.get_unchecked(routine_id) > 0
+            ? (VbsRoutineFrameHasMetadata => Int) | (VbsRoutineFrameCSafe => Int) | (VbsRoutineFrameRecursiveSafe => Int)
+            : 0;
+    }
+    let separator: Int = strings.find_substr(descriptor, ":");
+    return separator > 1 ? strconv.atoi(std.substr(descriptor, 1, separator - 1)) : 0;
+}
+
+func vbs_routine_slot_names(bytecode: VbsBytecodeProgram, routine_id: Int) -> collections.Vector<String> {
+    if routine_id < 0 || routine_id >= bytecode.routine_slot_names.len() {
+        return new collections.Vector<String>();
+    }
+    loop bytecode.routine_slot_name_cache.len() <= routine_id {
+        _ = bytecode.routine_slot_name_cache.push(new VbsRoutineSlotNameCache());
+    }
+    let cache: VbsRoutineSlotNameCache = bytecode.routine_slot_name_cache.get_unchecked(routine_id);
+    if cache.hydrated {
+        return cache.names;
+    }
+    let descriptor: String = bytecode.routine_slot_names.get_unchecked(routine_id);
+    if std.len(descriptor) >= 2 && std.byte_at(descriptor, 0) == 'G' {
+        cache.names = asp.runtime.unpack_string_parts(std.substr(descriptor, 2, std.len(descriptor) - 2));
+    } else if std.len(descriptor) > 0 && std.byte_at(descriptor, 0) == 'F' {
+        let separator: Int = strings.find_substr(descriptor, ":");
+        if separator > 1 {
+            cache.names = asp.runtime.unpack_string_parts(std.substr(descriptor, separator + 1, std.len(descriptor) - separator - 1));
+        } else {
+            cache.names = asp.runtime.unpack_string_parts(descriptor);
+        }
+    } else {
+        cache.names = asp.runtime.unpack_string_parts(descriptor);
+    }
+    cache.hydrated = true;
+    return cache.names;
+}
+
+// Lowers AST IDs into fixed-width bytecode. Its state consists of the active
+// program/output, name-to-slot bindings, jump patch lists, and routine/class
+// context; public compile entry points reset all four groups.
+class VbsBytecodeCompiler {
+    var bytecode: VbsBytecodeProgram;
+    var loop_stack: collections.Vector<Int>;
+    var loop_handles_exit_for: collections.Vector<Int>;
+    var loop_handles_exit_do: collections.Vector<Int>;
+    var loop_patch_loop_ids: collections.Vector<Int>;
+    var loop_patch_pcs: collections.Vector<Int>;
+    var current_routine_id: Int;
+    var routine_index_keys: collections.Vector<String>;
+    var routine_index_values: collections.Vector<Int>;
+    var routine_index_capacity: Int;
+    var inline_return_expr_cache: collections.Vector<Int>;
+    var current_scalar_slot_names: collections.Vector<String>;
+    var current_scalar_array_slot_names: collections.Vector<String>;
+    var current_routine_frame_flags: Int;
+    var global_binding_names: collections.Vector<String>;
+    var global_binding_index: collections.Map<String, Int>;
+    var unsafe_scalar_call_names: collections.Vector<String>;
+    var optimization_enabled: Bool;
+    var optimizer: asp.compiler.VbsOptimizer;
+
+    func init(self: VbsBytecodeCompiler) -> Void {
+        self.bytecode = new VbsBytecodeProgram();
+        self.loop_stack = new collections.Vector<Int>();
+        self.loop_handles_exit_for = new collections.Vector<Int>();
+        self.loop_handles_exit_do = new collections.Vector<Int>();
+        self.loop_patch_loop_ids = new collections.Vector<Int>();
+        self.loop_patch_pcs = new collections.Vector<Int>();
+        self.current_routine_id = -1;
+        self.routine_index_keys = new collections.Vector<String>();
+        self.routine_index_values = new collections.Vector<Int>();
+        self.routine_index_capacity = 0;
+        self.inline_return_expr_cache = new collections.Vector<Int>();
+        self.current_scalar_slot_names = new collections.Vector<String>();
+        self.current_scalar_array_slot_names = new collections.Vector<String>();
+        self.current_routine_frame_flags = 0;
+        self.global_binding_names = new collections.Vector<String>();
+        self.global_binding_index = new collections.Map<String, Int>();
+        self.unsafe_scalar_call_names = new collections.Vector<String>();
+        self.optimization_enabled = true;
+        self.optimizer = new asp.compiler.VbsOptimizer(new asp.compiler.VbsProgram());
+    }
+
+    // Slot collectors run before emission. Names are ASCII-folded and assigned
+    // once so runtime opcodes can use integer indexes without map lookups.
+    func scalar_slot_index(self: VbsBytecodeCompiler, name: String) -> Int {
+        let i: Int = 0;
+        loop i < self.current_scalar_slot_names.len() {
+            if strings.equal_fold_ascii(self.current_scalar_slot_names.get(i), name) {
+                return i;
+            }
+            i += 1;
+        }
+        return -1;
+    }
+
+    func add_scalar_slot(self: VbsBytecodeCompiler, name: String) -> Void {
+        if std.len(name) != 0 && self.scalar_slot_index(name) < 0 {
+            _ = self.current_scalar_slot_names.push(name);
+        }
+    }
+
+    func scalar_array_slot_index(self: VbsBytecodeCompiler, name: String) -> Int {
+        let i: Int = 0;
+        loop i < self.current_scalar_array_slot_names.len() {
+            if strings.equal_fold_ascii(self.current_scalar_array_slot_names.get(i), name) {
+                return i;
+            }
+            i += 1;
+        }
+        return -1;
+    }
+
+    func add_scalar_array_slot(self: VbsBytecodeCompiler, name: String) -> Void {
+        self.add_scalar_slot(name);
+        if std.len(name) != 0 && self.scalar_array_slot_index(name) < 0 {
+            _ = self.current_scalar_array_slot_names.push(name);
+        }
+    }
+
+    func has_global_binding(self: VbsBytecodeCompiler, name: String) -> Bool {
+        return self.global_binding_index.get_or(strings.to_lower_ascii(name), -1) >= 0;
+    }
+
+    func global_binding_slot(self: VbsBytecodeCompiler, name: String) -> Int {
+        return self.global_binding_index.get_or(strings.to_lower_ascii(name), -1);
+    }
+
+    func add_global_binding(self: VbsBytecodeCompiler, name: String) -> Void {
+        if std.len(name) != 0 && strings.find_substr(name, ".") < 0 && !self.has_global_binding(name) {
+            let canonical: String = strings.to_lower_ascii(name);
+            let slot: Int = self.global_binding_names.len();
+            _ = self.global_binding_names.push(canonical);
+            _ = self.global_binding_index.set(canonical, slot);
+        }
+    }
+
+    func stmt_identifier_target(self: VbsBytecodeCompiler, stmt: asp.compiler.VbsStmtNode) -> String {
+        if std.len(stmt.target_name) != 0 {
+            return stmt.target_name;
+        }
+        if stmt.target_expr_id < 0 || stmt.target_expr_id >= self.bytecode.program.exprs.len() {
+            return "";
+        }
+        let target_expr: asp.compiler.VbsExprNode = self.bytecode.program.snapshot_expr(stmt.target_expr_id);
+        if target_expr.kind == asp.compiler.VbsExprIdentifier {
+            return target_expr.text;
+        }
+        if target_expr.kind == asp.compiler.VbsExprCall && target_expr.left_id >= 0 && target_expr.left_id < self.bytecode.program.exprs.len() && std.len(target_expr.text) == 0 && target_expr.arg_ids.len() == 0 {
+            let left_expr: asp.compiler.VbsExprNode = self.bytecode.program.snapshot_expr(target_expr.left_id);
+            if left_expr.kind == asp.compiler.VbsExprIdentifier {
+                return left_expr.text;
+            }
+        }
+        return "";
+    }
+
+    func stmt_scalar_target_arg_count(self: VbsBytecodeCompiler, stmt: asp.compiler.VbsStmtNode, slot_name: String) -> Int {
+        if stmt.target_expr_id >= 0 && stmt.target_expr_id < self.bytecode.program.exprs.len() {
+            let target_expr: asp.compiler.VbsExprNode = self.bytecode.program.snapshot_expr(stmt.target_expr_id);
+            if target_expr.kind == asp.compiler.VbsExprCall {
+                if target_expr.left_id < 0 && strings.equal_fold_ascii(target_expr.text, slot_name) {
+                    return target_expr.arg_ids.len();
+                }
+                if target_expr.left_id >= 0 && target_expr.left_id < self.bytecode.program.exprs.len() && std.len(target_expr.text) == 0 {
+                    let left_expr: asp.compiler.VbsExprNode = self.bytecode.program.snapshot_expr(target_expr.left_id);
+                    if left_expr.kind == asp.compiler.VbsExprIdentifier && strings.equal_fold_ascii(left_expr.text, slot_name) {
+                        return target_expr.arg_ids.len();
+                    }
+                }
+            }
+            return 0;
+        }
+        return stmt.target_arg_ids.len();
+    }
+
+    func compile_scalar_target_args(self: VbsBytecodeCompiler, stmt: asp.compiler.VbsStmtNode, slot_name: String) -> Int {
+        if stmt.target_expr_id >= 0 && stmt.target_expr_id < self.bytecode.program.exprs.len() {
+            let target_expr: asp.compiler.VbsExprNode = self.bytecode.program.snapshot_expr(stmt.target_expr_id);
+            let count: Int = self.stmt_scalar_target_arg_count(stmt, slot_name);
+            let i: Int = 0;
+            loop i < count {
+                self.compile_expr_node(target_expr.arg_ids.get(i));
+                i += 1;
+            }
+            return count;
+        }
+        let i: Int = 0;
+        loop i < stmt.target_arg_ids.len() {
+            self.compile_expr_node(stmt.target_arg_ids.get(i));
+            i += 1;
+        }
+        return stmt.target_arg_ids.len();
+    }
+
+    func collect_global_bindings_from_block(self: VbsBytecodeCompiler, block_id: Int) -> Void {
+        if block_id < 0 || block_id >= self.bytecode.program.blocks.len() {
+            return;
+        }
+        let stmt_ids: collections.Vector<Int> = asp.compiler.deserialize_vbs_stmt_block(
+            asp.compiler.serialize_vbs_stmt_block(self.bytecode.program.blocks.get(block_id))
+        ).stmt_ids;
+        let i: Int = 0;
+        loop i < stmt_ids.len() {
+            let stmt_id: Int = stmt_ids.get(i);
+            if stmt_id >= 0 && stmt_id < self.bytecode.program.stmts.len() {
+                eg_gc_preempt_guard_enter();
+                let serialized_stmt: String = asp.compiler.serialize_vbs_stmt_node(self.bytecode.program.get_stmt(stmt_id));
+                eg_gc_preempt_guard_leave();
+                let stmt: asp.compiler.VbsStmtNode = asp.compiler.deserialize_vbs_stmt_node(serialized_stmt);
+                if stmt.kind == asp.compiler.VbsStmtDim || stmt.kind == asp.compiler.VbsStmtConst {
+                    let j: Int = 0;
+                    loop j < stmt.names.len() {
+                        self.add_global_binding(stmt.names.get(j));
+                        j += 1;
+                    }
+                } else if stmt.kind == asp.compiler.VbsStmtReDim {
+                    self.add_global_binding(stmt.target_name);
+                } else if stmt.kind == asp.compiler.VbsStmtAssign || stmt.kind == asp.compiler.VbsStmtSetAssign {
+                    let target_name: String = self.stmt_identifier_target(stmt);
+                    if self.stmt_scalar_target_arg_count(stmt, target_name) == 0 {
+                        self.add_global_binding(target_name);
+                    }
+                } else if stmt.kind == asp.compiler.VbsStmtFor || stmt.kind == asp.compiler.VbsStmtForEach {
+                    self.add_global_binding(stmt.target_name);
+                }
+                if stmt.kind == asp.compiler.VbsStmtIf {
+                    self.collect_global_bindings_from_block(stmt.then_block_id);
+                    if stmt.else_block_id >= 0 {
+                        self.collect_global_bindings_from_block(stmt.else_block_id);
+                    }
+                } else if stmt.kind == asp.compiler.VbsStmtWhile || stmt.kind == asp.compiler.VbsStmtDoLoop || stmt.kind == asp.compiler.VbsStmtFor || stmt.kind == asp.compiler.VbsStmtForEach || stmt.kind == asp.compiler.VbsStmtWith {
+                    self.collect_global_bindings_from_block(stmt.body_block_id);
+                } else if stmt.kind == asp.compiler.VbsStmtSelectCase {
+                    let j: Int = 0;
+                    loop j < stmt.case_clause_ids.len() {
+                        let clause_id: Int = stmt.case_clause_ids.get(j);
+                        if clause_id >= 0 && clause_id < self.bytecode.program.case_clauses.len() {
+                            self.collect_global_bindings_from_block(self.bytecode.program.case_clauses.get(clause_id).block_id);
+                        }
+                        j += 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    func collect_scalar_declarations_from_block(self: VbsBytecodeCompiler, block_id: Int) -> Void {
+        if block_id < 0 || block_id >= self.bytecode.program.blocks.len() {
+            return;
+        }
+        let stmt_ids: collections.Vector<Int> = asp.compiler.deserialize_vbs_stmt_block(
+            asp.compiler.serialize_vbs_stmt_block(self.bytecode.program.blocks.get(block_id))
+        ).stmt_ids;
+        let i: Int = 0;
+        loop i < stmt_ids.len() {
+            let stmt_id: Int = stmt_ids.get(i);
+            if stmt_id >= 0 && stmt_id < self.bytecode.program.stmts.len() {
+                eg_gc_preempt_guard_enter();
+                let serialized_stmt: String = asp.compiler.serialize_vbs_stmt_node(self.bytecode.program.get_stmt(stmt_id));
+                eg_gc_preempt_guard_leave();
+                let stmt: asp.compiler.VbsStmtNode = asp.compiler.deserialize_vbs_stmt_node(serialized_stmt);
+                if stmt.kind == asp.compiler.VbsStmtDim || stmt.kind == asp.compiler.VbsStmtConst {
+                    let j: Int = 0;
+                    loop j < stmt.names.len() {
+                        let declared_name: String = stmt.names.get(j);
+                        self.add_scalar_slot(declared_name);
+                        if stmt.kind == asp.compiler.VbsStmtDim
+                        && j < stmt.expr_ids.len()
+                        && stmt.expr_ids.get(j) > 0 {
+                            self.add_scalar_array_slot(declared_name);
+                        }
+                        j += 1;
+                    }
+                }
+                if stmt.kind == asp.compiler.VbsStmtIf {
+                    self.collect_scalar_declarations_from_block(stmt.then_block_id);
+                    if stmt.else_block_id >= 0 {
+                        self.collect_scalar_declarations_from_block(stmt.else_block_id);
+                    }
+                } else if stmt.kind == asp.compiler.VbsStmtWhile || stmt.kind == asp.compiler.VbsStmtDoLoop || stmt.kind == asp.compiler.VbsStmtFor || stmt.kind == asp.compiler.VbsStmtForEach || stmt.kind == asp.compiler.VbsStmtWith {
+                    self.collect_scalar_declarations_from_block(stmt.body_block_id);
+                } else if stmt.kind == asp.compiler.VbsStmtSelectCase {
+                    let j: Int = 0;
+                    loop j < stmt.case_clause_ids.len() {
+                        let clause_id: Int = stmt.case_clause_ids.get(j);
+                        if clause_id >= 0 && clause_id < self.bytecode.program.case_clauses.len() {
+                            self.collect_scalar_declarations_from_block(self.bytecode.program.case_clauses.get(clause_id).block_id);
+                        }
+                        j += 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    func collect_scalar_slots_from_block(self: VbsBytecodeCompiler, block_id: Int) -> Void {
+        if block_id < 0 || block_id >= self.bytecode.program.blocks.len() {
+            return;
+        }
+        let stmt_ids: collections.Vector<Int> = self.bytecode.program.blocks.get(block_id).stmt_ids;
+        let i: Int = 0;
+        loop i < stmt_ids.len() {
+            let stmt_id: Int = stmt_ids.get(i);
+            if stmt_id >= 0 && stmt_id < self.bytecode.program.stmts.len() {
+                let stmt: asp.compiler.VbsStmtNode = self.bytecode.program.get_stmt(stmt_id);
+                if stmt.kind == asp.compiler.VbsStmtReDim {
+                    if self.scalar_slot_index(stmt.target_name) >= 0 || !self.has_global_binding(stmt.target_name) {
+                        self.add_scalar_array_slot(stmt.target_name);
+                    }
+                    _ = self.current_scalar_array_slot_names.push("__egret_dynamic_array__");
+                } else if stmt.kind == asp.compiler.VbsStmtAssign || stmt.kind == asp.compiler.VbsStmtSetAssign {
+                    let target_name: String = self.stmt_identifier_target(stmt);
+                    let target_arg_count: Int = self.stmt_scalar_target_arg_count(stmt, target_name);
+                    if stmt.kind == asp.compiler.VbsStmtSetAssign {
+                        let safe_global_target: Bool = std.len(target_name) != 0
+                        && strings.find_substr(target_name, ".") < 0
+                        && target_arg_count == 0
+                        && self.has_global_binding(target_name)
+                        && self.scalar_slot_index(target_name) < 0;
+                        if !safe_global_target {
+                            _ = self.current_scalar_array_slot_names.push("__egret_unsafe_set_assign__");
+                        }
+                    }
+                    if std.len(target_name) != 0
+                    && strings.find_substr(target_name, ".") < 0
+                    && target_arg_count == 0
+                    && (self.scalar_slot_index(target_name) >= 0 || !self.has_global_binding(target_name)) {
+                        self.add_scalar_slot(target_name);
+                    }
+                } else if stmt.kind == asp.compiler.VbsStmtFor || stmt.kind == asp.compiler.VbsStmtForEach {
+                    if self.scalar_slot_index(stmt.target_name) >= 0 || !self.has_global_binding(stmt.target_name) {
+                        self.add_scalar_slot(stmt.target_name);
+                    }
+                }
+                if stmt.kind == asp.compiler.VbsStmtIf {
+                    self.collect_scalar_slots_from_block(stmt.then_block_id);
+                    if stmt.else_block_id >= 0 {
+                        self.collect_scalar_slots_from_block(stmt.else_block_id);
+                    }
+                } else if stmt.kind == asp.compiler.VbsStmtWhile || stmt.kind == asp.compiler.VbsStmtDoLoop || stmt.kind == asp.compiler.VbsStmtFor || stmt.kind == asp.compiler.VbsStmtForEach || stmt.kind == asp.compiler.VbsStmtWith {
+                    self.collect_scalar_slots_from_block(stmt.body_block_id);
+                } else if stmt.kind == asp.compiler.VbsStmtSelectCase {
+                    let j: Int = 0;
+                    loop j < stmt.case_clause_ids.len() {
+                        let clause_id: Int = stmt.case_clause_ids.get(j);
+                        if clause_id >= 0 && clause_id < self.bytecode.program.case_clauses.len() {
+                            self.collect_scalar_slots_from_block(self.bytecode.program.case_clauses.get(clause_id).block_id);
+                        }
+                        j += 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    func collect_class_loop_slots_from_block(self: VbsBytecodeCompiler, block_id: Int) -> Void {
+        if block_id < 0 || block_id >= self.bytecode.program.blocks.len() {
+            return;
+        }
+        let stmt_ids: collections.Vector<Int> = asp.compiler.deserialize_vbs_stmt_block(
+            asp.compiler.serialize_vbs_stmt_block(self.bytecode.program.blocks.get(block_id))
+        ).stmt_ids;
+        let i: Int = 0;
+        loop i < stmt_ids.len() {
+            let stmt_id: Int = stmt_ids.get(i);
+            if stmt_id >= 0 && stmt_id < self.bytecode.program.stmts.len() {
+                eg_gc_preempt_guard_enter();
+                let serialized_stmt: String = asp.compiler.serialize_vbs_stmt_node(self.bytecode.program.get_stmt(stmt_id));
+                eg_gc_preempt_guard_leave();
+                let stmt: asp.compiler.VbsStmtNode = asp.compiler.deserialize_vbs_stmt_node(serialized_stmt);
+                if stmt.kind == asp.compiler.VbsStmtFor || stmt.kind == asp.compiler.VbsStmtForEach {
+                    self.add_scalar_slot(stmt.target_name);
+                }
+                if stmt.kind == asp.compiler.VbsStmtIf {
+                    self.collect_class_loop_slots_from_block(stmt.then_block_id);
+                    if stmt.else_block_id >= 0 {
+                        self.collect_class_loop_slots_from_block(stmt.else_block_id);
+                    }
+                } else if stmt.kind == asp.compiler.VbsStmtWhile || stmt.kind == asp.compiler.VbsStmtDoLoop || stmt.kind == asp.compiler.VbsStmtFor || stmt.kind == asp.compiler.VbsStmtForEach || stmt.kind == asp.compiler.VbsStmtWith {
+                    self.collect_class_loop_slots_from_block(stmt.body_block_id);
+                } else if stmt.kind == asp.compiler.VbsStmtSelectCase {
+                    let j: Int = 0;
+                    loop j < stmt.case_clause_ids.len() {
+                        let clause_id: Int = stmt.case_clause_ids.get(j);
+                        if clause_id >= 0 && clause_id < self.bytecode.program.case_clauses.len() {
+                            self.collect_class_loop_slots_from_block(self.bytecode.program.case_clauses.get(clause_id).block_id);
+                        }
+                        j += 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    func routine_frame_restrictions_from_block(self: VbsBytecodeCompiler, block_id: Int) -> Int {
+        if block_id < 0 || block_id >= self.bytecode.program.blocks.len() {
+            return VbsRoutineFrameOnError => Int;
+        }
+        let restrictions: Int = 0;
+        let stmt_ids: collections.Vector<Int> = self.bytecode.program.blocks.get(block_id).stmt_ids;
+        let i: Int = 0;
+        loop i < stmt_ids.len() {
+            let stmt_id: Int = stmt_ids.get(i);
+            if stmt_id >= 0 && stmt_id < self.bytecode.program.stmts.len() {
+                let stmt: asp.compiler.VbsStmtNode = self.bytecode.program.get_stmt(stmt_id);
+                if stmt.kind == asp.compiler.VbsStmtOnErrorResumeNext || stmt.kind == asp.compiler.VbsStmtOnErrorGoto0 {
+                    restrictions = restrictions | (VbsRoutineFrameOnError => Int);
+                }
+                if stmt.kind == asp.compiler.VbsStmtCall
+                && (strings.equal_fold_ascii(stmt.call_name, "Execute") || strings.equal_fold_ascii(stmt.call_name, "ExecuteGlobal")) {
+                    restrictions = restrictions | (VbsRoutineFrameExecute => Int);
+                }
+                if stmt.kind == asp.compiler.VbsStmtIf {
+                    restrictions = restrictions | self.routine_frame_restrictions_from_block(stmt.then_block_id);
+                    if stmt.else_block_id >= 0 {
+                        restrictions = restrictions | self.routine_frame_restrictions_from_block(stmt.else_block_id);
+                    }
+                } else if stmt.kind == asp.compiler.VbsStmtWhile
+                || stmt.kind == asp.compiler.VbsStmtDoLoop
+                || stmt.kind == asp.compiler.VbsStmtFor
+                || stmt.kind == asp.compiler.VbsStmtForEach
+                || stmt.kind == asp.compiler.VbsStmtWith {
+                    restrictions = restrictions | self.routine_frame_restrictions_from_block(stmt.body_block_id);
+                } else if stmt.kind == asp.compiler.VbsStmtSelectCase {
+                    let j: Int = 0;
+                    loop j < stmt.case_clause_ids.len() {
+                        let clause_id: Int = stmt.case_clause_ids.get(j);
+                        if clause_id >= 0 && clause_id < self.bytecode.program.case_clauses.len() {
+                            restrictions = restrictions | self.routine_frame_restrictions_from_block(self.bytecode.program.case_clauses.get(clause_id).block_id);
+                        }
+                        j += 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+        return restrictions;
+    }
+
+    func prepare_scalar_slots(self: VbsBytecodeCompiler, routine_id: Int) -> Void {
+        self.current_scalar_slot_names = new collections.Vector<String>();
+        self.current_scalar_array_slot_names = new collections.Vector<String>();
+        self.current_routine_frame_flags = 0;
+        if routine_id < 0
+        || routine_id >= self.bytecode.program.routine_names.len()
+        || routine_id >= self.bytecode.program.routine_owner_classes.len()
+        || routine_id >= self.bytecode.program.routine_is_functions.len()
+        || routine_id >= self.bytecode.program.routine_param_names.len()
+        || routine_id >= self.bytecode.program.routine_param_by_refs.len()
+        || routine_id >= self.bytecode.program.routine_block_ids.len() {
+            return;
+        }
+        let routine_name: String = self.bytecode.program.routine_names.get(routine_id);
+        let routine_block_id: Int = self.bytecode.program.routine_block_ids.get(routine_id);
+        let param_names: collections.Vector<String> = asp.runtime.unpack_string_parts(self.bytecode.program.routine_param_names.get(routine_id));
+        let param_by_refs: collections.Vector<Int> = asp.compiler.unpack_int_parts(self.bytecode.program.routine_param_by_refs.get(routine_id));
+        let writes_mask: Int = routine_id < self.bytecode.program.routine_writes_param_masks.len()
+            ? self.bytecode.program.routine_writes_param_masks.get(routine_id)
+            : 2147483647;
+        let writes_by_ref: Bool = false;
+        let by_ref_index: Int = 0;
+        loop by_ref_index < param_by_refs.len() && by_ref_index < 31 {
+            if param_by_refs.get(by_ref_index) != 0 && (writes_mask & (1 << by_ref_index)) != 0 {
+                writes_by_ref = true;
+                break;
+            }
+            by_ref_index += 1;
+        }
+        let is_class_routine: Bool = std.len(self.bytecode.program.routine_owner_classes.get(routine_id)) != 0;
+        let restrictions: Int = self.routine_frame_restrictions_from_block(routine_block_id);
+        // The unified C frame performs ByRef copyback on pop for functions as
+        // well as subs.  Treating a writable ByRef function (and every caller
+        // of it) as scalar-unsafe forced the whole call chain back through the
+        // recursive evaluator.
+        let metadata_eligible: Bool = true;
+        _ = writes_by_ref;
+        let block_fast_scalar: Bool = self.bytecode.program.block_is_fast_scalar(routine_block_id, self.unsafe_scalar_call_names);
+        let targeted_array_frame: Bool = std.len(self.bytecode.program.routine_owner_classes.get(routine_id)) == 0
+            && (strings.equal_fold_ascii(routine_name, "ExecuteFrameBridgeFixture")
+                || strings.equal_fold_ascii(routine_name, "System_Initialize")
+                || strings.equal_fold_ascii(routine_name, "LoadGlobeCache")
+                || strings.equal_fold_ascii(routine_name, "LoadDefaultTemplates")
+                || strings.equal_fold_ascii(routine_name, "ActivePlugin")
+                || strings.equal_fold_ascii(routine_name, "Add_Response_Plugin")
+                || strings.equal_fold_ascii(routine_name, "Add_Filter_Plugin")
+                || strings.equal_fold_ascii(routine_name, "ConvertToWordArray"));
+        let targeted_execute_frame: Bool = strings.equal_fold_ascii(routine_name, "ExecuteFrameBridgeFixture")
+            || strings.equal_fold_ascii(routine_name, "System_Initialize")
+            || strings.equal_fold_ascii(routine_name, "ActivePlugin")
+            || strings.equal_fold_ascii(routine_name, "Add_Response_Plugin")
+            || strings.equal_fold_ascii(routine_name, "Add_Filter_Plugin");
+        // Indexed global object mutation still depends on evaluator l-value
+        // resolution; do not bind this legacy helper to a scalar local frame.
+        let evaluator_object_lvalue: Bool = !is_class_routine
+            && strings.equal_fold_ascii(routine_name, "FunCatalogs");
+        let eligible: Bool = metadata_eligible
+            && (is_class_routine || block_fast_scalar || targeted_array_frame || evaluator_object_lvalue);
+        self.current_routine_frame_flags = restrictions;
+        if eligible {
+            self.add_scalar_slot(routine_name);
+            let declaration_param_index: Int = 0;
+            loop declaration_param_index < param_names.len() {
+                self.add_scalar_slot(param_names.get(declaration_param_index));
+                declaration_param_index += 1;
+            }
+            self.collect_scalar_declarations_from_block(routine_block_id);
+            if is_class_routine {
+                self.collect_class_loop_slots_from_block(routine_block_id);
+            } else {
+                self.collect_scalar_slots_from_block(routine_block_id);
+            }
+            let has_dynamic_array: Bool = self.scalar_array_slot_index("__egret_dynamic_array__") >= 0;
+            if !is_class_routine
+            && !targeted_array_frame
+            && !evaluator_object_lvalue
+            && (self.scalar_array_slot_index("__egret_unsafe_set_assign__") >= 0 || has_dynamic_array) {
+                eligible = false;
+                self.current_scalar_slot_names = new collections.Vector<String>();
+                self.current_scalar_array_slot_names = new collections.Vector<String>();
+            }
+            if eligible {
+                self.current_routine_frame_flags = self.current_routine_frame_flags
+                    | (VbsRoutineFrameHasMetadata => Int);
+                if (is_class_routine || block_fast_scalar || targeted_array_frame)
+                && !evaluator_object_lvalue {
+                    self.current_routine_frame_flags = self.current_routine_frame_flags | (VbsRoutineFrameRecursiveSafe => Int);
+                }
+                if ((restrictions & (VbsRoutineFrameExecute => Int)) == 0 || targeted_execute_frame)
+                && !evaluator_object_lvalue {
+                    self.current_routine_frame_flags = self.current_routine_frame_flags | (VbsRoutineFrameCSafe => Int);
+                }
+            }
+        }
+        if !eligible {
+            return;
+        }
+    }
+
+    // Emits one complete three-word instruction and returns its instruction PC.
+    func emit(self: VbsBytecodeCompiler, op: VbsBytecodeOp, arg0: Int = -1, arg1: Int = -1) -> Int {
+        let pc: Int = self.bytecode.instruction_count();
+        _ = self.bytecode.insns.push(op => Int);
+        _ = self.bytecode.insns.push(arg0);
+        _ = self.bytecode.insns.push(arg1);
+        return pc;
+    }
+
+    // Static binding is an optimization only. Resolution returns -1 whenever
+    // name, owner, arity, or late-bound semantics remain uncertain.
+    func find_static_routine_id_by_owner(self: VbsBytecodeCompiler, name: String, owner_class: String) -> Int {
+        let key: String = self.bytecode.program.routine_lookup_key(name, owner_class);
+        if self.routine_index_capacity <= 0 {
+            return -1;
+        }
+        let hash: Int = 216613626;
+        let hash_index: Int = 0;
+        loop hash_index < std.len(key) {
+            hash = (hash * 16777619) ^ std.byte_at(key, hash_index);
+            hash_index += 1;
+        }
+        let slot: Int = (hash & 2147483647) % self.routine_index_capacity;
+        let probe: Int = 0;
+        loop probe < self.routine_index_capacity {
+            let index: Int = (slot + probe) % self.routine_index_capacity;
+            let current: String = self.routine_index_keys.get(index);
+            if std.len(current) == 0 {
+                return -1;
+            }
+            if current == key {
+                return self.routine_index_values.get(index);
+            }
+            probe += 1;
+        }
+        return -1;
+    }
+
+    func find_static_routine_id(self: VbsBytecodeCompiler, name: String) -> Int {
+        if asp.runtime_builtin_call_name(name) {
+            return -1;
+        }
+        if self.current_routine_id >= 0 {
+            let owner_class: String = self.routine_owner_name(self.current_routine_id);
+            if std.len(owner_class) > 0 {
+                let class_routine_id: Int = self.find_static_routine_id_by_owner(name, owner_class);
+                if class_routine_id >= 0 {
+                    return class_routine_id;
+                }
+            }
+        }
+        return self.find_static_routine_id_by_owner(name, "");
+    }
+
+    // Returns routine_id + 1 so zero remains "no packed member metadata".
+    // Only an unambiguous class member with entirely ByVal parameters is
+    // eligible. Property Let/Set, overloaded class names and writable ByRef
+    // semantics deliberately remain late-bound.
+    func find_static_object_member_id(self: VbsBytecodeCompiler, name: String) -> Int {
+        if std.len(name) == 0 || strings.find_substr(name, ".") >= 0 {
+            return 0;
+        }
+        let selected: Int = -1;
+        let selected_is_function: Bool = false;
+        let i: Int = 0;
+        loop i < self.bytecode.program.routine_names.len() {
+            if i < self.bytecode.program.routine_owner_classes.len()
+            && std.len(self.bytecode.program.routine_owner_classes.get(i)) > 0
+            && strings.equal_fold_ascii(self.bytecode.program.routine_names.get(i), name) {
+                let refs: collections.Vector<Int> = asp.compiler.unpack_int_parts(self.bytecode.program.routine_param_by_refs.get(i));
+                let has_by_ref: Bool = false;
+                let j: Int = 0;
+                loop j < refs.len() {
+                    if refs.get(j) != 0 {
+                        has_by_ref = true;
+                        break;
+                    }
+                    j += 1;
+                }
+                if !has_by_ref {
+                    let is_function: Bool = self.bytecode.program.routine_is_functions.get(i) != 0;
+                    if selected < 0 || (!selected_is_function && is_function) {
+                        selected = i;
+                        selected_is_function = is_function;
+                    } else if is_function == selected_is_function {
+                        return 0;
+                    }
+                }
+            }
+            i += 1;
+        }
+        return selected >= 0 ? selected + 1 : 0;
+    }
+
+    func static_object_call_binding(self: VbsBytecodeCompiler, name: String) -> Int {
+        let builtin_id: Int = self.static_builtin_object_member_id(name);
+        if builtin_id > 0 {
+            return 0 - 100000 - builtin_id;
+        }
+        let dot: Int = strings.find_substr(name, ".");
+        if dot <= 0 || dot + 1 >= std.len(name) {
+            return -1;
+        }
+        let receiver: String = std.substr(name, 0, dot);
+        if strings.equal_fold_ascii(receiver, "Response")
+        || strings.equal_fold_ascii(receiver, "Request")
+        || strings.equal_fold_ascii(receiver, "Server")
+        || strings.equal_fold_ascii(receiver, "Session")
+        || strings.equal_fold_ascii(receiver, "Application")
+        || strings.equal_fold_ascii(receiver, "Err") {
+            return -1;
+        }
+        let member_id: Int = self.find_static_object_member_id(std.substr(name, dot + 1, std.len(name) - dot - 1));
+        return member_id > 0 ? 0 - member_id - 1 : -1;
+    }
+
+    func static_builtin_object_member_id(self: VbsBytecodeCompiler, name: String) -> Int {
+        _ = self;
+        if strings.equal_fold_ascii(name, "Request") { return 1; }
+        if strings.equal_fold_ascii(name, "Request.QueryString") { return 2; }
+        if strings.equal_fold_ascii(name, "Request.Form") { return 3; }
+        if strings.equal_fold_ascii(name, "Request.Cookies") { return 4; }
+        if strings.equal_fold_ascii(name, "Request.ServerVariables") { return 5; }
+        if strings.equal_fold_ascii(name, "Request.BinaryRead") { return 6; }
+        if strings.equal_fold_ascii(name, "Session") { return 7; }
+        if strings.equal_fold_ascii(name, "Session.Contents") { return 8; }
+        if strings.equal_fold_ascii(name, "Application") { return 9; }
+        if strings.equal_fold_ascii(name, "Application.Contents") { return 10; }
+        if strings.equal_fold_ascii(name, "Server.MapPath") { return 11; }
+        if strings.equal_fold_ascii(name, "Server.CreateObject") { return 12; }
+        if strings.equal_fold_ascii(name, "Server.URLEncode") { return 13; }
+        if strings.equal_fold_ascii(name, "Server.HTMLEncode") { return 14; }
+        if strings.equal_fold_ascii(name, "Replace") { return 15; }
+        if strings.equal_fold_ascii(name, "InStr") { return 16; }
+        if strings.equal_fold_ascii(name, "Len") { return 17; }
+        if strings.equal_fold_ascii(name, "CStr") { return 18; }
+        if strings.equal_fold_ascii(name, "Left") || strings.equal_fold_ascii(name, "LeftB") { return 19; }
+        if strings.equal_fold_ascii(name, "Right") { return 20; }
+        if strings.equal_fold_ascii(name, "Mid") { return 21; }
+        if strings.equal_fold_ascii(name, "LCase") { return 22; }
+        if strings.equal_fold_ascii(name, "UCase") { return 23; }
+        if strings.equal_fold_ascii(name, "Trim") { return 24; }
+        if strings.equal_fold_ascii(name, "IsNull") { return 25; }
+        if strings.equal_fold_ascii(name, "IsEmpty") { return 26; }
+        if strings.equal_fold_ascii(name, "IsNumeric") { return 27; }
+        if strings.equal_fold_ascii(name, "CInt") { return 28; }
+        if strings.equal_fold_ascii(name, "CLng") { return 29; }
+        if strings.equal_fold_ascii(name, "CDbl") { return 30; }
+        if strings.equal_fold_ascii(name, "Response.Write") { return 101; }
+        if strings.equal_fold_ascii(name, "Response.BinaryWrite") { return 102; }
+        if strings.equal_fold_ascii(name, "Response.Clear") { return 103; }
+        if strings.equal_fold_ascii(name, "Response.Flush") { return 104; }
+        if strings.equal_fold_ascii(name, "Response.End") { return 105; }
+        if strings.equal_fold_ascii(name, "Response.Redirect") { return 106; }
+        if strings.equal_fold_ascii(name, "Response.AddHeader") { return 107; }
+        return 0;
+    }
+
+    func current_class_has_property_pair(self: VbsBytecodeCompiler, name: String) -> Bool {
+        if self.current_routine_id < 0 || self.current_routine_id >= self.bytecode.program.routine_owner_classes.len() {
+            return false;
+        }
+        let owner_class: String = self.routine_owner_name(self.current_routine_id);
+        if std.len(owner_class) == 0 {
+            return false;
+        }
+        return self.bytecode.program.routine_index.get_or(self.bytecode.program.routine_kind_lookup_key(name, owner_class, true), -1) >= 0
+            && self.bytecode.program.routine_index.get_or(self.bytecode.program.routine_kind_lookup_key(name, owner_class, false), -1) >= 0;
+    }
+
+    func is_response_cookies_expr(self: VbsBytecodeCompiler, expr_id: Int) -> Bool {
+        if expr_id < 0 || expr_id >= self.bytecode.program.exprs.len() {
+            return false;
+        }
+        let expr: asp.compiler.VbsExprNode = self.bytecode.program.get_expr(expr_id);
+        if expr.kind != asp.compiler.VbsExprCall {
+            return false;
+        }
+        if strings.equal_fold_ascii(expr.text, "Response.Cookies") {
+            return true;
+        }
+        if strings.equal_fold_ascii(expr.text, "Item") {
+            return self.is_response_cookies_expr(expr.left_id);
+        }
+        if !strings.equal_fold_ascii(expr.text, "Cookies") || expr.left_id < 0 {
+            return false;
+        }
+        let base: asp.compiler.VbsExprNode = self.bytecode.program.get_expr(expr.left_id);
+        return base.kind == asp.compiler.VbsExprIdentifier && strings.equal_fold_ascii(base.text, "Response");
+    }
+
+    func routine_owner_name(self: VbsBytecodeCompiler, routine_id: Int) -> String {
+        if routine_id >= 0 && routine_id < self.bytecode.program.routines.len() {
+            return asp.runtime.clone_runtime_string(self.bytecode.program.routines.get(routine_id).owner_class);
+        }
+        if routine_id >= 0 && routine_id < self.bytecode.program.routine_owner_classes.len() {
+            return asp.runtime.clone_runtime_string(self.bytecode.program.routine_owner_classes.get(routine_id));
+        }
+        return "";
+    }
+
+    func routine_is_class(self: VbsBytecodeCompiler, routine_id: Int) -> Bool {
+        if std.len(self.routine_owner_name(routine_id)) > 0 {
+            return true;
+        }
+        let class_index: Int = 0;
+        loop class_index < self.bytecode.program.classes.len() {
+            eg_gc_preempt_guard_enter();
+            let serialized_class: String = asp.compiler.serialize_vbs_class_def(self.bytecode.program.classes.get(class_index));
+            eg_gc_preempt_guard_leave();
+            let class_def: asp.compiler.VbsClassDef = asp.compiler.deserialize_vbs_class_def(serialized_class);
+            let routine_index: Int = 0;
+            loop routine_index < class_def.routine_ids.len() {
+                if class_def.routine_ids.get(routine_index) == routine_id {
+                    return true;
+                }
+                routine_index += 1;
+            }
+            class_index += 1;
+        }
+        return false;
+    }
+
+    func current_class_has_field(self: VbsBytecodeCompiler, name: String) -> Bool {
+        if self.current_routine_id < 0 {
+            return false;
+        }
+        let owner_class: String = self.routine_owner_name(self.current_routine_id);
+        if std.len(owner_class) == 0 {
+            return false;
+        }
+        let class_id: Int = 0;
+        loop class_id < self.bytecode.program.classes.len() {
+            let class_def: asp.compiler.VbsClassDef = asp.compiler.deserialize_vbs_class_def(
+                asp.compiler.serialize_vbs_class_def(self.bytecode.program.classes.get(class_id))
+            );
+            let owns_routine: Bool = strings.equal_fold_ascii(class_def.name, owner_class);
+            if owns_routine {
+                let field_index: Int = 0;
+                loop field_index < class_def.field_names.len() {
+                    if strings.equal_fold_ascii(class_def.field_names.get(field_index), name) {
+                        return true;
+                    }
+                    field_index += 1;
+                }
+                return false;
+            }
+            class_id += 1;
+        }
+        return false;
+    }
+
+    func inline_return_expr_id(self: VbsBytecodeCompiler, routine_id: Int) -> Int {
+        if routine_id < 0 || routine_id >= self.bytecode.program.routine_names.len() {
+            return -1;
+        }
+        loop self.inline_return_expr_cache.len() < self.bytecode.program.routine_names.len() {
+            _ = self.inline_return_expr_cache.push(-2);
+        }
+        let cached: Int = self.inline_return_expr_cache.get(routine_id);
+        if cached != -2 {
+            return cached;
+        }
+        let analyzed: Int = self.analyze_inline_return_expr_id(routine_id);
+        _ = self.inline_return_expr_cache.set(routine_id, analyzed);
+        return analyzed;
+    }
+
+    func analyze_inline_return_expr_id(self: VbsBytecodeCompiler, routine_id: Int) -> Int {
+        let routine_name: String = self.bytecode.program.routine_names.get(routine_id);
+        let owner_class: String = self.bytecode.program.routine_owner_classes.get(routine_id);
+        let is_function: Bool = self.bytecode.program.routine_is_functions.get(routine_id) != 0;
+        let block_id: Int = self.bytecode.program.routine_block_ids.get(routine_id);
+        if !is_function || std.len(owner_class) != 0 || block_id < 0 || block_id >= self.bytecode.program.blocks.len() {
+            return -1;
+        }
+        let block: asp.compiler.VbsStmtBlock = asp.compiler.deserialize_vbs_stmt_block(
+            asp.compiler.serialize_vbs_stmt_block(self.bytecode.program.blocks.get(block_id))
+        );
+        let return_expr_id: Int = -1;
+        let i: Int = 0;
+        loop i < block.stmt_ids.len() {
+            let stmt_id: Int = block.stmt_ids.get(i);
+            if stmt_id < 0 || stmt_id >= self.bytecode.program.stmts.len() {
+                return -1;
+            }
+            let stmt: asp.compiler.VbsStmtNode = asp.compiler.deserialize_vbs_stmt_node(
+                asp.compiler.serialize_vbs_stmt_node(self.bytecode.program.get_stmt(stmt_id))
+            );
+            if stmt.kind == asp.compiler.VbsStmtNoop || stmt.kind == asp.compiler.VbsStmtOptionExplicit {
+                i += 1;
+                skip;
+            }
+            if return_expr_id >= 0 || stmt.kind != asp.compiler.VbsStmtAssign || stmt.target_arg_ids.len() != 0 || !strings.equal_fold_ascii(stmt.target_name, routine_name) {
+                return -1;
+            }
+            if stmt.target_expr_id >= 0 {
+                let target_expr: asp.compiler.VbsExprNode = asp.compiler.deserialize_vbs_expr_node(
+                    asp.compiler.serialize_vbs_expr_node(self.bytecode.program.get_expr(stmt.target_expr_id))
+                );
+                if target_expr.kind != asp.compiler.VbsExprIdentifier || target_expr.left_id >= 0 || target_expr.arg_ids.len() != 0 || !strings.equal_fold_ascii(target_expr.text, routine_name) {
+                    return -1;
+                }
+            }
+            if stmt.value_expr_id < 0 {
+                return -1;
+            }
+            return_expr_id = stmt.value_expr_id;
+            i += 1;
+        }
+        return return_expr_id;
+    }
+
+    // Inlining substitutes parameter placeholders into a cloned expression
+    // tree; clone_inline_expr_tree enforces a recursion depth limit.
+    func inline_param_index(self: VbsBytecodeCompiler, packed_params: String, name: String) -> Int {
+        if std.len(packed_params) == 0 {
+            return -1;
+        }
+        let params: collections.Vector<String> = asp.runtime.unpack_string_parts(packed_params);
+        let i: Int = 0;
+        loop i < params.len() {
+            if strings.equal_fold_ascii(params.get(i), name) {
+                return i;
+            }
+            i += 1;
+        }
+        return -1;
+    }
+
+    func clone_inline_expr_tree(self: VbsBytecodeCompiler, expr_id: Int, depth: Int = 0) -> Int {
+        if expr_id < 0 || expr_id >= self.bytecode.program.exprs.len() || depth >= 64 {
+            return -1;
+        }
+        let cloned: asp.compiler.VbsExprNode = asp.compiler.deserialize_vbs_expr_node(
+            asp.compiler.serialize_vbs_expr_node(self.bytecode.program.get_expr(expr_id))
+        );
+        if cloned.left_id >= 0 {
+            cloned.left_id = self.clone_inline_expr_tree(cloned.left_id, depth + 1);
+            if cloned.left_id < 0 {
+                return -1;
+            }
+        }
+        if cloned.right_id >= 0 {
+            cloned.right_id = self.clone_inline_expr_tree(cloned.right_id, depth + 1);
+            if cloned.right_id < 0 {
+                return -1;
+            }
+        }
+        let i: Int = 0;
+        loop i < cloned.arg_ids.len() {
+            let cloned_arg_id: Int = self.clone_inline_expr_tree(cloned.arg_ids.get(i), depth + 1);
+            if cloned_arg_id < 0 {
+                return -1;
+            }
+            _ = cloned.arg_ids.set(i, cloned_arg_id);
+            i += 1;
+        }
+        return self.bytecode.program.add_expr(cloned);
+    }
+
+    // Branch destinations are unknown until emitted. Patch helpers translate
+    // instruction PCs to offsets in the three-word stream.
+    func patch_arg1(self: VbsBytecodeCompiler, pc: Int, value: Int) -> Void {
+        let offset: Int = pc * 3 + 2;
+        if pc >= 0 && offset < self.bytecode.insns.len() {
+            _ = self.bytecode.insns.set(offset, value);
+        }
+    }
+
+    func patch_arg0(self: VbsBytecodeCompiler, pc: Int, value: Int) -> Void {
+        let offset: Int = pc * 3 + 1;
+        if pc >= 0 && offset < self.bytecode.insns.len() {
+            _ = self.bytecode.insns.set(offset, value);
+        }
+    }
+
+    func push_loop(self: VbsBytecodeCompiler, handles_exit_for: Bool, handles_exit_do: Bool) -> Int {
+        let id: Int = self.loop_handles_exit_for.len();
+        _ = self.loop_handles_exit_for.push(handles_exit_for ? 1 : 0);
+        _ = self.loop_handles_exit_do.push(handles_exit_do ? 1 : 0);
+        _ = self.loop_stack.push(id);
+        return id;
+    }
+
+    func pop_loop(self: VbsBytecodeCompiler) -> Int {
+        if self.loop_stack.len() == 0 {
+            return -1;
+        }
+        return self.loop_stack.pop_back(-1);
+    }
+
+    func current_loop_for(self: VbsBytecodeCompiler, want_exit_for: Bool, want_exit_do: Bool) -> Int {
+        let i: Int = self.loop_stack.len() - 1;
+        loop i >= 0 {
+            let loop_id: Int = self.loop_stack.get(i);
+            if (want_exit_for && self.loop_handles_exit_for.get(loop_id) != 0) || (want_exit_do && self.loop_handles_exit_do.get(loop_id) != 0) {
+                return loop_id;
+            }
+            i -= 1;
+        }
+        return -1;
+    }
+
+    func patch_loop_exits(self: VbsBytecodeCompiler, loop_id: Int, target_pc: Int) -> Void {
+        let i: Int = 0;
+        loop i < self.loop_patch_pcs.len() {
+            if self.loop_patch_loop_ids.get(i) == loop_id {
+                self.patch_arg0(self.loop_patch_pcs.get(i), target_pc);
+            }
+            i += 1;
+        }
+    }
+
+    // Statement lowering emits structured jumps and specialized fast opcodes,
+    // falling back to ExecStmt when dynamic semantics require the evaluator.
+    // Every emitted stack effect must match vm_runner.
+    func compile_block(self: VbsBytecodeCompiler, block_id: Int) -> Int {
+        if block_id < 0 || block_id >= self.bytecode.program.blocks.len() {
+            return self.emit(VbsBytecodeHalt);
+        }
+        if self.bytecode.block_pcs.get(block_id) >= 0 {
+            return self.bytecode.block_pcs.get(block_id);
+        }
+        let entry_pc: Int = self.bytecode.instruction_count();
+        _ = self.bytecode.block_pcs.set(block_id, entry_pc);
+        let stmt_ids: collections.Vector<Int> = self.bytecode.program.blocks.get(block_id).stmt_ids;
+        let i: Int = 0;
+        loop i < stmt_ids.len() {
+            let stmt_id: Int = stmt_ids.get(i);
+            self.compile_stmt(stmt_id);
+            if self.optimization_enabled && stmt_id >= 0 && stmt_id < self.bytecode.program.stmts.len() {
+                let kind: asp.compiler.VbsStmtKind = self.bytecode.program.get_stmt(stmt_id).kind;
+                if kind == asp.compiler.VbsStmtExitFunction
+                || kind == asp.compiler.VbsStmtExitSub
+                || kind == asp.compiler.VbsStmtExitProperty {
+                    break;
+                }
+            }
+            i += 1;
+        }
+        _ = self.bytecode.block_end_pcs.set(block_id, self.bytecode.instruction_count());
+        return entry_pc;
+    }
+
+    func compile_stmt(self: VbsBytecodeCompiler, stmt_id: Int) -> Void {
+        if stmt_id < 0 || stmt_id >= self.bytecode.program.stmts.len() {
+            return;
+        }
+        let stmt: asp.compiler.VbsStmtNode = asp.compiler.deserialize_vbs_stmt_node(
+            asp.compiler.serialize_vbs_stmt_node(self.bytecode.program.get_stmt(stmt_id))
+        );
+        let end_jumps: collections.Vector<Int> = new collections.Vector<Int>();
+        if stmt.kind == asp.compiler.VbsStmtNoop || stmt.kind == asp.compiler.VbsStmtOptionExplicit || stmt.kind == asp.compiler.VbsStmtRoutineDef || stmt.kind == asp.compiler.VbsStmtClassDef {
+            return;
+        }
+        if stmt.kind == asp.compiler.VbsStmtOnErrorResumeNext {
+            _ = self.emit(VbsBytecodeOnErrorResumeNext, stmt_id, -1);
+            return;
+        }
+        if stmt.kind == asp.compiler.VbsStmtOnErrorGoto0 {
+            _ = self.emit(VbsBytecodeOnErrorGoto0, stmt_id, -1);
+            return;
+        }
+        if stmt.kind == asp.compiler.VbsStmtDim && self.current_scalar_slot_names.len() > 0 {
+            let bound_offset: Int = 0;
+            let i: Int = 0;
+            loop i < stmt.names.len() {
+                let rank: Int = i < stmt.expr_ids.len() ? stmt.expr_ids.get(i) : 0;
+                let dimension: Int = 0;
+                loop dimension < rank && bound_offset + dimension < stmt.target_arg_ids.len() {
+                    self.compile_expr_node(stmt.target_arg_ids.get(bound_offset + dimension));
+                    dimension += 1;
+                }
+                if rank > 0 {
+                    _ = self.emit(VbsBytecodeInitScalarArray, self.scalar_slot_index(stmt.names.get(i)), rank);
+                }
+                bound_offset += rank;
+                i += 1;
+            }
+            return;
+        }
+        if stmt.kind == asp.compiler.VbsStmtConst && self.current_scalar_slot_names.len() > 0 {
+            let i: Int = 0;
+            loop i < stmt.names.len() && i < stmt.expr_ids.len() {
+                self.compile_expr_node(stmt.expr_ids.get(i));
+                _ = self.emit(VbsBytecodeAssignScalarSlot, self.scalar_slot_index(stmt.names.get(i)), 0);
+                i += 1;
+            }
+            return;
+        }
+        if stmt.kind == asp.compiler.VbsStmtReDim && self.current_scalar_slot_names.len() > 0 {
+            let slot: Int = self.scalar_slot_index(stmt.target_name);
+            if slot >= 0 {
+                let i: Int = 0;
+                loop i < stmt.target_arg_ids.len() {
+                    self.compile_expr_node(stmt.target_arg_ids.get(i));
+                    i += 1;
+                }
+                _ = self.emit(VbsBytecodeReDimScalarArray, slot, stmt.bool_value ? -stmt.target_arg_ids.len() : stmt.target_arg_ids.len());
+                return;
+            }
+        }
+        if stmt.kind == asp.compiler.VbsStmtReDim {
+            let i: Int = 0;
+            loop i < stmt.target_arg_ids.len() {
+                self.compile_expr_node(stmt.target_arg_ids.get(i));
+                i += 1;
+            }
+            _ = self.emit(VbsBytecodeReDimIdentifier, stmt_id,
+                stmt.bool_value ? 0 - stmt.target_arg_ids.len() : stmt.target_arg_ids.len());
+            return;
+        }
+        if stmt.kind == asp.compiler.VbsStmtWith {
+            self.compile_expr_node(stmt.value_expr_id);
+            _ = self.emit(VbsBytecodeAssignIdentifier, stmt_id, -1);
+            _ = self.compile_block(stmt.body_block_id);
+            return;
+        }
+        if stmt.kind == asp.compiler.VbsStmtIf {
+            if self.optimization_enabled {
+                let truth: Int = self.optimizer.constant_truth(stmt.cond_expr_id);
+                if truth == 1 {
+                    _ = self.compile_block(stmt.then_block_id);
+                    return;
+                }
+                if truth == 0 {
+                    if stmt.else_block_id >= 0 {
+                        _ = self.compile_block(stmt.else_block_id);
+                    }
+                    return;
+                }
+            }
+            self.compile_expr_node(stmt.cond_expr_id);
+            let jump_false_pc: Int = self.emit(VbsBytecodeJumpIfFalse, -1, -1);
+            _ = self.compile_block(stmt.then_block_id);
+            if stmt.else_block_id >= 0 {
+                let jump_end_pc: Int = self.emit(VbsBytecodeJump, -1, -1);
+                self.patch_arg1(jump_false_pc, self.bytecode.instruction_count());
+                _ = self.compile_block(stmt.else_block_id);
+                self.patch_arg0(jump_end_pc, self.bytecode.instruction_count());
+            } else {
+                self.patch_arg1(jump_false_pc, self.bytecode.instruction_count());
+            }
+            // Resume Next after a failed condition skips the complete If,
+            // including Else. The normal false edge remains in arg1.
+            self.patch_arg0(jump_false_pc, self.bytecode.instruction_count());
+            return;
+        }
+        if stmt.kind == asp.compiler.VbsStmtWhile {
+            let loop_start: Int = self.bytecode.instruction_count();
+            let constant_truth: Int = self.optimization_enabled ? self.optimizer.constant_truth(stmt.cond_expr_id) : -1;
+            if constant_truth == 0 {
+                return;
+            }
+            let jump_end_pc: Int = -1;
+            if constant_truth < 0 {
+                self.compile_expr_node(stmt.cond_expr_id);
+                jump_end_pc = self.emit(VbsBytecodeJumpIfFalse, -1, -1);
+            }
+            let loop_id: Int = self.push_loop(false, true);
+            _ = self.compile_block(stmt.body_block_id);
+            _ = self.emit(VbsBytecodeJump, loop_start, -1);
+            let loop_end: Int = self.bytecode.instruction_count();
+            if jump_end_pc >= 0 {
+                self.patch_arg0(jump_end_pc, loop_end);
+                self.patch_arg1(jump_end_pc, loop_end);
+            }
+            self.patch_loop_exits(loop_id, loop_end);
+            _ = self.pop_loop();
+            return;
+        }
+        if stmt.kind == asp.compiler.VbsStmtDoLoop {
+            let loop_start: Int = self.bytecode.instruction_count();
+            let pre_check_pc: Int = -1;
+            if stmt.cond_expr_id >= 0 && !stmt.bool_value {
+                let pre_truth: Int = self.optimization_enabled ? self.optimizer.constant_truth(stmt.cond_expr_id) : -1;
+                if pre_truth == 0 {
+                    return;
+                }
+                if pre_truth < 0 {
+                    self.compile_expr_node(stmt.cond_expr_id);
+                    pre_check_pc = self.emit(VbsBytecodeJumpIfFalse, -1, -1);
+                }
+            }
+            let loop_id: Int = self.push_loop(false, true);
+            _ = self.compile_block(stmt.body_block_id);
+            if stmt.bool_value && stmt.extra_expr_id >= 0 {
+                self.compile_expr_node(stmt.extra_expr_id);
+                let post_check_pc: Int = self.emit(VbsBytecodeJumpIfFalse, -1, -1);
+                _ = self.emit(VbsBytecodeJump, loop_start, -1);
+                let loop_end_pc: Int = self.bytecode.instruction_count();
+                self.patch_arg0(post_check_pc, loop_end_pc);
+                self.patch_arg1(post_check_pc, loop_end_pc);
+                self.patch_loop_exits(loop_id, loop_end_pc);
+                _ = self.pop_loop();
+                return;
+            }
+            _ = self.emit(VbsBytecodeJump, loop_start, -1);
+            let loop_end: Int = self.bytecode.instruction_count();
+            if pre_check_pc >= 0 {
+                self.patch_arg0(pre_check_pc, loop_end);
+                self.patch_arg1(pre_check_pc, loop_end);
+            }
+            self.patch_loop_exits(loop_id, loop_end);
+            _ = self.pop_loop();
+            return;
+        }
+        if stmt.kind == asp.compiler.VbsStmtFor {
+            self.compile_expr_node(stmt.value_expr_id);
+            self.compile_expr_node(stmt.extra_expr_id);
+            if stmt.extra_expr_id2 >= 0 {
+                self.compile_expr_node(stmt.extra_expr_id2);
+            }
+            let body_jump_pc: Int = self.emit(VbsBytecodeJump, -1, -1);
+            _ = self.compile_block(stmt.body_block_id);
+            self.patch_arg0(body_jump_pc, self.bytecode.instruction_count());
+            let target_slot: Int = self.scalar_slot_index(stmt.target_name);
+            let global_slot: Int = self.global_binding_slot(stmt.target_name);
+            let encoded_slot: Int = target_slot >= 0
+            ? target_slot
+            : (global_slot >= 0 && (self.current_routine_id < 0 || self.current_scalar_slot_names.len() > 0) ? 0 - global_slot - 2 : -1);
+            _ = self.emit(VbsBytecodeForLoop, stmt_id, encoded_slot);
+            return;
+        }
+        if stmt.kind == asp.compiler.VbsStmtForEach {
+            self.compile_expr_node(stmt.value_expr_id);
+            let body_jump_pc: Int = self.emit(VbsBytecodeJump, -1, -1);
+            _ = self.compile_block(stmt.body_block_id);
+            self.patch_arg0(body_jump_pc, self.bytecode.instruction_count());
+            let target_slot: Int = self.scalar_slot_index(stmt.target_name);
+            let global_slot: Int = self.global_binding_slot(stmt.target_name);
+            let encoded_slot: Int = target_slot >= 0
+            ? target_slot
+            : global_slot >= 0 && (self.current_routine_id < 0 || self.current_scalar_slot_names.len() > 0)
+            ? 0 - global_slot - 2
+            : -1;
+            _ = self.emit(VbsBytecodeForEachLoop, stmt_id, encoded_slot);
+            return;
+        }
+        if stmt.kind == asp.compiler.VbsStmtSelectCase {
+            self.compile_expr_node(stmt.value_expr_id);
+            let has_else: Bool = false;
+            let i: Int = 0;
+            loop i < stmt.case_clause_ids.len() {
+                let clause: asp.compiler.VbsCaseClause = self.bytecode.program.case_clauses.get(stmt.case_clause_ids.get(i));
+                if clause.is_else {
+                    _ = self.emit(VbsBytecodePop, -1, -1);
+                    _ = self.compile_block(clause.block_id);
+                    _ = end_jumps.push(self.emit(VbsBytecodeJump, -1, -1));
+                    has_else = true;
+                    break;
+                }
+                // Each alternative must enter the same body. compile_block()
+                // memoizes block PCs, so emitting it per alternative silently
+                // omits the body for every match after the first one.
+                let match_jumps: collections.Vector<Int> = new collections.Vector<Int>();
+                let j: Int = 0;
+                loop j < clause.expr_ids.len() {
+                    _ = self.emit(VbsBytecodeDup, -1, -1);
+                    self.compile_expr_node(clause.expr_ids.get(j));
+                    _ = self.emit(VbsBytecodeEq, -1, -1);
+                    let next_case_pc: Int = self.emit(VbsBytecodeJumpIfFalse, -1, -1);
+                    _ = match_jumps.push(self.emit(VbsBytecodeJump, -1, -1));
+                    self.patch_arg1(next_case_pc, self.bytecode.instruction_count());
+                    j += 1;
+                }
+                let skip_body_pc: Int = self.emit(VbsBytecodeJump, -1, -1);
+                let body_pc: Int = self.bytecode.instruction_count();
+                let match_index: Int = 0;
+                loop match_index < match_jumps.len() {
+                    self.patch_arg0(match_jumps.get(match_index), body_pc);
+                    match_index += 1;
+                }
+                _ = self.emit(VbsBytecodePop, -1, -1);
+                _ = self.compile_block(clause.block_id);
+                _ = end_jumps.push(self.emit(VbsBytecodeJump, -1, -1));
+                self.patch_arg0(skip_body_pc, self.bytecode.instruction_count());
+                i += 1;
+            }
+            if !has_else {
+                _ = self.emit(VbsBytecodePop, -1, -1);
+            }
+            let select_end: Int = self.bytecode.instruction_count();
+            let jump_index: Int = 0;
+            loop jump_index < end_jumps.len() {
+                self.patch_arg0(end_jumps.get(jump_index), select_end);
+                jump_index += 1;
+            }
+            return;
+        }
+        if stmt.kind == asp.compiler.VbsStmtAssign || stmt.kind == asp.compiler.VbsStmtSetAssign {
+            let scalar_target_name: String = self.stmt_identifier_target(stmt);
+            if self.current_routine_id >= 0
+            && self.current_routine_id < self.bytecode.program.routine_names.len()
+            && self.bytecode.program.routine_is_functions.get(self.current_routine_id) != 0
+            && strings.equal_fold_ascii(scalar_target_name, self.bytecode.program.routine_names.get(self.current_routine_id))
+            && self.scalar_slot_index(self.bytecode.program.routine_names.get(self.current_routine_id)) >= 0
+            && self.stmt_scalar_target_arg_count(stmt, scalar_target_name) == 0 {
+                self.compile_expr_node(stmt.value_expr_id);
+                _ = self.emit(VbsBytecodeAssignScalarSlot, self.scalar_slot_index(self.bytecode.program.routine_names.get(self.current_routine_id)), 0);
+                return;
+            }
+            let scalar_target_slot: Int = self.scalar_slot_index(scalar_target_name);
+            if scalar_target_slot >= 0 {
+                let scalar_arg_count: Int = self.compile_scalar_target_args(stmt, scalar_target_name);
+                self.compile_expr_node(stmt.value_expr_id);
+                _ = self.emit(VbsBytecodeAssignScalarSlot, scalar_target_slot, scalar_arg_count);
+                return;
+            }
+            let global_target_slot: Int = self.global_binding_slot(scalar_target_name);
+            if global_target_slot >= 0
+            && self.stmt_scalar_target_arg_count(stmt, scalar_target_name) == 0
+            && (self.current_routine_id < 0 || self.current_scalar_slot_names.len() > 0)
+            && !self.current_class_has_property_pair(scalar_target_name)
+            && !self.current_class_has_field(scalar_target_name) {
+                self.compile_expr_node(stmt.value_expr_id);
+                _ = self.emit(VbsBytecodeAssignGlobalSlot, global_target_slot, stmt.kind == asp.compiler.VbsStmtSetAssign ? 1 : 0);
+                return;
+            }
+            if stmt.target_expr_id >= 0 {
+                let target_expr: asp.compiler.VbsExprNode = self.bytecode.program.get_expr(stmt.target_expr_id);
+                let response_cookie_member: Bool = target_expr.left_id >= 0
+                    && (strings.equal_fold_ascii(target_expr.text, "Path") || strings.equal_fold_ascii(target_expr.text, "Expires"))
+                    && self.is_response_cookies_expr(target_expr.left_id);
+                if target_expr.kind == asp.compiler.VbsExprIdentifier && target_expr.left_id < 0 && target_expr.arg_ids.len() == 0 && strings.find_substr(target_expr.text, ".") < 0 && !self.current_class_has_property_pair(target_expr.text) {
+                    self.compile_expr_node(stmt.value_expr_id);
+                    _ = self.emit(VbsBytecodeAssignIdentifier, stmt_id, -1);
+                    return;
+                }
+                if target_expr.kind == asp.compiler.VbsExprCall && target_expr.left_id >= 0 && std.len(target_expr.text) == 0 && target_expr.arg_ids.len() == 0 {
+                    let left_expr: asp.compiler.VbsExprNode = self.bytecode.program.get_expr(target_expr.left_id);
+                    if left_expr.kind == asp.compiler.VbsExprIdentifier && !self.current_class_has_property_pair(left_expr.text) {
+                        self.compile_expr_node(stmt.value_expr_id);
+                        _ = self.emit(VbsBytecodeAssignIdentifier, stmt_id, -1);
+                        return;
+                    }
+                }
+                if target_expr.left_id >= 0 && !response_cookie_member {
+                    self.compile_expr_node(target_expr.left_id);
+                }
+                let i: Int = 0;
+                loop i < target_expr.arg_ids.len() {
+                    self.compile_expr_node(target_expr.arg_ids.get(i));
+                    i += 1;
+                }
+                self.compile_expr_node(stmt.value_expr_id);
+                if target_expr.left_id >= 0 && std.len(target_expr.text) != 0 {
+                    _ = self.emit(VbsBytecodeAssignTargetMember, stmt_id, response_cookie_member ? 1 : -1);
+                } else {
+                    _ = self.emit(VbsBytecodeAssignTargetDefault, stmt_id, -1);
+                }
+            } else {
+                let i: Int = 0;
+                loop i < stmt.target_arg_ids.len() {
+                    self.compile_expr_node(stmt.target_arg_ids.get(i));
+                    i += 1;
+                }
+                self.compile_expr_node(stmt.value_expr_id);
+                if stmt.target_arg_ids.len() == 0 {
+                    if strings.equal_fold_ascii(stmt.target_name, "Session.Timeout") {
+                        _ = self.emit(VbsBytecodeAssignSessionTimeout, stmt_id, -1);
+                    } else if strings.equal_fold_ascii(stmt.target_name, "Response.ContentType") {
+                        _ = self.emit(VbsBytecodeAssignResponseContentType, stmt_id, -1);
+                    } else if strings.equal_fold_ascii(stmt.target_name, "Response.Charset") {
+                        _ = self.emit(VbsBytecodeAssignResponseCharset, stmt_id, -1);
+                    } else if strings.equal_fold_ascii(stmt.target_name, "Response.Buffer") {
+                        _ = self.emit(VbsBytecodeAssignResponseBuffer, stmt_id, -1);
+                    } else if strings.equal_fold_ascii(stmt.target_name, "Response.Status") {
+                        _ = self.emit(VbsBytecodeAssignResponseStatus, stmt_id, -1);
+                    } else if strings.find_substr(stmt.target_name, ".") >= 0 || self.current_class_has_property_pair(stmt.target_name) {
+                        _ = self.emit(VbsBytecodeAssignStmt, stmt_id, -1);
+                    } else {
+                        _ = self.emit(VbsBytecodeAssignIdentifier, stmt_id, -1);
+                    }
+                } else if strings.equal_fold_ascii(stmt.target_name, "Session") {
+                    _ = self.emit(VbsBytecodeAssignSessionValue, stmt_id, -1);
+                } else if strings.equal_fold_ascii(stmt.target_name, "Application") {
+                    _ = self.emit(VbsBytecodeAssignApplicationValue, stmt_id, -1);
+                } else {
+                    _ = self.emit(VbsBytecodeAssignStmt, stmt_id, -1);
+                }
+            }
+            return;
+        }
+        if stmt.kind == asp.compiler.VbsStmtCall {
+            if stmt.extra_expr_id >= 0 && stmt.extra_expr_id2 >= 0 {
+                self.compile_expr_node(stmt.extra_expr_id);
+                let i: Int = 0;
+                loop i < stmt.call_arg_ids.len() {
+                    self.compile_expr_node(stmt.call_arg_ids.get(i));
+                    i += 1;
+                }
+                let member_name: String = stmt.extra_expr_id2 < self.bytecode.program.exprs.len()
+                    ? self.bytecode.program.get_expr(stmt.extra_expr_id2).text
+                    : "";
+                _ = self.emit(VbsBytecodeObjectCallStmt, stmt_id, self.find_static_object_member_id(member_name));
+                return;
+            }
+            if stmt.target_expr_id >= 0 {
+                self.compile_expr_node(stmt.target_expr_id);
+                // arg1 == 0 marks the stack-evaluated target-expression form.
+                // Older cached bytecode used -1 and is handled by the runner's
+                // interpreted compatibility path.
+                _ = self.emit(VbsBytecodeCallStmt, stmt_id, 0);
+                return;
+            }
+            if strings.equal_fold_ascii(stmt.call_name, "__AspWriteLiteralHex") && stmt.call_arg_ids.len() == 1 {
+                let literal_expr_id: Int = stmt.call_arg_ids.get(0);
+                if literal_expr_id >= 0 && literal_expr_id < self.bytecode.program.exprs.len() {
+                    let literal_expr: asp.compiler.VbsExprNode = self.bytecode.program.get_expr(literal_expr_id);
+                    if literal_expr.kind == asp.compiler.VbsExprString {
+                        let literal_id: Int = self.bytecode.literal_strings.len();
+                        _ = self.bytecode.literal_strings.push(asp.runtime.hex_decode_string(literal_expr.text));
+                        _ = self.emit(VbsBytecodeWriteLiteral, literal_id, -1);
+                        return;
+                    }
+                }
+            }
+            let i: Int = 0;
+            loop i < stmt.call_arg_ids.len() {
+                self.compile_expr_node(stmt.call_arg_ids.get(i));
+                i += 1;
+            }
+            let routine_id: Int = self.find_static_routine_id(stmt.call_name);
+            _ = self.emit(VbsBytecodeCallStmt, stmt_id, routine_id >= 0 ? routine_id : self.static_object_call_binding(stmt.call_name));
+            return;
+        }
+        if stmt.kind == asp.compiler.VbsStmtExitFunction {
+            _ = self.emit(VbsBytecodeReturnSignal, 2, -1);
+            return;
+        }
+        if stmt.kind == asp.compiler.VbsStmtExitSub {
+            _ = self.emit(VbsBytecodeReturnSignal, 3, -1);
+            return;
+        }
+        if stmt.kind == asp.compiler.VbsStmtExitProperty {
+            _ = self.emit(VbsBytecodeReturnSignal, 2, -1);
+            return;
+        }
+        if stmt.kind == asp.compiler.VbsStmtExitFor {
+            let loop_id: Int = self.current_loop_for(true, false);
+            if loop_id >= 0 {
+                let jump_pc: Int = self.emit(VbsBytecodeJump, -1, -1);
+                _ = self.loop_patch_loop_ids.push(loop_id);
+                _ = self.loop_patch_pcs.push(jump_pc);
+                return;
+            }
+        }
+        if stmt.kind == asp.compiler.VbsStmtExitDo {
+            let loop_id: Int = self.current_loop_for(false, true);
+            if loop_id >= 0 {
+                let jump_pc: Int = self.emit(VbsBytecodeJump, -1, -1);
+                _ = self.loop_patch_loop_ids.push(loop_id);
+                _ = self.loop_patch_pcs.push(jump_pc);
+                return;
+            }
+        }
+        _ = self.emit(VbsBytecodeExecStmt, stmt_id, -1);
+    }
+
+    // Compiles all blocks and routines as one transaction. Freezing severs
+    // parser-only storage after every referenced ID has been captured.
+    func compile_script(self: VbsBytecodeCompiler, program: asp.compiler.VbsProgram, freeze_program: Bool = true, optimize_global_slots: Bool = true) -> VbsBytecodeProgram {
+        self.bytecode = new VbsBytecodeProgram();
+        self.bytecode.program = program;
+        // Serialization/freezing is deliberately deferred until routine
+        // parameter-write analysis and bytecode generation are complete.
+        self.loop_stack = new collections.Vector<Int>();
+        self.loop_handles_exit_for = new collections.Vector<Int>();
+        self.loop_handles_exit_do = new collections.Vector<Int>();
+        self.loop_patch_loop_ids = new collections.Vector<Int>();
+        self.loop_patch_pcs = new collections.Vector<Int>();
+        self.current_routine_id = -1;
+        self.routine_index_keys = new collections.Vector<String>();
+        self.routine_index_values = new collections.Vector<Int>();
+        self.routine_index_capacity = program.routine_names.len() * 2 + 1;
+        self.inline_return_expr_cache = new collections.Vector<Int>();
+        self.current_scalar_slot_names = new collections.Vector<String>();
+        self.current_scalar_array_slot_names = new collections.Vector<String>();
+        self.global_binding_names = new collections.Vector<String>();
+        self.global_binding_index = new collections.Map<String, Int>();
+        self.unsafe_scalar_call_names = new collections.Vector<String>();
+        self.optimization_enabled = vbs_compiler_optimizations_enabled();
+        self.optimizer = new asp.compiler.VbsOptimizer(program);
+        let routine_index_slot: Int = 0;
+        loop routine_index_slot < self.routine_index_capacity {
+            _ = self.routine_index_keys.push("");
+            _ = self.routine_index_values.push(-1);
+            routine_index_slot += 1;
+        }
+        let routine_index_id: Int = 0;
+        loop routine_index_id < program.routine_names.len() {
+            let owner_class: String = routine_index_id < program.routine_owner_classes.len() ? program.routine_owner_classes.get(routine_index_id) : "";
+            let key: String = program.routine_lookup_key(program.routine_names.get(routine_index_id), owner_class);
+            let hash: Int = 216613626;
+            let hash_index: Int = 0;
+            loop hash_index < std.len(key) {
+                hash = (hash * 16777619) ^ std.byte_at(key, hash_index);
+                hash_index += 1;
+            }
+            let slot: Int = (hash & 2147483647) % self.routine_index_capacity;
+            let probe: Int = 0;
+            loop probe < self.routine_index_capacity {
+                let index: Int = (slot + probe) % self.routine_index_capacity;
+                let current: String = self.routine_index_keys.get(index);
+                if std.len(current) == 0 || current == key {
+                    _ = self.routine_index_keys.set(index, key);
+                    _ = self.routine_index_values.set(index, routine_index_id);
+                    break;
+                }
+                probe += 1;
+            }
+            routine_index_id += 1;
+        }
+        if optimize_global_slots {
+            self.collect_global_bindings_from_block(program.root_block_id);
+        }
+        self.bytecode.global_slot_names = self.global_binding_names;
+        let i: Int = 0;
+        loop i < program.blocks.len() {
+            _ = self.bytecode.block_pcs.push(-1);
+            _ = self.bytecode.block_end_pcs.push(-1);
+            i += 1;
+        }
+        i = 0;
+        loop i < program.routine_names.len() {
+            let block_id: Int = i < program.routine_block_ids.len() ? program.routine_block_ids.get(i) : -1;
+            let param_names: collections.Vector<String> = i < program.routine_param_names.len()
+            ? asp.runtime.unpack_string_parts(program.routine_param_names.get(i))
+            : new collections.Vector<String>();
+            let writes_mask: Int = program.block_parameter_write_mask(block_id, param_names);
+            if i < program.routine_writes_param_masks.len() {
+                _ = program.routine_writes_param_masks.set(i, writes_mask);
+            }
+            // Fresh programs execute the same ByRef writeback contract as
+            // deserialized programs, whose routine metadata is rebuilt on load.
+            if i < program.routines.len() {
+                program.routines.get(i).writes_param_mask = writes_mask;
+            }
+            // Writable ByRef calls are safe in the unified frame: the caller
+            // argument ids and writes mask are retained until frame pop.
+            i += 1;
+        }
+        self.bytecode.root_pc = self.compile_block(program.root_block_id);
+        i = 0;
+        loop i < program.routine_block_ids.len() {
+            self.current_routine_id = i;
+            self.prepare_scalar_slots(i);
+            let has_frame_metadata: Bool = (self.current_routine_frame_flags & (VbsRoutineFrameHasMetadata => Int)) != 0;
+            _ = self.bytecode.routine_slot_counts.push(has_frame_metadata ? self.current_scalar_slot_names.len() : -1);
+            _ = self.bytecode.routine_slot_names.push(vbs_routine_frame_descriptor(self.current_routine_frame_flags, self.current_scalar_slot_names));
+            _ = self.bytecode.routine_block_ids.push(program.routine_block_ids.get(i));
+            _ = self.bytecode.routine_writes_masks.push(program.routine_writes_param_masks.get(i));
+            _ = self.bytecode.routine_param_counts.push(asp.runtime.unpack_string_parts(program.routine_param_names.get(i)).len());
+            _ = self.bytecode.routine_owners.push(program.routine_owner_classes.get(i));
+            _ = self.compile_block(program.routine_block_ids.get(i));
+            i += 1;
+        }
+        self.current_routine_id = -1;
+        self.current_routine_frame_flags = 0;
+        self.current_scalar_slot_names = new collections.Vector<String>();
+        self.current_scalar_array_slot_names = new collections.Vector<String>();
+        i = program.blocks.len() - 1;
+        loop i >= 0 {
+            if self.bytecode.block_pcs.get(i) < 0 {
+                _ = self.compile_block(i);
+            }
+            i -= 1;
+        }
+        _ = self.emit(VbsBytecodeHalt);
+        if self.optimization_enabled {
+            (new VbsBytecodeOptimizer()).optimize(self.bytecode);
+        }
+        // writes_param_mask is part of runtime routine metadata, so freeze only
+        // after the analysis above has populated every routine.
+        if freeze_program {
+            program.freeze_decoded();
+        }
+        self.bytecode.serialized_program = "";
+        return self.bytecode;
+    }
+
+    // Expression-only programs are used by dynamic evaluation paths and have a
+    // root expression ID instead of a root statement PC.
+    func compile_expr(self: VbsBytecodeCompiler, program: asp.compiler.VbsProgram, freeze_program: Bool = true) -> VbsBytecodeProgram {
+        self.bytecode = new VbsBytecodeProgram();
+        self.bytecode.program = program;
+        self.bytecode.expr_only = true;
+        self.bytecode.root_pc = 0;
+        self.bytecode.root_expr_id = program.root_expr_id;
+        self.optimization_enabled = vbs_compiler_optimizations_enabled();
+        self.optimizer = new asp.compiler.VbsOptimizer(program);
+        self.compile_expr_node(program.root_expr_id);
+        _ = self.emit(VbsBytecodeHalt);
+        if self.optimization_enabled {
+            (new VbsBytecodeOptimizer()).optimize(self.bytecode);
+        }
+        if freeze_program {
+            program.freeze_decoded();
+        }
+        self.bytecode.serialized_program = "";
+        return self.bytecode;
+    }
+
+    // Flattens concatenation chains so ConcatN allocates the final string once.
+    func collect_concat_expr_ids(self: VbsBytecodeCompiler, expr_id: Int, out: collections.Vector<Int>) -> Void {
+        if expr_id < 0 || expr_id >= self.bytecode.program.exprs.len() {
+            return;
+        }
+        let expr: asp.compiler.VbsExprNode = self.bytecode.program.snapshot_expr(expr_id);
+        if expr.kind == asp.compiler.VbsExprConcat {
+            self.collect_concat_expr_ids(expr.left_id, out);
+            self.collect_concat_expr_ids(expr.right_id, out);
+            return;
+        }
+        _ = out.push(expr_id);
+    }
+
+    // Local value numbering is limited to expressions whose leaves are
+    // literals, inline parameters, or routine scalar slots. Reusing globals or
+    // calls would be invalid because property access and concurrent
+    // Application mutation are observable.
+    func expr_is_cse_safe(self: VbsBytecodeCompiler, expr_id: Int, inline_params: String, depth: Int = 0) -> Bool {
+        if expr_id < 0 || expr_id >= self.bytecode.program.exprs.len() || depth >= 64 {
+            return false;
+        }
+        let expr: asp.compiler.VbsExprNode = self.bytecode.program.snapshot_expr(expr_id);
+        if expr.kind == asp.compiler.VbsExprString
+        || expr.kind == asp.compiler.VbsExprInteger
+        || expr.kind == asp.compiler.VbsExprFloat
+        || expr.kind == asp.compiler.VbsExprDate
+        || expr.kind == asp.compiler.VbsExprBool
+        || expr.kind == asp.compiler.VbsExprNothing {
+            return true;
+        }
+        if expr.kind == asp.compiler.VbsExprIdentifier {
+            return self.inline_param_index(inline_params, expr.text) >= 0
+                || self.scalar_slot_index(expr.text) >= 0;
+        }
+        if expr.kind == asp.compiler.VbsExprNeg || expr.kind == asp.compiler.VbsExprNot {
+            return self.expr_is_cse_safe(expr.left_id, inline_params, depth + 1);
+        }
+        if expr.right_id >= 0 && expr.kind != asp.compiler.VbsExprCall && expr.kind != asp.compiler.VbsExprNew {
+            return self.expr_is_cse_safe(expr.left_id, inline_params, depth + 1)
+                && self.expr_is_cse_safe(expr.right_id, inline_params, depth + 1);
+        }
+        return false;
+    }
+
+    func exprs_equal(self: VbsBytecodeCompiler, left_id: Int, right_id: Int, depth: Int = 0) -> Bool {
+        if left_id == right_id {
+            return true;
+        }
+        if left_id < 0 || right_id < 0
+        || left_id >= self.bytecode.program.exprs.len()
+        || right_id >= self.bytecode.program.exprs.len()
+        || depth >= 64 {
+            return false;
+        }
+        let left: asp.compiler.VbsExprNode = self.bytecode.program.snapshot_expr(left_id);
+        let right: asp.compiler.VbsExprNode = self.bytecode.program.snapshot_expr(right_id);
+        if left.kind != right.kind
+        || left.text != right.text
+        || left.int_value != right.int_value
+        || left.bool_value != right.bool_value
+        || left.arg_ids.len() != right.arg_ids.len() {
+            return false;
+        }
+        if !self.exprs_equal(left.left_id, right.left_id, depth + 1)
+        || !self.exprs_equal(left.right_id, right.right_id, depth + 1) {
+            return false;
+        }
+        let i: Int = 0;
+        loop i < left.arg_ids.len() {
+            if !self.exprs_equal(left.arg_ids.get(i), right.arg_ids.get(i), depth + 1) {
+                return false;
+            }
+            i += 1;
+        }
+        return true;
+    }
+
+    func compile_expr_node(self: VbsBytecodeCompiler, expr_id: Int, inline_params: String = "", inline_depth: Int = 0, inline_global_scope: Bool = false) -> Void {
+        if expr_id < 0 || expr_id >= self.bytecode.program.exprs.len() {
+            return;
+        }
+        if self.optimization_enabled {
+            let optimized_id: Int = self.optimizer.optimize_expr(expr_id);
+            if optimized_id != expr_id {
+                self.compile_expr_node(optimized_id, inline_params, inline_depth, inline_global_scope);
+                return;
+            }
+        }
+        let expr: asp.compiler.VbsExprNode = self.bytecode.program.snapshot_expr(expr_id);
+        if expr.kind == asp.compiler.VbsExprIdentifier && inline_depth > 0 {
+            let param_index: Int = self.inline_param_index(inline_params, expr.text);
+            if param_index >= 0 {
+                _ = self.emit(VbsBytecodePushInlineParam, param_index, -1);
+                return;
+            }
+        }
+        if self.optimization_enabled && expr.kind == asp.compiler.VbsExprIdentifier {
+            let constant_expr_id: Int = self.optimizer.propagated_expr(self.current_routine_id, expr.text);
+            if constant_expr_id >= 0 && constant_expr_id != expr_id {
+                self.compile_expr_node(constant_expr_id, inline_params, inline_depth, inline_global_scope);
+                return;
+            }
+        }
+        if expr.kind == asp.compiler.VbsExprCall && expr.left_id < 0 && self.current_scalar_slot_names.len() > 0 {
+            let dot: Int = strings.find_substr(expr.text, ".");
+            if dot > 0 && dot + 1 < std.len(expr.text) {
+                let receiver_slot: Int = self.scalar_slot_index(std.substr(expr.text, 0, dot));
+                if receiver_slot >= 0 {
+                    _ = self.emit(VbsBytecodePushScalarSlot, receiver_slot, -1);
+                    let arg_index: Int = 0;
+                    loop arg_index < expr.arg_ids.len() {
+                        self.compile_expr_node(expr.arg_ids.get(arg_index), inline_params, inline_depth, inline_global_scope);
+                        arg_index += 1;
+                    }
+                    _ = self.emit(VbsBytecodeMemberAccessExpr, expr_id, 0);
+                    return;
+                }
+            }
+            let scalar_slot: Int = self.scalar_slot_index(expr.text);
+            if scalar_slot >= 0 && (self.scalar_array_slot_index(expr.text) >= 0 || self.find_static_routine_id(expr.text) < 0) {
+                let i: Int = 0;
+                loop i < expr.arg_ids.len() {
+                    self.compile_expr_node(expr.arg_ids.get(i), inline_params, inline_depth, inline_global_scope);
+                    i += 1;
+                }
+                _ = self.emit(VbsBytecodeTargetAccessExpr, expr_id, scalar_slot);
+                return;
+            }
+        }
+        if expr.kind == asp.compiler.VbsExprIdentifier && self.current_scalar_slot_names.len() > 0 {
+            let dot: Int = strings.find_substr(expr.text, ".");
+            if dot > 0 && dot + 1 < std.len(expr.text) {
+                let receiver_slot: Int = self.scalar_slot_index(std.substr(expr.text, 0, dot));
+                if receiver_slot >= 0 {
+                    _ = self.emit(VbsBytecodePushScalarSlot, receiver_slot, -1);
+                    _ = self.emit(VbsBytecodeMemberAccessExpr, expr_id, 0);
+                    return;
+                }
+            }
+            let scalar_slot: Int = self.scalar_slot_index(expr.text);
+            if scalar_slot >= 0 {
+                _ = self.emit(VbsBytecodePushScalarSlot, scalar_slot, -1);
+            } else if self.current_class_has_field(expr.text) || self.current_class_has_property_pair(expr.text) {
+                _ = self.emit(VbsBytecodePushExprLeaf, expr_id, -1);
+            } else if self.global_binding_slot(expr.text) >= 0 {
+                _ = self.emit(VbsBytecodePushGlobalSlot, self.global_binding_slot(expr.text), -1);
+            } else if self.routine_is_class(self.current_routine_id) {
+                _ = self.emit(VbsBytecodePushExprLeaf, expr_id, -1);
+            } else {
+                _ = self.emit(VbsBytecodePushGlobalExprLeaf, expr_id, -1);
+            }
+            return;
+        }
+        if expr.kind == asp.compiler.VbsExprIdentifier && self.current_routine_id < 0 && self.global_binding_slot(expr.text) >= 0 {
+            _ = self.emit(VbsBytecodePushGlobalSlot, self.global_binding_slot(expr.text), -1);
+            return;
+        }
+        if expr.kind == asp.compiler.VbsExprIdentifier && inline_depth > 0 {
+            if inline_global_scope {
+                let global_slot: Int = self.global_binding_slot(expr.text);
+                _ = self.emit(global_slot >= 0 ? VbsBytecodePushGlobalSlot : VbsBytecodePushGlobalExprLeaf, global_slot >= 0 ? global_slot : expr_id, -1);
+                return;
+            }
+        }
+        if expr.kind == asp.compiler.VbsExprString || expr.kind == asp.compiler.VbsExprInteger || expr.kind == asp.compiler.VbsExprFloat || expr.kind == asp.compiler.VbsExprDate || expr.kind == asp.compiler.VbsExprBool || expr.kind == asp.compiler.VbsExprNothing || expr.kind == asp.compiler.VbsExprIdentifier || expr.kind == asp.compiler.VbsExprNew {
+            _ = self.emit(VbsBytecodePushExprLeaf, expr_id, -1);
+            return;
+        }
+        if expr.kind == asp.compiler.VbsExprNeg {
+            self.compile_expr_node(expr.left_id, inline_params, inline_depth, inline_global_scope);
+            _ = self.emit(VbsBytecodeNeg, -1, -1);
+            return;
+        }
+        if expr.kind == asp.compiler.VbsExprNot {
+            self.compile_expr_node(expr.left_id, inline_params, inline_depth, inline_global_scope);
+            _ = self.emit(VbsBytecodeNot, -1, -1);
+            return;
+        }
+        if expr.kind == asp.compiler.VbsExprConcat {
+            let parts: collections.Vector<Int> = new collections.Vector<Int>();
+            self.collect_concat_expr_ids(expr_id, parts);
+            let i: Int = 0;
+            loop i < parts.len() {
+                self.compile_expr_node(parts.get_unchecked(i), inline_params, inline_depth, inline_global_scope);
+                i += 1;
+            }
+            _ = self.emit(VbsBytecodeConcatN, parts.len(), -1);
+            return;
+        }
+        if expr.kind == asp.compiler.VbsExprEq || expr.kind == asp.compiler.VbsExprNe || expr.kind == asp.compiler.VbsExprIs || expr.kind == asp.compiler.VbsExprLt || expr.kind == asp.compiler.VbsExprLe || expr.kind == asp.compiler.VbsExprGt || expr.kind == asp.compiler.VbsExprGe || expr.kind == asp.compiler.VbsExprAdd || expr.kind == asp.compiler.VbsExprSub || expr.kind == asp.compiler.VbsExprMul || expr.kind == asp.compiler.VbsExprDiv || expr.kind == asp.compiler.VbsExprIntDiv || expr.kind == asp.compiler.VbsExprMod || expr.kind == asp.compiler.VbsExprAnd || expr.kind == asp.compiler.VbsExprOr || expr.kind == asp.compiler.VbsExprXor || expr.kind == asp.compiler.VbsExprPow {
+            self.compile_expr_node(expr.left_id, inline_params, inline_depth, inline_global_scope);
+            if self.optimization_enabled
+            && self.exprs_equal(expr.left_id, expr.right_id)
+            && self.expr_is_cse_safe(expr.left_id, inline_params) {
+                _ = self.emit(VbsBytecodeDup, -1, -1);
+            } else {
+                self.compile_expr_node(expr.right_id, inline_params, inline_depth, inline_global_scope);
+            }
+            if expr.kind == asp.compiler.VbsExprEq {
+                _ = self.emit(VbsBytecodeEq, -1, -1);
+            } else if expr.kind == asp.compiler.VbsExprNe {
+                _ = self.emit(VbsBytecodeNe, -1, -1);
+            } else if expr.kind == asp.compiler.VbsExprIs {
+                _ = self.emit(VbsBytecodeIs, -1, -1);
+            } else if expr.kind == asp.compiler.VbsExprLt {
+                _ = self.emit(VbsBytecodeLt, -1, -1);
+            } else if expr.kind == asp.compiler.VbsExprLe {
+                _ = self.emit(VbsBytecodeLe, -1, -1);
+            } else if expr.kind == asp.compiler.VbsExprGt {
+                _ = self.emit(VbsBytecodeGt, -1, -1);
+            } else if expr.kind == asp.compiler.VbsExprGe {
+                _ = self.emit(VbsBytecodeGe, -1, -1);
+            } else if expr.kind == asp.compiler.VbsExprAdd {
+                _ = self.emit(VbsBytecodeAdd, -1, -1);
+            } else if expr.kind == asp.compiler.VbsExprSub {
+                _ = self.emit(VbsBytecodeSub, -1, -1);
+            } else if expr.kind == asp.compiler.VbsExprMul {
+                _ = self.emit(VbsBytecodeMul, -1, -1);
+            } else if expr.kind == asp.compiler.VbsExprDiv {
+                _ = self.emit(VbsBytecodeDiv, -1, -1);
+            } else if expr.kind == asp.compiler.VbsExprIntDiv {
+                _ = self.emit(VbsBytecodeIntDiv, -1, -1);
+            } else if expr.kind == asp.compiler.VbsExprMod {
+                _ = self.emit(VbsBytecodeMod, -1, -1);
+            } else if expr.kind == asp.compiler.VbsExprAnd {
+                _ = self.emit(VbsBytecodeAnd, -1, -1);
+            } else if expr.kind == asp.compiler.VbsExprOr {
+                _ = self.emit(VbsBytecodeOr, -1, -1);
+            } else if expr.kind == asp.compiler.VbsExprXor {
+                _ = self.emit(VbsBytecodeXor, -1, -1);
+            } else if expr.kind == asp.compiler.VbsExprPow {
+                _ = self.emit(VbsBytecodePow, -1, -1);
+            }
+            return;
+        }
+        if expr.kind == asp.compiler.VbsExprCall {
+            if expr.left_id >= 0 {
+                self.compile_expr_node(expr.left_id, inline_params, inline_depth, inline_global_scope);
+            }
+            let i: Int = 0;
+            loop i < expr.arg_ids.len() {
+                self.compile_expr_node(expr.arg_ids.get(i), inline_params, inline_depth, inline_global_scope);
+                i += 1;
+            }
+            if expr.left_id >= 0 && std.len(expr.text) == 0 {
+                _ = self.emit(VbsBytecodeTargetAccessExpr, expr_id, -1);
+            } else if expr.left_id >= 0 {
+                _ = self.emit(VbsBytecodeMemberAccessExpr, expr_id, self.find_static_object_member_id(expr.text));
+            } else {
+                let routine_id: Int = self.find_static_routine_id(expr.text);
+                // Compile the immutable callee expression directly. Parameter
+                // references are resolved through the inline frame, so no
+                // cloned AST ownership graph can outlive its parser storage.
+                let return_expr_id: Int = self.optimization_enabled && inline_depth < 8
+                    ? self.inline_return_expr_id(routine_id)
+                    : -1;
+                let routine_params_packed: String = routine_id >= 0 && routine_id < self.bytecode.program.routine_param_names.len()
+                ? self.bytecode.program.routine_param_names.get(routine_id)
+                : "";
+                let routine_params: collections.Vector<String> = asp.runtime.unpack_string_parts(routine_params_packed);
+                if return_expr_id >= 0 && routine_id >= 0 && expr.arg_ids.len() == routine_params.len() {
+                    _ = self.emit(VbsBytecodeInlineEnter, expr.arg_ids.len(), routine_id);
+                    self.compile_expr_node(return_expr_id, routine_params_packed, inline_depth + 1, true);
+                    _ = self.emit(VbsBytecodeInlineExit, -1, -1);
+                } else {
+                    _ = self.emit(VbsBytecodeCallExpr, expr_id, routine_id >= 0 ? routine_id : self.static_object_call_binding(expr.text));
+                }
+            }
+            return;
+        }
+        _ = self.emit(VbsBytecodePushExprLeaf, expr_id, -1);
+    }
+}
+
+extern func eg_asp_text_checksum(data: String) -> Int;
+extern func eg_asp_text_checksum_range(data: String, start: Int, length: Int) -> Int;
+
+// Binary bytecode uses explicit fixed-width integers and length-prefixed
+// strings. The checksum covers payload bytes and never process pointers.
+func vbc_binary_checksum(data: String) -> Int {
+    return eg_asp_text_checksum(data);
+}
+
+func vbc_binary_write_u32(out: bytes.Buffer, value: Int) -> Void {
+    out.write_u8(value & 255);
+    out.write_u8((value >> 8) & 255);
+    out.write_u8((value >> 16) & 255);
+    out.write_u8((value >> 24) & 255);
+}
+
+func vbc_binary_write_i64(out: bytes.Buffer, value: Int) -> Void {
+    let i: Int = 0;
+    loop i < 8 {
+        out.write_u8((value >> (i * 8)) & 255);
+        i += 1;
+    }
+}
+
+func vbc_binary_write_string(out: bytes.Buffer, value: String) -> Void {
+    vbc_binary_write_u32(out, std.len(value));
+    out.write_string(value);
+}
+
+func vbc_binary_write_ints(out: bytes.Buffer, values: collections.Vector<Int>) -> Void {
+    vbc_binary_write_u32(out, values.len());
+    let i: Int = 0;
+    loop i < values.len() {
+        vbc_binary_write_i64(out, values.get(i));
+        i += 1;
+    }
+}
+
+func vbc_binary_write_strings(out: bytes.Buffer, values: collections.Vector<String>) -> Void {
+    vbc_binary_write_u32(out, values.len());
+    let i: Int = 0;
+    loop i < values.len() {
+        vbc_binary_write_string(out, values.get(i));
+        i += 1;
+    }
+}
+
+// Bounds-checking reader for managed binary images. `ok` is sticky: after one
+// malformed field, later reads return defaults without advancing unsafely.
+class VbcBinaryReader {
+    var data: String;
+    var offset: Int;
+    var end: Int;
+    var valid: Bool;
+
+    func init(self: VbcBinaryReader, data: String) -> Void {
+        self.data = data;
+        self.offset = 0;
+        self.end = std.len(data);
+        self.valid = true;
+    }
+
+    func can_read(self: VbcBinaryReader, length: Int) -> Bool {
+        return self.valid && length >= 0 && self.offset >= 0 && self.offset + length >= self.offset && self.offset + length <= self.end;
+    }
+
+    func read_u32(self: VbcBinaryReader) -> Int {
+        if !self.can_read(4) {
+            self.valid = false;
+            return 0;
+        }
+        let value: Int = std.byte_at(self.data, self.offset)
+            | (std.byte_at(self.data, self.offset + 1) << 8)
+            | (std.byte_at(self.data, self.offset + 2) << 16)
+            | (std.byte_at(self.data, self.offset + 3) << 24);
+        self.offset += 4;
+        return value;
+    }
+
+    func read_i64(self: VbcBinaryReader) -> Int {
+        if !self.can_read(8) {
+            self.valid = false;
+            return 0;
+        }
+        let value: Int = 0;
+        let i: Int = 0;
+        loop i < 8 {
+            value = value | (std.byte_at(self.data, self.offset + i) << (i * 8));
+            i += 1;
+        }
+        self.offset += 8;
+        return value;
+    }
+
+    func read_string(self: VbcBinaryReader) -> String {
+        let length: Int = self.read_u32();
+        if !self.can_read(length) {
+            self.valid = false;
+            return "";
+        }
+        let value: String = std.substr(self.data, self.offset, length);
+        self.offset += length;
+        return value;
+    }
+
+    func read_ints(self: VbcBinaryReader) -> collections.Vector<Int> {
+        let values: collections.Vector<Int> = new collections.Vector<Int>();
+        let count: Int = self.read_u32();
+        if count < 0 || count > 16777216 || !self.can_read(count * 8) {
+            self.valid = false;
+            return values;
+        }
+        values.reserve(count);
+        let i: Int = 0;
+        loop i < count {
+            _ = values.push(self.read_i64());
+            i += 1;
+        }
+        return values;
+    }
+
+    func read_strings(self: VbcBinaryReader) -> collections.Vector<String> {
+        let values: collections.Vector<String> = new collections.Vector<String>();
+        let count: Int = self.read_u32();
+        if count < 0 || count > 1048576 {
+            self.valid = false;
+            return values;
+        }
+        values.reserve(count);
+        let i: Int = 0;
+        loop i < count {
+            _ = values.push(self.read_string());
+            i += 1;
+        }
+        return values;
+    }
+}
+
+// Runtime-program serialization stores only frozen metadata needed by
+// execution. The mapped decoder records offsets instead of copying large blobs.
+func serialize_vbs_runtime_program(program: asp.compiler.VbsProgram) -> String {
+    let out: bytes.Buffer = new bytes.Buffer();
+    vbc_binary_write_i64(out, program.root_block_id);
+    vbc_binary_write_i64(out, program.root_expr_id);
+    vbc_binary_write_strings(out, program.runtime_strings);
+    vbc_binary_write_string(out, program.runtime_expr_blob);
+    vbc_binary_write_string(out, program.runtime_expr_args_blob);
+    vbc_binary_write_string(out, program.runtime_expr_name_parts_blob);
+    vbc_binary_write_string(out, program.runtime_stmt_blob);
+    vbc_binary_write_string(out, program.runtime_stmt_ids_blob);
+    vbc_binary_write_string(out, program.runtime_stmt_name_parts_blob);
+    vbc_binary_write_string(out, program.runtime_block_blob);
+    vbc_binary_write_string(out, program.runtime_case_blob);
+    vbc_binary_write_string(out, program.runtime_routine_blob);
+    vbc_binary_write_string(out, program.runtime_routine_hash_blob);
+    vbc_binary_write_string(out, program.runtime_class_blob);
+    vbc_binary_write_string(out, program.runtime_class_field_blob);
+    vbc_binary_write_string(out, program.runtime_meta_ids_blob);
+    let packed: String = out.str();
+    out.dispose();
+    return packed;
+}
+
+func deserialize_vbs_runtime_program(text: String, has_name_parts: Bool = true) -> asp.compiler.VbsProgram {
+    let program: asp.compiler.VbsProgram = new asp.compiler.VbsProgram();
+    let reader: VbcBinaryReader = new VbcBinaryReader(text);
+    program.root_block_id = reader.read_i64();
+    program.root_expr_id = reader.read_i64();
+    program.runtime_strings = reader.read_strings();
+    program.runtime_expr_blob = reader.read_string();
+    program.runtime_expr_args_blob = reader.read_string();
+    if has_name_parts {
+        program.runtime_expr_name_parts_blob = reader.read_string();
+    }
+    program.runtime_stmt_blob = reader.read_string();
+    program.runtime_stmt_ids_blob = reader.read_string();
+    if has_name_parts {
+        program.runtime_stmt_name_parts_blob = reader.read_string();
+    }
+    program.runtime_block_blob = reader.read_string();
+    program.runtime_case_blob = reader.read_string();
+    program.runtime_routine_blob = reader.read_string();
+    program.runtime_routine_hash_blob = reader.read_string();
+    program.runtime_class_blob = reader.read_string();
+    program.runtime_class_field_blob = reader.read_string();
+    program.runtime_meta_ids_blob = reader.read_string();
+    if !reader.valid || reader.offset != reader.end {
+        _ = program.errors.push("invalid packed runtime program");
+    }
+    return program;
+}
+
+func deserialize_vbs_runtime_program_mapped(reader: asp.runtime.MappedBinaryReader, expected_end: Int) -> asp.compiler.VbsProgram {
+    let program: asp.compiler.VbsProgram = new asp.compiler.VbsProgram();
+    program.root_block_id = reader.read_i64();
+    program.root_expr_id = reader.read_i64();
+    program.runtime_strings = reader.read_strings();
+    let mapped_text, mapped_err = os.getenv("EGRET_ASP_MMAP_RUNTIME_METADATA");
+    let mapped: Bool = mapped_err != OK
+        || (mapped_text != "0"
+            && !strings.equal_fold_ascii(mapped_text, "off")
+            && !strings.equal_fold_ascii(mapped_text, "false")
+            && !strings.equal_fold_ascii(mapped_text, "no"));
+    if mapped {
+        program.mapped_image_handle = reader.handle;
+        program.mapped_expr_offset = reader.read_span();
+        program.mapped_expr_length = reader.last_span_length;
+        program.mapped_expr_args_offset = reader.read_span();
+        program.mapped_expr_args_length = reader.last_span_length;
+        program.mapped_expr_name_parts_offset = reader.read_span();
+        program.mapped_expr_name_parts_length = reader.last_span_length;
+        program.mapped_stmt_offset = reader.read_span();
+        program.mapped_stmt_length = reader.last_span_length;
+        program.mapped_stmt_ids_offset = reader.read_span();
+        program.mapped_stmt_ids_length = reader.last_span_length;
+        program.mapped_stmt_name_parts_offset = reader.read_span();
+        program.mapped_stmt_name_parts_length = reader.last_span_length;
+        program.mapped_block_offset = reader.read_span();
+        program.mapped_block_length = reader.last_span_length;
+        program.mapped_case_offset = reader.read_span();
+        program.mapped_case_length = reader.last_span_length;
+        program.mapped_routine_offset = reader.read_span();
+        program.mapped_routine_length = reader.last_span_length;
+        program.mapped_routine_hash_offset = reader.read_span();
+        program.mapped_routine_hash_length = reader.last_span_length;
+        program.mapped_class_offset = reader.read_span();
+        program.mapped_class_length = reader.last_span_length;
+        program.mapped_class_field_offset = reader.read_span();
+        program.mapped_class_field_length = reader.last_span_length;
+        program.mapped_meta_ids_offset = reader.read_span();
+        program.mapped_meta_ids_length = reader.last_span_length;
+    } else {
+        program.runtime_expr_blob = reader.read_string();
+        program.runtime_expr_args_blob = reader.read_string();
+        program.runtime_expr_name_parts_blob = reader.read_string();
+        program.runtime_stmt_blob = reader.read_string();
+        program.runtime_stmt_ids_blob = reader.read_string();
+        program.runtime_stmt_name_parts_blob = reader.read_string();
+        program.runtime_block_blob = reader.read_string();
+        program.runtime_case_blob = reader.read_string();
+        program.runtime_routine_blob = reader.read_string();
+        program.runtime_routine_hash_blob = reader.read_string();
+        program.runtime_class_blob = reader.read_string();
+        program.runtime_class_field_blob = reader.read_string();
+        program.runtime_meta_ids_blob = reader.read_string();
+    }
+    if !reader.valid || reader.offset != expected_end {
+        _ = program.errors.push("invalid mapped runtime program");
+    }
+    return program;
+}
+
+// Writes a complete versioned bytecode image with lengths and checksum.
+func serialize_vbs_bytecode_program(bytecode: VbsBytecodeProgram) -> String {
+    let payload_buffer: bytes.Buffer = new bytes.Buffer();
+    vbc_binary_write_u32(payload_buffer, bytecode.expr_only ? 1 : 0);
+    vbc_binary_write_i64(payload_buffer, bytecode.root_pc);
+    vbc_binary_write_i64(payload_buffer, bytecode.root_expr_id);
+    let serialized_program: String = serialize_vbs_runtime_program(bytecode.program);
+    vbc_binary_write_string(payload_buffer, serialized_program);
+    vbc_binary_write_ints(payload_buffer, bytecode.insns);
+    vbc_binary_write_ints(payload_buffer, bytecode.block_pcs);
+    vbc_binary_write_ints(payload_buffer, bytecode.block_end_pcs);
+    vbc_binary_write_ints(payload_buffer, bytecode.routine_slot_counts);
+    vbc_binary_write_strings(payload_buffer, bytecode.routine_slot_names);
+    vbc_binary_write_strings(payload_buffer, bytecode.literal_strings);
+    vbc_binary_write_strings(payload_buffer, bytecode.global_slot_names);
+    let payload: String = payload_buffer.str();
+    payload_buffer.dispose();
+    let file_buffer: bytes.Buffer = new bytes.Buffer();
+    file_buffer.write_string("EGBVC008");
+    vbc_binary_write_u32(file_buffer, 8);
+    vbc_binary_write_u32(file_buffer, std.len(payload));
+    vbc_binary_write_u32(file_buffer, vbc_binary_checksum(payload));
+    file_buffer.write_string(payload);
+    let out: String = file_buffer.str();
+    file_buffer.dispose();
+    return out;
+}
+
+func deserialize_vbs_bytecode_program(text: String) -> VbsBytecodeProgram {
+    let bytecode: VbsBytecodeProgram = new VbsBytecodeProgram();
+    let magic: String = std.len(text) >= 8 ? std.substr(text, 0, 8) : "";
+    if std.len(text) < 20 || (magic != "EGBVC001" && magic != "EGBVC002" && magic != "EGBVC003" && magic != "EGBVC004" && magic != "EGBVC005" && magic != "EGBVC006" && magic != "EGBVC007" && magic != "EGBVC008") {
+        _ = bytecode.add_error("invalid serialized bytecode");
+        return bytecode;
+    }
+    let serialized_version: Int = std.byte_at(text, 8)
+        | (std.byte_at(text, 9) << 8)
+        | (std.byte_at(text, 10) << 16)
+        | (std.byte_at(text, 11) << 24);
+    if serialized_version != 1 && serialized_version != 2 && serialized_version != 3 && serialized_version != 4 && serialized_version != 5 && serialized_version != 6 && serialized_version != 7 && serialized_version != 8 {
+        _ = bytecode.add_error("unsupported serialized bytecode version");
+        return bytecode;
+    }
+    let payload_length: Int = std.byte_at(text, 12)
+        | (std.byte_at(text, 13) << 8)
+        | (std.byte_at(text, 14) << 16)
+        | (std.byte_at(text, 15) << 24);
+    let expected_checksum: Int = std.byte_at(text, 16)
+        | (std.byte_at(text, 17) << 8)
+        | (std.byte_at(text, 18) << 16)
+        | (std.byte_at(text, 19) << 24);
+    if payload_length < 0 || payload_length != std.len(text) - 20 {
+        _ = bytecode.add_error("invalid serialized bytecode length");
+        return bytecode;
+    }
+    if eg_asp_text_checksum_range(text, 20, payload_length) != expected_checksum {
+        _ = bytecode.add_error("invalid serialized bytecode checksum");
+        return bytecode;
+    }
+    let reader: VbcBinaryReader = new VbcBinaryReader(text);
+    reader.offset = 20;
+    reader.end = 20 + payload_length;
+    bytecode.expr_only = reader.read_u32() != 0;
+    bytecode.root_pc = reader.read_i64();
+    bytecode.root_expr_id = reader.read_i64();
+    let serialized_program_length: Int = reader.read_u32();
+    let serialized_program_start: Int = reader.offset;
+    if !reader.can_read(serialized_program_length) {
+        _ = bytecode.add_error("invalid serialized program length");
+        return bytecode;
+    }
+    reader.offset += serialized_program_length;
+    bytecode.serialized_program = "";
+    bytecode.program = serialized_version >= 5
+        ? deserialize_vbs_runtime_program(std.substr(text, serialized_program_start, serialized_program_length), serialized_version >= 8)
+        : asp.compiler.deserialize_vbs_program_range(text, serialized_program_start, serialized_program_length);
+    if serialized_version == 1 {
+        let legacy_ops: collections.Vector<Int> = reader.read_ints();
+        let legacy_arg0s: collections.Vector<Int> = reader.read_ints();
+        let legacy_arg1s: collections.Vector<Int> = reader.read_ints();
+        if legacy_ops.len() != legacy_arg0s.len() || legacy_ops.len() != legacy_arg1s.len() {
+            _ = bytecode.add_error("invalid legacy instruction arrays");
+            return bytecode;
+        }
+        bytecode.insns.reserve(legacy_ops.len() * 3);
+        let instruction_index: Int = 0;
+        loop instruction_index < legacy_ops.len() {
+            _ = bytecode.insns.push(legacy_ops.get_unchecked(instruction_index));
+            _ = bytecode.insns.push(legacy_arg0s.get_unchecked(instruction_index));
+            _ = bytecode.insns.push(legacy_arg1s.get_unchecked(instruction_index));
+            instruction_index += 1;
+        }
+    } else {
+        bytecode.insns = reader.read_ints();
+        if bytecode.insns.len() % 3 != 0 {
+            _ = bytecode.add_error("invalid packed instruction stream");
+            return bytecode;
+        }
+    }
+    bytecode.block_pcs = reader.read_ints();
+    bytecode.block_end_pcs = reader.read_ints();
+    bytecode.routine_slot_counts = reader.read_ints();
+    if serialized_version >= 7 {
+        bytecode.routine_slot_names = reader.read_strings();
+    }
+    if serialized_version >= 3 {
+        bytecode.literal_strings = reader.read_strings();
+    }
+    if serialized_version >= 6 {
+        bytecode.global_slot_names = reader.read_strings();
+    }
+    if !reader.valid || reader.offset != reader.end {
+        _ = bytecode.add_error("truncated serialized bytecode");
+        return bytecode;
+    }
+    // Compatible v1-v4 payloads are normalized to the same immutable runtime
+    // representation used natively by v5.
+    if serialized_version < 5 {
+        bytecode.program.freeze_decoded();
+    }
+    let routine_index: Int = 0;
+    loop routine_index < bytecode.program.runtime_routine_count() {
+        _ = bytecode.routine_block_ids.push(bytecode.program.runtime_routine_block(routine_index));
+        _ = bytecode.routine_writes_masks.push(bytecode.program.runtime_routine_writes_mask(routine_index));
+        _ = bytecode.routine_param_counts.push(bytecode.program.runtime_routine_param_count(routine_index));
+        _ = bytecode.routine_owners.push(bytecode.program.runtime_routine_owner(routine_index));
+        routine_index += 1;
+    }
+    let i: Int = bytecode.block_pcs.len();
+    loop i < bytecode.program.runtime_block_count() {
+        _ = bytecode.block_pcs.push(-1);
+        i += 1;
+    }
+    let j: Int = bytecode.block_end_pcs.len();
+    loop j < bytecode.program.runtime_block_count() {
+        _ = bytecode.block_end_pcs.push(-1);
+        j += 1;
+    }
+    return bytecode;
+}
+
+// Validates all mapped ranges before publishing the image handle to the VM.
+func deserialize_vbs_bytecode_program_mapped(handle: Int, start: Int, length: Int) -> VbsBytecodeProgram {
+    let bytecode: VbsBytecodeProgram = new VbsBytecodeProgram();
+    if handle == 0 || length < 20
+    || eg_asp_mmap_matches(handle, start, "EGBVC008") == 0
+    || eg_asp_mmap_read_u32(handle, start + 8) != 8 {
+        _ = bytecode.add_error("unsupported mapped bytecode");
+        return bytecode;
+    }
+    let payload_length: Int = eg_asp_mmap_read_u32(handle, start + 12);
+    let expected_checksum: Int = eg_asp_mmap_read_u32(handle, start + 16);
+    if payload_length < 0 || payload_length != length - 20
+    || eg_asp_mmap_checksum(handle, start + 20, payload_length) != expected_checksum {
+        _ = bytecode.add_error("invalid mapped bytecode payload");
+        return bytecode;
+    }
+    let reader: asp.runtime.MappedBinaryReader = new asp.runtime.MappedBinaryReader(
+        handle, start + 20, payload_length
+    );
+    bytecode.expr_only = reader.read_u32() != 0;
+    bytecode.root_pc = reader.read_i64();
+    bytecode.root_expr_id = reader.read_i64();
+    let program_start: Int = reader.read_span();
+    let program_length: Int = reader.last_span_length;
+    if !reader.valid {
+        _ = bytecode.add_error("invalid mapped runtime program length");
+        return bytecode;
+    }
+    let program_reader: asp.runtime.MappedBinaryReader = new asp.runtime.MappedBinaryReader(
+        handle, program_start, program_length
+    );
+    bytecode.program = deserialize_vbs_runtime_program_mapped(
+        program_reader, program_start + program_length
+    );
+    let instruction_words: Int = reader.read_u32();
+    if instruction_words < 0 || instruction_words > 50331648
+    || instruction_words % 3 != 0 || !reader.can_read(instruction_words * 8) {
+        _ = bytecode.add_error("invalid mapped instruction stream");
+        return bytecode;
+    }
+    bytecode.mapped_image_handle = handle;
+    bytecode.mapped_insn_offset = reader.offset;
+    bytecode.mapped_instruction_count = instruction_words / 3;
+    reader.offset += instruction_words * 8;
+    bytecode.block_pcs = reader.read_ints();
+    bytecode.block_end_pcs = reader.read_ints();
+    bytecode.routine_slot_counts = reader.read_ints();
+    bytecode.routine_slot_names = reader.read_strings();
+    bytecode.literal_strings = reader.read_strings();
+    bytecode.global_slot_names = reader.read_strings();
+    if !reader.valid || reader.offset != reader.end || !bytecode.program.ok() {
+        _ = bytecode.add_error("truncated mapped bytecode");
+        return bytecode;
+    }
+    let routine_index: Int = 0;
+    loop routine_index < bytecode.program.runtime_routine_count() {
+        _ = bytecode.routine_block_ids.push(bytecode.program.runtime_routine_block(routine_index));
+        _ = bytecode.routine_writes_masks.push(bytecode.program.runtime_routine_writes_mask(routine_index));
+        _ = bytecode.routine_param_counts.push(bytecode.program.runtime_routine_param_count(routine_index));
+        _ = bytecode.routine_owners.push(bytecode.program.runtime_routine_owner(routine_index));
+        routine_index += 1;
+    }
+    let i: Int = bytecode.block_pcs.len();
+    loop i < bytecode.program.runtime_block_count() {
+        _ = bytecode.block_pcs.push(-1);
+        i += 1;
+    }
+    let j: Int = bytecode.block_end_pcs.len();
+    loop j < bytecode.program.runtime_block_count() {
+        _ = bytecode.block_end_pcs.push(-1);
+        j += 1;
+    }
+    return bytecode;
+}

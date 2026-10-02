@@ -1,0 +1,129 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp;
+
+use asp.object.database;
+use asp.runtime;
+use asp.compiler;
+use asp.vm;
+
+use std;
+use fs;
+use path;
+use strings;
+use strconv;
+use collections;
+use os;
+use os.process;
+use time;
+
+// Build a renderable failure page so compile errors follow the normal response
+// pipeline instead of escaping as a partially initialized CompiledPage.
+func make_error_page(page_path: String, message: String) -> asp.runtime.CompiledPage {
+    let page: asp.runtime.CompiledPage = new asp.runtime.CompiledPage();
+    page.page_path = page_path;
+    _ = page.nodes.push(new asp.compiler.PageNode(asp.compiler.PageNodeLiteral, message, page_path, 1));
+    _ = page.program_blobs.push("");
+    return page;
+}
+
+// Collapse mixed template nodes into one script. Literal bytes are hex encoded
+// to avoid changing encoding, quoting, or newline semantics while generating
+// calls to the internal response intrinsics.
+func lower_template_nodes_to_script(source_file: String, nodes: collections.Vector<asp.compiler.PageNode>) -> collections.Vector<asp.compiler.PageNode> {
+    let lowered: collections.Vector<asp.compiler.PageNode> = new collections.Vector<asp.compiler.PageNode>();
+    let builder: std.StringBuilder = new std.StringBuilder(65536);
+    let i: Int = 0;
+    loop i < nodes.len() {
+        let node: asp.compiler.PageNode = nodes.get(i);
+        if node.kind == asp.compiler.PageNodeLiteral {
+            if std.len(node.text) != 0 {
+                _ = builder.append("__AspWriteLiteralHex(\"");
+                _ = builder.append(asp.runtime.hex_encode(node.text));
+                _ = builder.append("\")\n");
+            }
+        } else if node.kind == asp.compiler.PageNodeExpr {
+            _ = builder.append("__AspWriteExpr(");
+            _ = builder.append(node.text);
+            _ = builder.append(")\n");
+        } else if node.kind == asp.compiler.PageNodeScript {
+            _ = builder.append(node.text);
+            if std.len(node.text) == 0 || std.byte_at(node.text, std.len(node.text) - 1) != '\n' {
+                _ = builder.append("\n");
+            }
+        }
+        i += 1;
+    }
+    let script: String = builder.to_string();
+    _ = builder.free();
+    _ = lowered.push(new asp.compiler.PageNode(asp.compiler.PageNodeScript, script, source_file, 1));
+    return lowered;
+}
+
+func should_cache_page_node_bytecode(node: asp.compiler.PageNode) -> Bool {
+    if node.kind != asp.compiler.PageNodeScript && node.kind != asp.compiler.PageNodeExpr {
+        return false;
+    }
+    return true;
+}
+
+// Parse according to node context, then compile into the matching VM entry
+// shape. On parse failure the returned program still carries diagnostics.
+func compile_page_node_program(page_path: String, node: asp.compiler.PageNode) -> asp.vm.VbsBytecodeProgram, ErrCode {
+    _ = page_path;
+    if node.kind == asp.compiler.PageNodeScript {
+        let program: asp.compiler.VbsProgram = (new asp.compiler.VbsParser()).parse_script_source(node.text);
+        if !program.ok() {
+            let failed: asp.vm.VbsBytecodeProgram = new asp.vm.VbsBytecodeProgram();
+            failed.program = program;
+            return failed, ERR_INVALID;
+        }
+        let compiled: asp.vm.VbsBytecodeProgram = (new asp.vm.VbsBytecodeCompiler()).compile_script(program);
+        return compiled, OK;
+    }
+    if node.kind == asp.compiler.PageNodeExpr {
+        let program: asp.compiler.VbsProgram = (new asp.compiler.VbsParser()).parse_expr_source(node.text);
+        if !program.ok() {
+            let failed: asp.vm.VbsBytecodeProgram = new asp.vm.VbsBytecodeProgram();
+            failed.program = program;
+            return failed, ERR_INVALID;
+        }
+        let compiled: asp.vm.VbsBytecodeProgram = (new asp.vm.VbsBytecodeCompiler()).compile_expr(program);
+        return compiled, OK;
+    }
+    return new asp.vm.VbsBytecodeProgram(), OK;
+}
+
+// Cache successful bytecode and failed ASTs in the same versioned envelope so
+// callers can report deterministic diagnostics without reparsing.
+func compile_page_node_bytecode(page_path: String, node: asp.compiler.PageNode) -> String, ErrCode {
+    let program: asp.vm.VbsBytecodeProgram = new asp.vm.VbsBytecodeProgram();
+    let compile_err: ErrCode = OK;
+    program, compile_err = compile_page_node_program(page_path, node);
+    if compile_err != OK {
+        return asp.compiler.serialize_vbs_program(program.program), compile_err;
+    }
+    return asp.vm.serialize_vbs_bytecode_program(program), OK;
+}
+
+// Treat cache data as untrusted: deserialize, verify the expected entry point,
+// and transparently recompile any missing or incompatible payload.
+func load_cached_page_node_bytecode(node: asp.compiler.PageNode, blob: String) -> asp.vm.VbsBytecodeProgram {
+    if node.kind != asp.compiler.PageNodeScript && node.kind != asp.compiler.PageNodeExpr {
+        return new asp.vm.VbsBytecodeProgram();
+    }
+    if std.len(blob) != 0 {
+        let cached: asp.vm.VbsBytecodeProgram = asp.vm.deserialize_vbs_bytecode_program(blob);
+        if cached.ok() {
+            if node.kind == asp.compiler.PageNodeScript && cached.root_pc >= 0 && cached.instruction_count() != 0 {
+                return cached;
+            }
+            if node.kind == asp.compiler.PageNodeExpr && cached.root_expr_id >= 0 {
+                return cached;
+            }
+        }
+    }
+    let compiled, _ = compile_page_node_program("", node);
+    return compiled;
+}

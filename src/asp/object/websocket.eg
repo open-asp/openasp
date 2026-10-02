@@ -1,0 +1,244 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.object;
+
+use asp;
+use asp.runtime;
+use asp.vm;
+
+use collections;
+use net.tcp;
+use net.tls;
+use net.websocket;
+use protocol.websocket;
+use std;
+use strconv;
+use strings;
+
+// WebSocket RuntimeObject fields retain URL, protocol, timeout, and last-frame
+// metadata; ObjectSpace exclusively owns the upgraded socket connection.
+func websocket_timeout(obj: asp.vm.RuntimeObject) -> Int {
+    return obj.cursor > 0 ? obj.cursor : 15000;
+}
+
+func websocket_raise_error(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj: asp.vm.RuntimeObject, operation: String, err: ErrCode) -> Void {
+    evaluator.raise_runtime_error(ctx, 12000 + (err => Int), operation + " failed with WebSocket error " + strconv.itoa(err => Int), obj.prog_id);
+}
+
+// Complete HTTP upgrade validation before publishing the connection. A failed
+// handshake closes its temporary socket and leaves the component unopened.
+func websocket_connect(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject, raw_url: String, subprotocol: String) -> asp.runtime.Variant {
+    if strings.contains(subprotocol, "\r") || strings.contains(subprotocol, "\n") {
+        evaluator.raise_runtime_error(ctx, 5, "WebSocket subprotocol cannot contain CR or LF", obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    let url, parse_err = protocol.websocket.parse_url(raw_url);
+    if parse_err != std.OK {
+        evaluator.raise_runtime_error(ctx, 5, "invalid WebSocket URL; use ws:// or wss://", obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    ctx.objects.close_websocket_connection(obj_id);
+    let fd, tcp_err = net.tcp.connect(url.host, url.port, websocket_timeout(obj));
+    if tcp_err != std.OK {
+        websocket_raise_error(evaluator, ctx, obj, "Connect", tcp_err);
+        return asp.runtime.variant_empty();
+    }
+    let conn: net.websocket.Conn = new net.websocket.Conn(fd, 0, url.scheme == "wss", websocket_timeout(obj), "", true);
+    if url.scheme == "wss" {
+        let tls_handle, tls_err = net.tls.upgrade_client_fd_ex(fd, url.host, websocket_timeout(obj), obj.lock_type >= 0, obj.transaction_backup_path);
+        if tls_err != std.OK {
+            websocket_raise_error(evaluator, ctx, obj, "TLS handshake", tls_err);
+            return asp.runtime.variant_empty();
+        }
+        conn.tls_h = tls_handle;
+    }
+    let key: String = protocol.websocket.make_client_key();
+    let request: String = protocol.websocket.encode_client_handshake(url.host, url.path, key, subprotocol);
+    let send_err: ErrCode = conn.send_all(request);
+    if send_err != std.OK {
+        _ = conn.close();
+        websocket_raise_error(evaluator, ctx, obj, "Client handshake", send_err);
+        return asp.runtime.variant_empty();
+    }
+    let raw_header, read_err = net.websocket.read_http_header(conn);
+    if read_err != std.OK {
+        _ = conn.close();
+        websocket_raise_error(evaluator, ctx, obj, "Client handshake", read_err);
+        return asp.runtime.variant_empty();
+    }
+    let header: String = net.websocket.split_header_buffer(conn);
+    let validate_err: ErrCode = protocol.websocket.validate_server_handshake(header, key);
+    if validate_err != std.OK {
+        _ = conn.close();
+        websocket_raise_error(evaluator, ctx, obj, "Client handshake validation", validate_err);
+        return asp.runtime.variant_empty();
+    }
+    _ = raw_header;
+    ctx.objects.put_websocket_connection(obj_id, conn);
+    obj.opened = true;
+    obj.text_value = raw_url;
+    obj.class_name = subprotocol;
+    obj.secondary_text = "client";
+    evaluator.set_object(ctx, obj_id, obj);
+    return asp.runtime.variant_empty();
+}
+
+func websocket_accept(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject, values: collections.Vector<asp.runtime.Variant>) -> asp.runtime.Variant {
+    if values.len() < 1 || values.get(0).kind != asp.runtime.VariantObject {
+        evaluator.raise_runtime_error(ctx, 450, "Accept requires an open OpenASP.Socket object", obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    let socket_id: Int = values.get(0).object_value;
+    let socket_obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, socket_id);
+    if socket_obj.component_kind != ComponentSocket || !socket_obj.opened || !ctx.objects.has_socket(socket_id) || socket_obj.class_name != "tcp" || socket_obj.secondary_text != "connected" {
+        evaluator.raise_runtime_error(ctx, 5, "Accept requires a connected TCP OpenASP.Socket", obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    let subprotocol: String = values.len() > 1 ? values.get(1).to_output_string() : "";
+    if strings.contains(subprotocol, "\r") || strings.contains(subprotocol, "\n") {
+        evaluator.raise_runtime_error(ctx, 5, "WebSocket subprotocol cannot contain CR or LF", obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    ctx.objects.close_websocket_connection(obj_id);
+    let fd: Int = ctx.objects.take_socket_fd(socket_id);
+    socket_obj.opened = false;
+    socket_obj.secondary_text = "upgraded";
+    evaluator.set_object(ctx, socket_id, socket_obj);
+    let conn, accept_err = net.websocket.accept(fd, websocket_timeout(obj), subprotocol);
+    if accept_err != std.OK {
+        _ = conn.close();
+        websocket_raise_error(evaluator, ctx, obj, "Server handshake", accept_err);
+        return asp.runtime.variant_empty();
+    }
+    ctx.objects.put_websocket_connection(obj_id, conn);
+    obj.opened = true;
+    obj.class_name = subprotocol;
+    obj.secondary_text = "server";
+    evaluator.set_object(ctx, obj_id, obj);
+    return asp.runtime.variant_empty();
+}
+
+func websocket_send(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject, operation: String, payload: String) -> asp.runtime.Variant {
+    if !obj.opened || !ctx.objects.has_websocket_connection(obj_id) {
+        evaluator.raise_runtime_error(ctx, 91, operation + " requires an open WebSocket", obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    let conn: net.websocket.Conn = ctx.objects.take_websocket_connection(obj_id);
+    let err: ErrCode = operation == "SendText" ? conn.send_text(payload)
+        : (operation == "SendBinary" ? conn.send_binary(payload)
+        : (operation == "Ping" ? conn.send_ping(payload) : conn.send_pong(payload)));
+    ctx.objects.put_websocket_connection(obj_id, conn);
+    if err != std.OK {
+        websocket_raise_error(evaluator, ctx, obj, operation, err);
+        return asp.runtime.variant_empty();
+    }
+    return asp.runtime.variant_bool(true);
+}
+
+// Receive one logical message; the protocol library handles fragmentation and
+// control frames. Last opcode/close details are copied back for property access.
+func websocket_receive(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject) -> asp.runtime.Variant {
+    if !obj.opened || !ctx.objects.has_websocket_connection(obj_id) {
+        evaluator.raise_runtime_error(ctx, 91, "Receive requires an open WebSocket", obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    let conn: net.websocket.Conn = ctx.objects.take_websocket_connection(obj_id);
+    let frame, err = conn.recv();
+    if err != std.OK {
+        ctx.objects.put_websocket_connection(obj_id, conn);
+        websocket_raise_error(evaluator, ctx, obj, "Receive", err);
+        return asp.runtime.variant_empty();
+    }
+    obj.int_value = frame.opcode;
+    obj.transaction_active = frame.fin;
+    obj.auxiliary_text = frame.opcode == protocol.websocket.opcode_text() ? "text"
+        : (frame.opcode == protocol.websocket.opcode_binary() ? "binary"
+        : (frame.opcode == protocol.websocket.opcode_close() ? "close"
+        : (frame.opcode == protocol.websocket.opcode_pong() ? "pong" : "continuation")));
+    if frame.opcode == protocol.websocket.opcode_close() {
+        if std.len(frame.payload) >= 2 {
+            obj.auxiliary_int = (std.byte_at(frame.payload, 0) << 8) | std.byte_at(frame.payload, 1);
+        }
+        _ = conn.close();
+        obj.opened = false;
+    } else {
+        ctx.objects.put_websocket_connection(obj_id, conn);
+    }
+    evaluator.set_object(ctx, obj_id, obj);
+    return asp.runtime.variant_string(frame.payload);
+}
+
+// COM-style facade over client connect and server-side accepted upgrades.
+// Close always removes the ObjectSpace connection before clearing opened.
+func invoke_websocket(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    let name: String = strings.to_lower_ascii(member);
+    if name == "connect" {
+        if values.len() < 1 {
+            evaluator.raise_runtime_error(ctx, 450, "Connect requires a ws:// or wss:// URL", obj.prog_id);
+            return asp.runtime.variant_empty();
+        }
+        return websocket_connect(evaluator, ctx, obj_id, obj, values.get(0).to_output_string(), values.len() > 1 ? values.get(1).to_output_string() : "");
+    }
+    if name == "accept" {
+        return websocket_accept(evaluator, ctx, obj_id, obj, values);
+    }
+    if name == "sendtext" || name == "sendbinary" || name == "ping" || name == "pong" {
+        if (name == "sendtext" || name == "sendbinary") && values.len() < 1 {
+            evaluator.raise_runtime_error(ctx, 450, member + " requires a payload", obj.prog_id);
+            return asp.runtime.variant_empty();
+        }
+        let operation: String = name == "sendtext" ? "SendText" : (name == "sendbinary" ? "SendBinary" : (name == "ping" ? "Ping" : "Pong"));
+        return websocket_send(evaluator, ctx, obj_id, obj, operation, values.len() > 0 ? values.get(0).to_output_string() : "");
+    }
+    if name == "receive" || name == "recv" {
+        return websocket_receive(evaluator, ctx, obj_id, obj);
+    }
+    if name == "close" {
+        ctx.objects.close_websocket_connection(obj_id);
+        obj.opened = false;
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if name == "timeout" || name == "tlsverify" || name == "cafile" {
+        if is_set && values.len() > 0 {
+            if name == "timeout" {
+                obj.cursor = asp.variant_to_int(values.get(values.len() - 1));
+            } else if name == "tlsverify" {
+                obj.lock_type = asp.variant_to_int(values.get(values.len() - 1)) == 0 ? -1 : 1;
+            } else {
+                obj.transaction_backup_path = values.get(values.len() - 1).to_output_string();
+            }
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        if name == "timeout" {
+            return asp.runtime.variant_int(websocket_timeout(obj));
+        }
+        if name == "tlsverify" {
+            return asp.runtime.variant_bool(obj.lock_type >= 0);
+        }
+        return asp.runtime.variant_string(obj.transaction_backup_path);
+    }
+    if name == "state" {
+        return asp.runtime.variant_int(obj.opened && ctx.objects.has_websocket_connection(obj_id) ? 1 : 0);
+    }
+    if name == "messagetype" {
+        return asp.runtime.variant_string(obj.auxiliary_text);
+    }
+    if name == "opcode" {
+        return asp.runtime.variant_int(obj.int_value);
+    }
+    if name == "final" {
+        return asp.runtime.variant_bool(obj.transaction_active);
+    }
+    if name == "closecode" {
+        return asp.runtime.variant_int(obj.auxiliary_int);
+    }
+    if name == "subprotocol" {
+        return asp.runtime.variant_string(obj.class_name);
+    }
+    evaluator.raise_runtime_error(ctx, 438, "WebSocket member not found or has invalid arguments: " + member, obj.prog_id);
+    return asp.runtime.variant_empty();
+}

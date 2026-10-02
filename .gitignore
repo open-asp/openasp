@@ -1,0 +1,12 @@
+.run/
+build/
+docs/
+examples/zblog-mysql-openasp
+.dbg/
+./fixtures/pages/build
+logs/
+release/
+.dockerignore
+Dockerfile.linux-x64
+make-release.sh
+Makefile

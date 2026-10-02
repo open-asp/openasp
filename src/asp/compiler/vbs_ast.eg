@@ -1,0 +1,1518 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.compiler;
+
+use asp.runtime;
+
+use asp;
+use std;
+use strings;
+use strconv;
+use collections;
+use bytes;
+
+extern func eg_asp_packed_i64_at(data: String, index: Int, fallback: Int) -> Int;
+extern func eg_asp_mmap_read_i64(handle: Int, offset: Int) -> Int;
+extern func eg_gc_preempt_guard_enter() -> Void;
+extern func eg_gc_preempt_guard_leave() -> Void;
+
+// Numeric enum values are part of the serialized-program ABI. Append new
+// values; never reorder existing entries without introducing a format version.
+enum VbsTokenKind {
+    VbsTokenEof,
+    VbsTokenIdentifier,
+    VbsTokenString,
+    VbsTokenInteger,
+    VbsTokenLParen,
+    VbsTokenRParen,
+    VbsTokenComma,
+    VbsTokenEq,
+    VbsTokenAmp,
+    VbsTokenColon,
+    VbsTokenNewline,
+    VbsTokenPlus,
+    VbsTokenMinus,
+    VbsTokenStar,
+    VbsTokenSlash,
+    VbsTokenBackslash,
+    VbsTokenLess,
+    VbsTokenGreater,
+    VbsTokenLe,
+    VbsTokenGe,
+    VbsTokenNe,
+    VbsTokenDot,
+    VbsTokenFloat,
+    VbsTokenCaret,
+    VbsTokenDate,
+}
+
+// Immutable token payload passed from lexer to parser. `text` retains the
+// source spelling needed for identifiers and literals; `line` is one-based.
+class VbsToken {
+    var kind: VbsTokenKind;
+    var text: String;
+    var line: Int;
+
+    func init(self: VbsToken, kind: VbsTokenKind, text: String, line: Int) -> Void {
+        self.kind = kind;
+        self.text = text;
+        self.line = line;
+    }
+}
+
+// Expression node tags. Binary operators use `left_id` and `right_id`; calls
+// additionally use `text` and `arg_ids`; literals use their matching scalar
+// field. Unused fields remain at constructor defaults.
+enum VbsExprKind {
+    VbsExprEmpty,
+    VbsExprString,
+    VbsExprInteger,
+    VbsExprBool,
+    VbsExprNothing,
+    VbsExprIdentifier,
+    VbsExprCall,
+    VbsExprNew,
+    VbsExprNeg,
+    VbsExprConcat,
+    VbsExprEq,
+    VbsExprNe,
+    VbsExprLt,
+    VbsExprLe,
+    VbsExprGt,
+    VbsExprGe,
+    VbsExprAdd,
+    VbsExprSub,
+    VbsExprMul,
+    VbsExprDiv,
+    VbsExprIntDiv,
+    VbsExprMod,
+    VbsExprNot,
+    VbsExprAnd,
+    VbsExprOr,
+    VbsExprXor,
+    VbsExprIs,
+    VbsExprFloat,
+    VbsExprPow,
+    VbsExprDate,
+}
+
+// Decodes the stable serialized integer tag. Unknown values become Empty so a
+// corrupt or newer cache fails closed instead of selecting an arbitrary opcode.
+func vbs_expr_kind_from_int(value: Int) -> VbsExprKind {
+    if value == 1 {
+        return VbsExprString;
+    }
+    if value == 2 {
+        return VbsExprInteger;
+    }
+    if value == 3 {
+        return VbsExprBool;
+    }
+    if value == 4 {
+        return VbsExprNothing;
+    }
+    if value == 5 {
+        return VbsExprIdentifier;
+    }
+    if value == 6 {
+        return VbsExprCall;
+    }
+    if value == 7 {
+        return VbsExprNew;
+    }
+    if value == 8 {
+        return VbsExprNeg;
+    }
+    if value == 9 {
+        return VbsExprConcat;
+    }
+    if value == 10 {
+        return VbsExprEq;
+    }
+    if value == 11 {
+        return VbsExprNe;
+    }
+    if value == 12 {
+        return VbsExprLt;
+    }
+    if value == 13 {
+        return VbsExprLe;
+    }
+    if value == 14 {
+        return VbsExprGt;
+    }
+    if value == 15 {
+        return VbsExprGe;
+    }
+    if value == 16 {
+        return VbsExprAdd;
+    }
+    if value == 17 {
+        return VbsExprSub;
+    }
+    if value == 18 {
+        return VbsExprMul;
+    }
+    if value == 19 {
+        return VbsExprDiv;
+    }
+    if value == 20 {
+        return VbsExprIntDiv;
+    }
+    if value == 21 {
+        return VbsExprMod;
+    }
+    if value == 22 {
+        return VbsExprNot;
+    }
+    if value == 23 {
+        return VbsExprAnd;
+    }
+    if value == 24 {
+        return VbsExprOr;
+    }
+    if value == 25 {
+        return VbsExprXor;
+    }
+    if value == 26 {
+        return VbsExprIs;
+    }
+    if value == 27 {
+        return VbsExprFloat;
+    }
+    if value == 28 {
+        return VbsExprPow;
+    }
+    if value == 29 {
+        return VbsExprDate;
+    }
+    return VbsExprEmpty;
+}
+
+// Parser-facing expression record. Children are table IDs rather than object
+// references, allowing the graph to be packed, mmap-backed, and lazily decoded.
+class VbsExprNode {
+    var kind: VbsExprKind;
+    var text: String;
+    var int_value: Int;
+    var bool_value: Bool;
+    var left_id: Int;
+    var right_id: Int;
+    var arg_ids: collections.Vector<Int>;
+
+    func init(self: VbsExprNode) -> Void {
+        self.kind = VbsExprEmpty;
+        self.text = "";
+        self.int_value = 0;
+        self.bool_value = false;
+        self.left_id = -1;
+        self.right_id = -1;
+        self.arg_ids = new collections.Vector<Int>();
+    }
+
+}
+
+// Statement tags share the same append-only serialization rule as expressions.
+enum VbsStmtKind {
+    VbsStmtNoop,
+    VbsStmtOptionExplicit,
+    VbsStmtOnErrorResumeNext,
+    VbsStmtOnErrorGoto0,
+    VbsStmtDim,
+    VbsStmtConst,
+    VbsStmtReDim,
+    VbsStmtAssign,
+    VbsStmtSetAssign,
+    VbsStmtCall,
+    VbsStmtIf,
+    VbsStmtWhile,
+    VbsStmtDoLoop,
+    VbsStmtFor,
+    VbsStmtForEach,
+    VbsStmtSelectCase,
+    VbsStmtExitFunction,
+    VbsStmtExitSub,
+    VbsStmtExitFor,
+    VbsStmtExitDo,
+    VbsStmtRoutineDef,
+    VbsStmtClassDef,
+    VbsStmtExitProperty,
+    VbsStmtWith,
+}
+
+// Converts the persisted statement tag to its semantic enum.
+func vbs_stmt_kind_from_int(value: Int) -> VbsStmtKind {
+    if value == 1 {
+        return VbsStmtOptionExplicit;
+    }
+    if value == 2 {
+        return VbsStmtOnErrorResumeNext;
+    }
+    if value == 3 {
+        return VbsStmtOnErrorGoto0;
+    }
+    if value == 4 {
+        return VbsStmtDim;
+    }
+    if value == 5 {
+        return VbsStmtConst;
+    }
+    if value == 6 {
+        return VbsStmtReDim;
+    }
+    if value == 7 {
+        return VbsStmtAssign;
+    }
+    if value == 8 {
+        return VbsStmtSetAssign;
+    }
+    if value == 9 {
+        return VbsStmtCall;
+    }
+    if value == 10 {
+        return VbsStmtIf;
+    }
+    if value == 11 {
+        return VbsStmtWhile;
+    }
+    if value == 12 {
+        return VbsStmtDoLoop;
+    }
+    if value == 13 {
+        return VbsStmtFor;
+    }
+    if value == 14 {
+        return VbsStmtForEach;
+    }
+    if value == 15 {
+        return VbsStmtSelectCase;
+    }
+    if value == 16 {
+        return VbsStmtExitFunction;
+    }
+    if value == 17 {
+        return VbsStmtExitSub;
+    }
+    if value == 18 {
+        return VbsStmtExitFor;
+    }
+    if value == 19 {
+        return VbsStmtExitDo;
+    }
+    if value == 20 {
+        return VbsStmtRoutineDef;
+    }
+    if value == 21 {
+        return VbsStmtClassDef;
+    }
+    if value == 22 {
+        return VbsStmtExitProperty;
+    }
+    if value == 23 {
+        return VbsStmtWith;
+    }
+    return VbsStmtNoop;
+}
+
+// Union-like statement record. Field meaning is selected by `kind`; all absent
+// references use -1. Parallel argument/name vectors preserve source order.
+class VbsStmtNode {
+    var kind: VbsStmtKind;
+    var names: collections.Vector<String>;
+    var expr_ids: collections.Vector<Int>;
+    var target_expr_id: Int;
+    var target_name: String;
+    var target_arg_ids: collections.Vector<Int>;
+    var value_expr_id: Int;
+    var extra_expr_id: Int;
+    var extra_expr_id2: Int;
+    var call_name: String;
+    var call_arg_ids: collections.Vector<Int>;
+    var cond_expr_id: Int;
+    var then_block_id: Int;
+    var else_block_id: Int;
+    var body_block_id: Int;
+    var case_clause_ids: collections.Vector<Int>;
+    var routine_id: Int;
+    var class_id: Int;
+    var bool_value: Bool;
+
+    func init(self: VbsStmtNode) -> Void {
+        self.kind = VbsStmtNoop;
+        self.names = new collections.Vector<String>();
+        self.expr_ids = new collections.Vector<Int>();
+        self.target_expr_id = -1;
+        self.target_name = "";
+        self.target_arg_ids = new collections.Vector<Int>();
+        self.value_expr_id = -1;
+        self.extra_expr_id = -1;
+        self.extra_expr_id2 = -1;
+        self.call_name = "";
+        self.call_arg_ids = new collections.Vector<Int>();
+        self.cond_expr_id = -1;
+        self.then_block_id = -1;
+        self.else_block_id = -1;
+        self.body_block_id = -1;
+        self.case_clause_ids = new collections.Vector<Int>();
+        self.routine_id = -1;
+        self.class_id = -1;
+        self.bool_value = false;
+    }
+
+}
+
+// Ordered statement-ID list used as the target of branches and routines.
+class VbsStmtBlock {
+    var stmt_ids: collections.Vector<Int>;
+
+    func init(self: VbsStmtBlock) -> Void {
+        self.stmt_ids = new collections.Vector<Int>();
+    }
+
+}
+
+// Routine declaration plus metadata derived after parsing. `writes_param_mask`
+// marks ByRef parameters requiring copy-back; `fast_scalar` is enabled only
+// after conservative whole-block analysis proves native-frame eligibility.
+class VbsRoutineDef {
+    var name: String;
+    var owner_class: String;
+    var is_function: Bool;
+    var param_names: collections.Vector<String>;
+    var param_by_refs: collections.Vector<Int>;
+    var block_id: Int;
+    var has_by_ref: Bool;
+    var fast_scalar: Bool;
+    var writes_param_mask: Int;
+
+    func init(self: VbsRoutineDef) -> Void {
+        self.name = "";
+        self.owner_class = "";
+        self.is_function = false;
+        self.param_names = new collections.Vector<String>();
+        self.param_by_refs = new collections.Vector<Int>();
+        self.block_id = -1;
+        self.has_by_ref = false;
+        self.fast_scalar = false;
+        self.writes_param_mask = 0;
+    }
+
+}
+
+// Class metadata is declarative. Field bound expressions are packed because
+// array dimensions are evaluated for each instance.
+class VbsClassDef {
+    var name: String;
+    var field_names: collections.Vector<String>;
+    var field_bound_expr_packs: collections.Vector<String>;
+    var routine_ids: collections.Vector<Int>;
+
+    func init(self: VbsClassDef) -> Void {
+        self.name = "";
+        self.field_names = new collections.Vector<String>();
+        self.field_bound_expr_packs = new collections.Vector<String>();
+        self.routine_ids = new collections.Vector<Int>();
+    }
+
+}
+
+// One Select Case arm. `is_else` distinguishes Case Else from an empty list.
+class VbsCaseClause {
+    var expr_ids: collections.Vector<Int>;
+    var block_id: Int;
+    var is_else: Bool;
+
+    func init(self: VbsCaseClause) -> Void {
+        self.expr_ids = new collections.Vector<Int>();
+        self.block_id = -1;
+        self.is_else = false;
+    }
+
+}
+
+// Owns every representation of one parsed script.
+//
+// Lifecycle:
+// 1. Parser fills object vectors and integer cross-references.
+// 2. `freeze_packed` creates compact managed blobs and derived lookup metadata.
+// 3. A cache load may retain only packed ranges and lazily decode nodes.
+// 4. `freeze_runtime_metadata` produces fixed-width blobs suitable for mmap.
+// 5. `release_parser_graph` drops the mutable graph after bytecode lowering.
+//
+// A non-zero `mapped_image_handle` means mapped offsets are authoritative.
+// Runtime accessors must support object, packed-string, and mmap forms without
+// changing observable semantics.
+class VbsProgram {
+    // Mutable parser graph and lazy-decode bookkeeping.
+    var source_text: String;
+    var exprs: collections.Vector<VbsExprNode>;
+    var packed_exprs: String;
+    var expr_starts: collections.Vector<Int>;
+    var expr_lengths: collections.Vector<Int>;
+    var expr_decoded: collections.Vector<Int>;
+    var expr_arg_packs: collections.Vector<String>;
+    var expr_decode_count: Int;
+    var stmts: collections.Vector<VbsStmtNode>;
+    var packed_stmts: String;
+    var stmt_starts: collections.Vector<Int>;
+    var stmt_lengths: collections.Vector<Int>;
+    var stmt_decoded: collections.Vector<Int>;
+    var stmt_target_arg_packs: collections.Vector<String>;
+    var stmt_call_arg_packs: collections.Vector<String>;
+    var blocks: collections.Vector<VbsStmtBlock>;
+    var routines: collections.Vector<VbsRoutineDef>;
+    var routine_names: collections.Vector<String>;
+    var routine_owner_classes: collections.Vector<String>;
+    var routine_is_functions: collections.Vector<Int>;
+    var routine_param_names: collections.Vector<String>;
+    var routine_param_by_refs: collections.Vector<String>;
+    var routine_block_ids: collections.Vector<Int>;
+    var routine_writes_param_masks: collections.Vector<Int>;
+    var routine_index: collections.Map<String, Int>;
+    var classes: collections.Vector<VbsClassDef>;
+    var case_clauses: collections.Vector<VbsCaseClause>;
+    var errors: collections.Vector<String>;
+    var root_block_id: Int;
+    var root_expr_id: Int;
+    // Immutable runtime tables. Strings are interned once and all other blobs
+    // contain fixed-width little-endian integer records.
+    var runtime_strings: collections.Vector<String>;
+    var runtime_expr_blob: String;
+    var runtime_expr_args_blob: String;
+    // Per expression: dot byte offset, interned receiver id, interned member id.
+    // These are computed while freezing so hot execution never allocates
+    // substrings merely to split a compiler-known identifier/member chain.
+    var runtime_expr_name_parts_blob: String;
+    var runtime_stmt_blob: String;
+    var runtime_stmt_ids_blob: String;
+    // Same layout as runtime_expr_name_parts_blob for statement call names.
+    var runtime_stmt_name_parts_blob: String;
+    var runtime_block_blob: String;
+    var runtime_case_blob: String;
+    var runtime_routine_blob: String;
+    var runtime_routine_hash_blob: String;
+    var runtime_class_blob: String;
+    var runtime_class_field_blob: String;
+    var runtime_meta_ids_blob: String;
+    // Byte offsets and lengths into the mmap image. Zero length selects the
+    // managed packed blob or parser graph fallback.
+    var mapped_image_handle: Int;
+    var mapped_expr_offset: Int;
+    var mapped_expr_length: Int;
+    var mapped_expr_args_offset: Int;
+    var mapped_expr_args_length: Int;
+    var mapped_expr_name_parts_offset: Int;
+    var mapped_expr_name_parts_length: Int;
+    var mapped_stmt_offset: Int;
+    var mapped_stmt_length: Int;
+    var mapped_stmt_ids_offset: Int;
+    var mapped_stmt_ids_length: Int;
+    var mapped_stmt_name_parts_offset: Int;
+    var mapped_stmt_name_parts_length: Int;
+    var mapped_block_offset: Int;
+    var mapped_block_length: Int;
+    var mapped_case_offset: Int;
+    var mapped_case_length: Int;
+    var mapped_routine_offset: Int;
+    var mapped_routine_length: Int;
+    var mapped_routine_hash_offset: Int;
+    var mapped_routine_hash_length: Int;
+    var mapped_class_offset: Int;
+    var mapped_class_length: Int;
+    var mapped_class_field_offset: Int;
+    var mapped_class_field_length: Int;
+    var mapped_meta_ids_offset: Int;
+    var mapped_meta_ids_length: Int;
+
+    func init(self: VbsProgram) -> Void {
+        self.source_text = "";
+        self.exprs = new collections.Vector<VbsExprNode>();
+        self.packed_exprs = "";
+        self.expr_starts = new collections.Vector<Int>();
+        self.expr_lengths = new collections.Vector<Int>();
+        self.expr_decoded = new collections.Vector<Int>();
+        self.expr_arg_packs = new collections.Vector<String>();
+        self.expr_decode_count = 0;
+        self.stmts = new collections.Vector<VbsStmtNode>();
+        self.packed_stmts = "";
+        self.stmt_starts = new collections.Vector<Int>();
+        self.stmt_lengths = new collections.Vector<Int>();
+        self.stmt_decoded = new collections.Vector<Int>();
+        self.stmt_target_arg_packs = new collections.Vector<String>();
+        self.stmt_call_arg_packs = new collections.Vector<String>();
+        self.blocks = new collections.Vector<VbsStmtBlock>();
+        self.routines = new collections.Vector<VbsRoutineDef>();
+        self.routine_names = new collections.Vector<String>();
+        self.routine_owner_classes = new collections.Vector<String>();
+        self.routine_is_functions = new collections.Vector<Int>();
+        self.routine_param_names = new collections.Vector<String>();
+        self.routine_param_by_refs = new collections.Vector<String>();
+        self.routine_block_ids = new collections.Vector<Int>();
+        self.routine_writes_param_masks = new collections.Vector<Int>();
+        self.routine_index = new collections.Map<String, Int>();
+        self.classes = new collections.Vector<VbsClassDef>();
+        self.case_clauses = new collections.Vector<VbsCaseClause>();
+        self.errors = new collections.Vector<String>();
+        self.root_block_id = -1;
+        self.root_expr_id = -1;
+        self.runtime_strings = new collections.Vector<String>();
+        self.runtime_expr_blob = "";
+        self.runtime_expr_args_blob = "";
+        self.runtime_expr_name_parts_blob = "";
+        self.runtime_stmt_blob = "";
+        self.runtime_stmt_ids_blob = "";
+        self.runtime_stmt_name_parts_blob = "";
+        self.runtime_block_blob = "";
+        self.runtime_case_blob = "";
+        self.runtime_routine_blob = "";
+        self.runtime_routine_hash_blob = "";
+        self.runtime_class_blob = "";
+        self.runtime_class_field_blob = "";
+        self.runtime_meta_ids_blob = "";
+        self.mapped_image_handle = 0;
+        self.mapped_expr_offset = 0;
+        self.mapped_expr_length = 0;
+        self.mapped_expr_args_offset = 0;
+        self.mapped_expr_args_length = 0;
+        self.mapped_expr_name_parts_offset = 0;
+        self.mapped_expr_name_parts_length = 0;
+        self.mapped_stmt_offset = 0;
+        self.mapped_stmt_length = 0;
+        self.mapped_stmt_ids_offset = 0;
+        self.mapped_stmt_ids_length = 0;
+        self.mapped_stmt_name_parts_offset = 0;
+        self.mapped_stmt_name_parts_length = 0;
+        self.mapped_block_offset = 0;
+        self.mapped_block_length = 0;
+        self.mapped_case_offset = 0;
+        self.mapped_case_length = 0;
+        self.mapped_routine_offset = 0;
+        self.mapped_routine_length = 0;
+        self.mapped_routine_hash_offset = 0;
+        self.mapped_routine_hash_length = 0;
+        self.mapped_class_offset = 0;
+        self.mapped_class_length = 0;
+        self.mapped_class_field_offset = 0;
+        self.mapped_class_field_length = 0;
+        self.mapped_meta_ids_offset = 0;
+        self.mapped_meta_ids_length = 0;
+    }
+
+    // Appenders return stable table IDs. Decoder side vectors are updated in
+    // lockstep because callers may freeze immediately after parsing.
+    func add_expr(self: VbsProgram, expr: VbsExprNode) -> Int {
+        let id: Int = self.exprs.len();
+        _ = self.expr_arg_packs.push(pack_int_parts(expr.arg_ids));
+        _ = self.exprs.push(expr);
+        _ = self.expr_decoded.push(1);
+        return id;
+    }
+
+    func get_expr(self: VbsProgram, expr_id: Int) -> VbsExprNode {
+        if (self.mapped_expr_length > 0 || std.len(self.runtime_expr_blob) > 0) && self.exprs.len() == 0 {
+            if expr_id < 0 || expr_id >= self.runtime_expr_count() {
+                return new VbsExprNode();
+            }
+            let expr: VbsExprNode = new VbsExprNode();
+            expr.kind = self.runtime_expr_kind(expr_id);
+            expr.text = self.runtime_expr_text(expr_id);
+            expr.int_value = self.runtime_expr_int(expr_id);
+            expr.bool_value = self.runtime_expr_bool(expr_id);
+            expr.left_id = self.runtime_expr_left(expr_id);
+            expr.right_id = self.runtime_expr_right(expr_id);
+            let i: Int = 0;
+            loop i < self.runtime_expr_arg_count(expr_id) {
+                _ = expr.arg_ids.push(self.runtime_expr_arg(expr_id, i));
+                i += 1;
+            }
+            return expr;
+        }
+        if expr_id < 0 || expr_id >= self.exprs.len() {
+            return new VbsExprNode();
+        }
+        if expr_id < self.expr_decoded.len() && self.expr_decoded.get(expr_id) == 0 {
+            let expr: VbsExprNode = deserialize_vbs_expr_node_range(self.packed_exprs, self.expr_starts.get(expr_id), self.expr_lengths.get(expr_id));
+            _ = self.expr_arg_packs.set(expr_id, pack_int_parts(expr.arg_ids));
+            _ = self.exprs.set(expr_id, expr);
+            _ = self.expr_decoded.set(expr_id, 1);
+            self.expr_decode_count += 1;
+        }
+        let result: VbsExprNode = self.exprs.get(expr_id);
+        return result;
+    }
+
+    // Returns an independent node for optimizer rewrites. Never mutate the
+    // cached placeholder shared by multiple lazily decoded entries.
+    func snapshot_expr(self: VbsProgram, expr_id: Int) -> VbsExprNode {
+        if expr_id < 0 || expr_id >= self.exprs.len() {
+            return new VbsExprNode();
+        }
+        if std.len(self.packed_exprs) > 0 && expr_id < self.expr_starts.len() && expr_id < self.expr_lengths.len() {
+            return deserialize_vbs_expr_node_range(self.packed_exprs, self.expr_starts.get(expr_id), self.expr_lengths.get(expr_id));
+        }
+        return self.get_expr(expr_id);
+    }
+
+    func add_stmt(self: VbsProgram, stmt: VbsStmtNode) -> Int {
+        let id: Int = self.stmts.len();
+        _ = self.stmt_target_arg_packs.push(pack_int_parts(stmt.target_arg_ids));
+        _ = self.stmt_call_arg_packs.push(pack_int_parts(stmt.call_arg_ids));
+        _ = self.stmts.push(stmt);
+        _ = self.stmt_decoded.push(1);
+        return id;
+    }
+
+    func get_stmt(self: VbsProgram, stmt_id: Int) -> VbsStmtNode {
+        if (self.mapped_stmt_length > 0 || std.len(self.runtime_stmt_blob) > 0) && self.stmts.len() == 0 {
+            if stmt_id < 0 || stmt_id >= self.runtime_stmt_count() {
+                return new VbsStmtNode();
+            }
+            let stmt: VbsStmtNode = new VbsStmtNode();
+            stmt.kind = self.runtime_stmt_kind(stmt_id);
+            let i: Int = 0;
+            loop i < self.runtime_stmt_field(stmt_id, 2, 0) {
+                let s: Int = self.runtime_mapped_blob_int(self.runtime_stmt_ids_blob, self.mapped_stmt_ids_offset, self.mapped_stmt_ids_length, self.runtime_stmt_field(stmt_id, 1, 0) + i, 0);
+                _ = stmt.names.push(self.runtime_strings.get_unchecked(s));
+                i += 1;
+            }
+            i = 0;
+            loop i < self.runtime_stmt_field(stmt_id, 4, 0) {
+                _ = stmt.expr_ids.push(self.runtime_mapped_blob_int(self.runtime_stmt_ids_blob, self.mapped_stmt_ids_offset, self.mapped_stmt_ids_length, self.runtime_stmt_field(stmt_id, 3, 0) + i, -1));
+                i += 1;
+            }
+            stmt.target_expr_id = self.runtime_stmt_target_expr(stmt_id);
+            stmt.target_name = self.runtime_stmt_target_name(stmt_id);
+            i = 0;
+            loop i < self.runtime_stmt_target_arg_count(stmt_id) { _ = stmt.target_arg_ids.push(self.runtime_stmt_target_arg(stmt_id, i)); i += 1; }
+            stmt.value_expr_id = self.runtime_stmt_value_expr(stmt_id);
+            stmt.extra_expr_id = self.runtime_stmt_extra_expr(stmt_id);
+            stmt.extra_expr_id2 = self.runtime_stmt_extra_expr2(stmt_id);
+            stmt.call_name = self.runtime_stmt_call_name(stmt_id);
+            i = 0;
+            loop i < self.runtime_stmt_call_arg_count(stmt_id) { _ = stmt.call_arg_ids.push(self.runtime_stmt_call_arg(stmt_id, i)); i += 1; }
+            stmt.cond_expr_id = self.runtime_stmt_cond_expr(stmt_id);
+            stmt.then_block_id = self.runtime_stmt_then_block(stmt_id);
+            stmt.else_block_id = self.runtime_stmt_else_block(stmt_id);
+            stmt.body_block_id = self.runtime_stmt_body_block(stmt_id);
+            i = 0;
+            loop i < self.runtime_stmt_case_count(stmt_id) { _ = stmt.case_clause_ids.push(self.runtime_stmt_case(stmt_id, i)); i += 1; }
+            stmt.routine_id = self.runtime_stmt_field(stmt_id, 21, -1);
+            stmt.class_id = self.runtime_stmt_field(stmt_id, 22, -1);
+            stmt.bool_value = self.runtime_stmt_field(stmt_id, 23, 0) != 0;
+            return stmt;
+        }
+        if stmt_id < 0 || stmt_id >= self.stmts.len() {
+            return new VbsStmtNode();
+        }
+        if stmt_id < self.stmt_decoded.len() && self.stmt_decoded.get(stmt_id) == 0 {
+            let stmt: VbsStmtNode = deserialize_vbs_stmt_node_range(self.packed_stmts, self.stmt_starts.get(stmt_id), self.stmt_lengths.get(stmt_id));
+            _ = self.stmt_target_arg_packs.set(stmt_id, pack_int_parts(stmt.target_arg_ids));
+            _ = self.stmt_call_arg_packs.set(stmt_id, pack_int_parts(stmt.call_arg_ids));
+            _ = self.stmts.set(stmt_id, stmt);
+            _ = self.stmt_decoded.set(stmt_id, 1);
+        }
+        let result: VbsStmtNode = self.stmts.get(stmt_id);
+        return result;
+    }
+
+    // Forces all lazy nodes to materialize before a representation transition.
+    func freeze_decoded(self: VbsProgram) -> Void {
+        if self.mapped_image_handle != 0 {
+            return;
+        }
+        self.freeze_packed();
+    }
+
+    // Compact integer helpers use the native reader for bounds-checked access.
+    // A mapped range is read under the preemption guard so unmapping cannot race
+    // an in-flight load.
+    func runtime_pack_ints(self: VbsProgram, values: collections.Vector<Int>) -> String {
+        _ = self;
+        let out: bytes.Buffer = new bytes.Buffer();
+        let i: Int = 0;
+        loop i < values.len() {
+            let value: Int = values.get(i);
+            let j: Int = 0;
+            loop j < 8 {
+                out.write_u8((value >> (j * 8)) & 255);
+                j += 1;
+            }
+            i += 1;
+        }
+        let packed: String = out.str();
+        out.dispose();
+        return packed;
+    }
+
+    func runtime_blob_int(self: VbsProgram, blob: String, index: Int, fallback: Int = -1) -> Int {
+        _ = self;
+        return eg_asp_packed_i64_at(blob, index, fallback);
+    }
+
+    func runtime_mapped_blob_int(self: VbsProgram, blob: String, mapped_offset: Int, mapped_length: Int, index: Int, fallback: Int = -1) -> Int {
+        if self.mapped_image_handle == 0 {
+            return self.runtime_blob_int(blob, index, fallback);
+        }
+        if index < 0 || index > 1152921504606846975 || index * 8 + 8 > mapped_length {
+            return fallback;
+        }
+        return eg_asp_mmap_read_i64(self.mapped_image_handle, mapped_offset + index * 8);
+    }
+
+    func runtime_intern_string(self: VbsProgram, text: String, indexes: collections.Map<String, Int>) -> Int {
+        let existing: Int = indexes.get_or(text, -1);
+        if existing >= 0 {
+            return existing;
+        }
+        let id: Int = self.runtime_strings.len();
+        _ = self.runtime_strings.push(text);
+        _ = indexes.set(text, id);
+        return id;
+    }
+
+    func runtime_routine_hash(self: VbsProgram, name: String, owner: String) -> Int {
+        _ = self;
+        let key: String = strings.to_lower_ascii(name) + "|" + strings.to_lower_ascii(owner);
+        let hash: Int = 216613626;
+        let i: Int = 0;
+        loop i < std.len(key) {
+            hash = (hash * 16777619) ^ std.byte_at(key, i);
+            i += 1;
+        }
+        return hash & 2147483647;
+    }
+
+    // Builds immutable fixed-width runtime metadata and lookup hashes. This is
+    // a one-time compile/cache cost that removes parsing and substring work
+    // from request execution.
+    func freeze_packed(self: VbsProgram) -> Void {
+        if self.mapped_image_handle != 0 || std.len(self.runtime_expr_blob) > 0 || std.len(self.runtime_stmt_blob) > 0 {
+            return;
+        }
+        let string_indexes: collections.Map<String, Int> = new collections.Map<String, Int>();
+        _ = self.runtime_intern_string("", string_indexes);
+        let expr_records: collections.Vector<Int> = new collections.Vector<Int>();
+        let expr_args: collections.Vector<Int> = new collections.Vector<Int>();
+        let expr_name_parts: collections.Vector<Int> = new collections.Vector<Int>();
+        let i: Int = 0;
+        loop i < self.exprs.len() {
+            eg_gc_preempt_guard_enter();
+            let expr: VbsExprNode = self.get_expr(i);
+            let expr_kind: VbsExprKind = expr.kind;
+            let expr_text: String = asp.runtime.clone_runtime_string(expr.text);
+            let expr_int_value: Int = expr.int_value;
+            let expr_bool_value: Bool = expr.bool_value;
+            let expr_left_id: Int = expr.left_id;
+            let expr_right_id: Int = expr.right_id;
+            let expr_arg_ids: collections.Vector<Int> = new collections.Vector<Int>();
+            let source_arg_count: Int = expr.arg_ids.len();
+            let source_arg_index: Int = 0;
+            loop source_arg_index < source_arg_count {
+                _ = expr_arg_ids.push(expr.arg_ids.get_unchecked(source_arg_index));
+                source_arg_index += 1;
+            }
+            eg_gc_preempt_guard_leave();
+            let arg_start: Int = expr_args.len();
+            let j: Int = 0;
+            loop j < expr_arg_ids.len() {
+                _ = expr_args.push(expr_arg_ids.get_unchecked(j));
+                j += 1;
+            }
+            _ = expr_records.push(expr_kind => Int);
+            _ = expr_records.push(self.runtime_intern_string(expr_text, string_indexes));
+            _ = expr_records.push(expr_int_value);
+            _ = expr_records.push(expr_bool_value ? 1 : 0);
+            _ = expr_records.push(expr_left_id);
+            _ = expr_records.push(expr_right_id);
+            _ = expr_records.push(arg_start);
+            _ = expr_records.push(expr_arg_ids.len());
+            let expr_dot: Int = strings.find_substr(expr_text, ".");
+            let expr_receiver: String = expr_dot >= 0 ? std.substr(expr_text, 0, expr_dot) : expr_text;
+            let expr_member: String = expr_dot >= 0
+                ? std.substr(expr_text, expr_dot + 1, std.len(expr_text) - expr_dot - 1)
+                : expr_text;
+            _ = expr_name_parts.push(expr_dot);
+            _ = expr_name_parts.push(self.runtime_intern_string(expr_receiver, string_indexes));
+            _ = expr_name_parts.push(self.runtime_intern_string(expr_member, string_indexes));
+            i += 1;
+        }
+        let stmt_records: collections.Vector<Int> = new collections.Vector<Int>();
+        let stmt_ids: collections.Vector<Int> = new collections.Vector<Int>();
+        let stmt_name_parts: collections.Vector<Int> = new collections.Vector<Int>();
+        i = 0;
+        loop i < self.stmts.len() {
+            eg_gc_preempt_guard_enter();
+            let stmt: VbsStmtNode = self.get_stmt(i);
+            let stmt_kind: VbsStmtKind = stmt.kind;
+            let stmt_target_expr_id: Int = stmt.target_expr_id;
+            let stmt_target_name: String = asp.runtime.clone_runtime_string(stmt.target_name);
+            let stmt_value_expr_id: Int = stmt.value_expr_id;
+            let stmt_extra_expr_id: Int = stmt.extra_expr_id;
+            let stmt_extra_expr_id2: Int = stmt.extra_expr_id2;
+            let stmt_call_name: String = asp.runtime.clone_runtime_string(stmt.call_name);
+            let stmt_cond_expr_id: Int = stmt.cond_expr_id;
+            let stmt_then_block_id: Int = stmt.then_block_id;
+            let stmt_else_block_id: Int = stmt.else_block_id;
+            let stmt_body_block_id: Int = stmt.body_block_id;
+            let stmt_routine_id: Int = stmt.routine_id;
+            let stmt_class_id: Int = stmt.class_id;
+            let stmt_bool_value: Bool = stmt.bool_value;
+            let stmt_names: collections.Vector<String> = new collections.Vector<String>();
+            let stmt_expr_ids: collections.Vector<Int> = new collections.Vector<Int>();
+            let stmt_target_arg_ids: collections.Vector<Int> = i < self.stmt_target_arg_packs.len()
+            ? unpack_int_parts(self.stmt_target_arg_packs.get_unchecked(i))
+            : new collections.Vector<Int>();
+            let stmt_call_arg_ids: collections.Vector<Int> = i < self.stmt_call_arg_packs.len()
+            ? unpack_int_parts(self.stmt_call_arg_packs.get_unchecked(i))
+            : new collections.Vector<Int>();
+            let stmt_case_clause_ids: collections.Vector<Int> = new collections.Vector<Int>();
+            let snapshot_index: Int = 0;
+            loop snapshot_index < stmt.names.len() { _ = stmt_names.push(asp.runtime.clone_runtime_string(stmt.names.get_unchecked(snapshot_index))); snapshot_index += 1; }
+            snapshot_index = 0;
+            loop snapshot_index < stmt.expr_ids.len() { _ = stmt_expr_ids.push(stmt.expr_ids.get_unchecked(snapshot_index)); snapshot_index += 1; }
+            snapshot_index = 0;
+            loop snapshot_index < stmt.case_clause_ids.len() { _ = stmt_case_clause_ids.push(stmt.case_clause_ids.get_unchecked(snapshot_index)); snapshot_index += 1; }
+            eg_gc_preempt_guard_leave();
+            let names_start: Int = stmt_ids.len();
+            let j: Int = 0;
+            loop j < stmt_names.len() {
+                _ = stmt_ids.push(self.runtime_intern_string(stmt_names.get_unchecked(j), string_indexes));
+                j += 1;
+            }
+            let exprs_start: Int = stmt_ids.len();
+            j = 0;
+            loop j < stmt_expr_ids.len() { _ = stmt_ids.push(stmt_expr_ids.get_unchecked(j)); j += 1; }
+            let target_args_start: Int = stmt_ids.len();
+            j = 0;
+            loop j < stmt_target_arg_ids.len() { _ = stmt_ids.push(stmt_target_arg_ids.get_unchecked(j)); j += 1; }
+            let call_args_start: Int = stmt_ids.len();
+            j = 0;
+            loop j < stmt_call_arg_ids.len() { _ = stmt_ids.push(stmt_call_arg_ids.get_unchecked(j)); j += 1; }
+            let cases_start: Int = stmt_ids.len();
+            j = 0;
+            loop j < stmt_case_clause_ids.len() { _ = stmt_ids.push(stmt_case_clause_ids.get_unchecked(j)); j += 1; }
+            _ = stmt_records.push(stmt_kind => Int);
+            _ = stmt_records.push(names_start); _ = stmt_records.push(stmt_names.len());
+            _ = stmt_records.push(exprs_start); _ = stmt_records.push(stmt_expr_ids.len());
+            _ = stmt_records.push(stmt_target_expr_id);
+            _ = stmt_records.push(self.runtime_intern_string(stmt_target_name, string_indexes));
+            _ = stmt_records.push(target_args_start); _ = stmt_records.push(stmt_target_arg_ids.len());
+            _ = stmt_records.push(stmt_value_expr_id);
+            _ = stmt_records.push(stmt_extra_expr_id); _ = stmt_records.push(stmt_extra_expr_id2);
+            _ = stmt_records.push(self.runtime_intern_string(stmt_call_name, string_indexes));
+            _ = stmt_records.push(call_args_start); _ = stmt_records.push(stmt_call_arg_ids.len());
+            _ = stmt_records.push(stmt_cond_expr_id);
+            _ = stmt_records.push(stmt_then_block_id); _ = stmt_records.push(stmt_else_block_id);
+            _ = stmt_records.push(stmt_body_block_id);
+            _ = stmt_records.push(cases_start); _ = stmt_records.push(stmt_case_clause_ids.len());
+            _ = stmt_records.push(stmt_routine_id); _ = stmt_records.push(stmt_class_id);
+            _ = stmt_records.push(stmt_bool_value ? 1 : 0);
+            let stmt_dot: Int = strings.find_substr(stmt_call_name, ".");
+            let stmt_receiver: String = stmt_dot >= 0 ? std.substr(stmt_call_name, 0, stmt_dot) : stmt_call_name;
+            let stmt_member: String = stmt_dot >= 0
+                ? std.substr(stmt_call_name, stmt_dot + 1, std.len(stmt_call_name) - stmt_dot - 1)
+                : stmt_call_name;
+            _ = stmt_name_parts.push(stmt_dot);
+            _ = stmt_name_parts.push(self.runtime_intern_string(stmt_receiver, string_indexes));
+            _ = stmt_name_parts.push(self.runtime_intern_string(stmt_member, string_indexes));
+            i += 1;
+        }
+        self.runtime_expr_blob = self.runtime_pack_ints(expr_records);
+        self.runtime_expr_args_blob = self.runtime_pack_ints(expr_args);
+        self.runtime_expr_name_parts_blob = self.runtime_pack_ints(expr_name_parts);
+        self.runtime_stmt_blob = self.runtime_pack_ints(stmt_records);
+        self.runtime_stmt_ids_blob = self.runtime_pack_ints(stmt_ids);
+        self.runtime_stmt_name_parts_blob = self.runtime_pack_ints(stmt_name_parts);
+        self.freeze_runtime_metadata(string_indexes);
+        self.release_parser_graph();
+    }
+
+    func freeze_runtime_metadata(self: VbsProgram, string_indexes: collections.Map<String, Int>) -> Void {
+        if self.mapped_image_handle != 0 || std.len(self.runtime_block_blob) > 0 { return; }
+        let meta_ids: collections.Vector<Int> = new collections.Vector<Int>();
+        let block_records: collections.Vector<Int> = new collections.Vector<Int>();
+        let i: Int = 0;
+        loop i < self.blocks.len() {
+            let block: VbsStmtBlock = self.blocks.get(i);
+            let start: Int = meta_ids.len();
+            let j: Int = 0;
+            loop j < block.stmt_ids.len() { _ = meta_ids.push(block.stmt_ids.get(j)); j += 1; }
+            _ = block_records.push(start); _ = block_records.push(block.stmt_ids.len());
+            i += 1;
+        }
+        let case_records: collections.Vector<Int> = new collections.Vector<Int>();
+        i = 0;
+        loop i < self.case_clauses.len() {
+            let clause: VbsCaseClause = self.case_clauses.get(i);
+            let start: Int = meta_ids.len();
+            let j: Int = 0;
+            loop j < clause.expr_ids.len() { _ = meta_ids.push(clause.expr_ids.get(j)); j += 1; }
+            _ = case_records.push(start); _ = case_records.push(clause.expr_ids.len());
+            _ = case_records.push(clause.block_id); _ = case_records.push(clause.is_else ? 1 : 0);
+            i += 1;
+        }
+        let routine_records: collections.Vector<Int> = new collections.Vector<Int>();
+        i = 0;
+        loop i < self.routine_names.len() {
+            let names: collections.Vector<String> = asp.runtime.unpack_string_parts(self.routine_param_names.get(i));
+            let refs: collections.Vector<Int> = unpack_int_parts(self.routine_param_by_refs.get(i));
+            let name_start: Int = meta_ids.len();
+            let j: Int = 0;
+            loop j < names.len() { _ = meta_ids.push(self.runtime_intern_string(names.get(j), string_indexes)); j += 1; }
+            let ref_start: Int = meta_ids.len();
+            j = 0;
+            loop j < refs.len() { _ = meta_ids.push(refs.get(j)); j += 1; }
+            _ = routine_records.push(self.runtime_intern_string(self.routine_names.get(i), string_indexes));
+            _ = routine_records.push(self.runtime_intern_string(self.routine_owner_classes.get(i), string_indexes));
+            _ = routine_records.push(self.routine_is_functions.get(i));
+            _ = routine_records.push(name_start); _ = routine_records.push(names.len());
+            _ = routine_records.push(ref_start); _ = routine_records.push(refs.len());
+            _ = routine_records.push(self.routine_block_ids.get(i));
+            _ = routine_records.push(self.routine_writes_param_masks.get(i));
+            i += 1;
+        }
+        let hash_capacity: Int = self.routine_names.len() * 2 + 1;
+        let hash_records: collections.Vector<Int> = new collections.Vector<Int>();
+        i = 0;
+        loop i < hash_capacity { _ = hash_records.push(-1); _ = hash_records.push(-1); i += 1; }
+        i = 0;
+        loop i < self.routine_names.len() {
+            let hash: Int = self.runtime_routine_hash(self.routine_names.get(i), self.routine_owner_classes.get(i));
+            let probe: Int = 0;
+            loop probe < hash_capacity {
+                let slot: Int = ((hash % hash_capacity) + probe) % hash_capacity;
+                if hash_records.get(slot * 2 + 1) < 0 {
+                    _ = hash_records.set(slot * 2, hash); _ = hash_records.set(slot * 2 + 1, i);
+                    break;
+                }
+                probe += 1;
+            }
+            i += 1;
+        }
+        let class_records: collections.Vector<Int> = new collections.Vector<Int>();
+        let field_records: collections.Vector<Int> = new collections.Vector<Int>();
+        i = 0;
+        loop i < self.classes.len() {
+            let cls: VbsClassDef = self.classes.get(i);
+            let field_start: Int = field_records.len() / 3;
+            let j: Int = 0;
+            loop j < cls.field_names.len() {
+                let bounds: collections.Vector<Int> = unpack_int_parts(cls.field_bound_expr_packs.get(j));
+                let bounds_start: Int = meta_ids.len();
+                let k: Int = 0;
+                loop k < bounds.len() { _ = meta_ids.push(bounds.get(k)); k += 1; }
+                _ = field_records.push(self.runtime_intern_string(cls.field_names.get(j), string_indexes));
+                _ = field_records.push(bounds_start); _ = field_records.push(bounds.len());
+                j += 1;
+            }
+            _ = class_records.push(self.runtime_intern_string(cls.name, string_indexes));
+            _ = class_records.push(field_start); _ = class_records.push(cls.field_names.len());
+            i += 1;
+        }
+        self.runtime_block_blob = self.runtime_pack_ints(block_records);
+        self.runtime_case_blob = self.runtime_pack_ints(case_records);
+        self.runtime_routine_blob = self.runtime_pack_ints(routine_records);
+        self.runtime_routine_hash_blob = self.runtime_pack_ints(hash_records);
+        self.runtime_class_blob = self.runtime_pack_ints(class_records);
+        self.runtime_class_field_blob = self.runtime_pack_ints(field_records);
+        self.runtime_meta_ids_blob = self.runtime_pack_ints(meta_ids);
+    }
+
+    // Releases parser-only storage after all runtime blobs and bytecode have
+    // been frozen. Any later runtime access must go through the accessors below.
+    func release_parser_graph(self: VbsProgram) -> Void {
+        self.exprs = new collections.Vector<VbsExprNode>();
+        self.stmts = new collections.Vector<VbsStmtNode>();
+        self.blocks = new collections.Vector<VbsStmtBlock>();
+        self.case_clauses = new collections.Vector<VbsCaseClause>();
+        self.routines = new collections.Vector<VbsRoutineDef>();
+        self.classes = new collections.Vector<VbsClassDef>();
+        self.routine_names = new collections.Vector<String>();
+        self.routine_owner_classes = new collections.Vector<String>();
+        self.routine_is_functions = new collections.Vector<Int>();
+        self.routine_param_names = new collections.Vector<String>();
+        self.routine_param_by_refs = new collections.Vector<String>();
+        self.routine_block_ids = new collections.Vector<Int>();
+        self.routine_writes_param_masks = new collections.Vector<Int>();
+        self.routine_index = new collections.Map<String, Int>();
+        self.packed_exprs = "";
+        self.expr_starts = new collections.Vector<Int>();
+        self.expr_lengths = new collections.Vector<Int>();
+        self.expr_decoded = new collections.Vector<Int>();
+        self.expr_arg_packs = new collections.Vector<String>();
+        self.packed_stmts = "";
+        self.stmt_starts = new collections.Vector<Int>();
+        self.stmt_lengths = new collections.Vector<Int>();
+        self.stmt_decoded = new collections.Vector<Int>();
+        self.stmt_target_arg_packs = new collections.Vector<String>();
+        self.stmt_call_arg_packs = new collections.Vector<String>();
+    }
+
+    // Uniform runtime access layer. Each compact accessor first selects mmap,
+    // then managed blob, then parser graph. Fixed record widths (64-byte
+    // expressions, 192-byte statements, etc.) are serialization ABI constants.
+    func runtime_expr_count(self: VbsProgram) -> Int { return self.mapped_expr_length > 0 ? self.mapped_expr_length / 64 : (std.len(self.runtime_expr_blob) > 0 ? std.len(self.runtime_expr_blob) / 64 : self.exprs.len()); }
+    func runtime_expr_field(self: VbsProgram, id: Int, field: Int, fallback: Int = -1) -> Int { return self.runtime_mapped_blob_int(self.runtime_expr_blob, self.mapped_expr_offset, self.mapped_expr_length, id * 8 + field, fallback); }
+    func runtime_expr_kind(self: VbsProgram, id: Int) -> VbsExprKind { return self.mapped_expr_length > 0 || std.len(self.runtime_expr_blob) > 0 ? vbs_expr_kind_from_int(self.runtime_expr_field(id, 0, 0)) : self.get_expr(id).kind; }
+    func runtime_expr_text(self: VbsProgram, id: Int) -> String { if self.mapped_expr_length == 0 && std.len(self.runtime_expr_blob) == 0 { return self.get_expr(id).text; } let s: Int = self.runtime_expr_field(id, 1, 0); return s >= 0 && s < self.runtime_strings.len() ? self.runtime_strings.get_unchecked(s) : ""; }
+    func runtime_expr_int(self: VbsProgram, id: Int) -> Int { return self.mapped_expr_length > 0 || std.len(self.runtime_expr_blob) > 0 ? self.runtime_expr_field(id, 2, 0) : self.get_expr(id).int_value; }
+    func runtime_expr_bool(self: VbsProgram, id: Int) -> Bool { return self.mapped_expr_length > 0 || std.len(self.runtime_expr_blob) > 0 ? self.runtime_expr_field(id, 3, 0) != 0 : self.get_expr(id).bool_value; }
+    func runtime_expr_left(self: VbsProgram, id: Int) -> Int { return self.mapped_expr_length > 0 || std.len(self.runtime_expr_blob) > 0 ? self.runtime_expr_field(id, 4, -1) : self.get_expr(id).left_id; }
+    func runtime_expr_right(self: VbsProgram, id: Int) -> Int { return self.mapped_expr_length > 0 || std.len(self.runtime_expr_blob) > 0 ? self.runtime_expr_field(id, 5, -1) : self.get_expr(id).right_id; }
+    func runtime_expr_arg_count(self: VbsProgram, id: Int) -> Int { return self.mapped_expr_length > 0 || std.len(self.runtime_expr_blob) > 0 ? self.runtime_expr_field(id, 7, 0) : self.get_expr(id).arg_ids.len(); }
+    func runtime_expr_arg(self: VbsProgram, id: Int, index: Int) -> Int { return self.mapped_expr_length > 0 || std.len(self.runtime_expr_blob) > 0 ? self.runtime_mapped_blob_int(self.runtime_expr_args_blob, self.mapped_expr_args_offset, self.mapped_expr_args_length, self.runtime_expr_field(id, 6, 0) + index, -1) : self.get_expr(id).arg_ids.get(index); }
+    func runtime_expr_name_dot(self: VbsProgram, id: Int) -> Int { return self.mapped_expr_name_parts_length > 0 || std.len(self.runtime_expr_name_parts_blob) > 0 ? self.runtime_mapped_blob_int(self.runtime_expr_name_parts_blob, self.mapped_expr_name_parts_offset, self.mapped_expr_name_parts_length, id * 3, -1) : strings.find_substr(self.runtime_expr_text(id), "."); }
+    func runtime_expr_receiver_name(self: VbsProgram, id: Int) -> String { if self.mapped_expr_name_parts_length == 0 && std.len(self.runtime_expr_name_parts_blob) == 0 { let text: String = self.runtime_expr_text(id); let dot: Int = strings.find_substr(text, "."); return dot >= 0 ? std.substr(text, 0, dot) : text; } let s: Int = self.runtime_mapped_blob_int(self.runtime_expr_name_parts_blob, self.mapped_expr_name_parts_offset, self.mapped_expr_name_parts_length, id * 3 + 1, 0); return s >= 0 && s < self.runtime_strings.len() ? self.runtime_strings.get_unchecked(s) : ""; }
+    func runtime_expr_member_name(self: VbsProgram, id: Int) -> String { if self.mapped_expr_name_parts_length == 0 && std.len(self.runtime_expr_name_parts_blob) == 0 { let text: String = self.runtime_expr_text(id); let dot: Int = strings.find_substr(text, "."); return dot >= 0 ? std.substr(text, dot + 1, std.len(text) - dot - 1) : text; } let s: Int = self.runtime_mapped_blob_int(self.runtime_expr_name_parts_blob, self.mapped_expr_name_parts_offset, self.mapped_expr_name_parts_length, id * 3 + 2, 0); return s >= 0 && s < self.runtime_strings.len() ? self.runtime_strings.get_unchecked(s) : ""; }
+    func runtime_stmt_count(self: VbsProgram) -> Int { return self.mapped_stmt_length > 0 ? self.mapped_stmt_length / 192 : (std.len(self.runtime_stmt_blob) > 0 ? std.len(self.runtime_stmt_blob) / 192 : self.stmts.len()); }
+    func runtime_stmt_field(self: VbsProgram, id: Int, field: Int, fallback: Int = -1) -> Int { return self.runtime_mapped_blob_int(self.runtime_stmt_blob, self.mapped_stmt_offset, self.mapped_stmt_length, id * 24 + field, fallback); }
+    func runtime_stmt_kind(self: VbsProgram, id: Int) -> VbsStmtKind { return self.mapped_stmt_length > 0 || std.len(self.runtime_stmt_blob) > 0 ? vbs_stmt_kind_from_int(self.runtime_stmt_field(id, 0, 0)) : self.get_stmt(id).kind; }
+    func runtime_stmt_name_count(self: VbsProgram, id: Int) -> Int { return self.mapped_stmt_length > 0 || std.len(self.runtime_stmt_blob) > 0 ? self.runtime_stmt_field(id, 2, 0) : self.get_stmt(id).names.len(); }
+    func runtime_stmt_name(self: VbsProgram, id: Int, index: Int) -> String { if self.mapped_stmt_length == 0 && std.len(self.runtime_stmt_blob) == 0 { return self.get_stmt(id).names.get(index); } let s: Int = self.runtime_mapped_blob_int(self.runtime_stmt_ids_blob, self.mapped_stmt_ids_offset, self.mapped_stmt_ids_length, self.runtime_stmt_field(id, 1, 0) + index, -1); return s >= 0 && s < self.runtime_strings.len() ? self.runtime_strings.get_unchecked(s) : ""; }
+    func runtime_stmt_expr_count(self: VbsProgram, id: Int) -> Int { return self.mapped_stmt_length > 0 || std.len(self.runtime_stmt_blob) > 0 ? self.runtime_stmt_field(id, 4, 0) : self.get_stmt(id).expr_ids.len(); }
+    func runtime_stmt_expr(self: VbsProgram, id: Int, index: Int) -> Int { return self.mapped_stmt_length > 0 || std.len(self.runtime_stmt_blob) > 0 ? self.runtime_mapped_blob_int(self.runtime_stmt_ids_blob, self.mapped_stmt_ids_offset, self.mapped_stmt_ids_length, self.runtime_stmt_field(id, 3, 0) + index, -1) : self.get_stmt(id).expr_ids.get(index); }
+    func runtime_stmt_target_expr(self: VbsProgram, id: Int) -> Int { return self.mapped_stmt_length > 0 || std.len(self.runtime_stmt_blob) > 0 ? self.runtime_stmt_field(id, 5, -1) : self.get_stmt(id).target_expr_id; }
+    func runtime_stmt_target_name(self: VbsProgram, id: Int) -> String { if self.mapped_stmt_length == 0 && std.len(self.runtime_stmt_blob) == 0 { return self.get_stmt(id).target_name; } let s: Int = self.runtime_stmt_field(id, 6, 0); return s >= 0 && s < self.runtime_strings.len() ? self.runtime_strings.get_unchecked(s) : ""; }
+    func runtime_stmt_target_arg_count(self: VbsProgram, id: Int) -> Int { return self.mapped_stmt_length > 0 || std.len(self.runtime_stmt_blob) > 0 ? self.runtime_stmt_field(id, 8, 0) : self.get_stmt(id).target_arg_ids.len(); }
+    func runtime_stmt_target_arg(self: VbsProgram, id: Int, index: Int) -> Int { return self.mapped_stmt_length > 0 || std.len(self.runtime_stmt_blob) > 0 ? self.runtime_mapped_blob_int(self.runtime_stmt_ids_blob, self.mapped_stmt_ids_offset, self.mapped_stmt_ids_length, self.runtime_stmt_field(id, 7, 0) + index, -1) : self.get_stmt(id).target_arg_ids.get(index); }
+    func runtime_stmt_value_expr(self: VbsProgram, id: Int) -> Int { return self.mapped_stmt_length > 0 || std.len(self.runtime_stmt_blob) > 0 ? self.runtime_stmt_field(id, 9, -1) : self.get_stmt(id).value_expr_id; }
+    func runtime_stmt_extra_expr(self: VbsProgram, id: Int) -> Int { return self.mapped_stmt_length > 0 || std.len(self.runtime_stmt_blob) > 0 ? self.runtime_stmt_field(id, 10, -1) : self.get_stmt(id).extra_expr_id; }
+    func runtime_stmt_extra_expr2(self: VbsProgram, id: Int) -> Int { return self.mapped_stmt_length > 0 || std.len(self.runtime_stmt_blob) > 0 ? self.runtime_stmt_field(id, 11, -1) : self.get_stmt(id).extra_expr_id2; }
+    func runtime_stmt_call_name(self: VbsProgram, id: Int) -> String { if self.mapped_stmt_length == 0 && std.len(self.runtime_stmt_blob) == 0 { return self.get_stmt(id).call_name; } let s: Int = self.runtime_stmt_field(id, 12, 0); return s >= 0 && s < self.runtime_strings.len() ? self.runtime_strings.get_unchecked(s) : ""; }
+    func runtime_stmt_call_dot(self: VbsProgram, id: Int) -> Int { return self.mapped_stmt_name_parts_length > 0 || std.len(self.runtime_stmt_name_parts_blob) > 0 ? self.runtime_mapped_blob_int(self.runtime_stmt_name_parts_blob, self.mapped_stmt_name_parts_offset, self.mapped_stmt_name_parts_length, id * 3, -1) : strings.find_substr(self.runtime_stmt_call_name(id), "."); }
+    func runtime_stmt_call_receiver(self: VbsProgram, id: Int) -> String { if self.mapped_stmt_name_parts_length == 0 && std.len(self.runtime_stmt_name_parts_blob) == 0 { let text: String = self.runtime_stmt_call_name(id); let dot: Int = strings.find_substr(text, "."); return dot >= 0 ? std.substr(text, 0, dot) : text; } let s: Int = self.runtime_mapped_blob_int(self.runtime_stmt_name_parts_blob, self.mapped_stmt_name_parts_offset, self.mapped_stmt_name_parts_length, id * 3 + 1, 0); return s >= 0 && s < self.runtime_strings.len() ? self.runtime_strings.get_unchecked(s) : ""; }
+    func runtime_stmt_call_member(self: VbsProgram, id: Int) -> String { if self.mapped_stmt_name_parts_length == 0 && std.len(self.runtime_stmt_name_parts_blob) == 0 { let text: String = self.runtime_stmt_call_name(id); let dot: Int = strings.find_substr(text, "."); return dot >= 0 ? std.substr(text, dot + 1, std.len(text) - dot - 1) : text; } let s: Int = self.runtime_mapped_blob_int(self.runtime_stmt_name_parts_blob, self.mapped_stmt_name_parts_offset, self.mapped_stmt_name_parts_length, id * 3 + 2, 0); return s >= 0 && s < self.runtime_strings.len() ? self.runtime_strings.get_unchecked(s) : ""; }
+    func runtime_stmt_call_arg_count(self: VbsProgram, id: Int) -> Int { return self.mapped_stmt_length > 0 || std.len(self.runtime_stmt_blob) > 0 ? self.runtime_stmt_field(id, 14, 0) : self.get_stmt(id).call_arg_ids.len(); }
+    func runtime_stmt_call_arg(self: VbsProgram, id: Int, index: Int) -> Int { return self.mapped_stmt_length > 0 || std.len(self.runtime_stmt_blob) > 0 ? self.runtime_mapped_blob_int(self.runtime_stmt_ids_blob, self.mapped_stmt_ids_offset, self.mapped_stmt_ids_length, self.runtime_stmt_field(id, 13, 0) + index, -1) : self.get_stmt(id).call_arg_ids.get(index); }
+    func runtime_stmt_cond_expr(self: VbsProgram, id: Int) -> Int { return self.mapped_stmt_length > 0 || std.len(self.runtime_stmt_blob) > 0 ? self.runtime_stmt_field(id, 15, -1) : self.get_stmt(id).cond_expr_id; }
+    func runtime_stmt_then_block(self: VbsProgram, id: Int) -> Int { return self.mapped_stmt_length > 0 || std.len(self.runtime_stmt_blob) > 0 ? self.runtime_stmt_field(id, 16, -1) : self.get_stmt(id).then_block_id; }
+    func runtime_stmt_else_block(self: VbsProgram, id: Int) -> Int { return self.mapped_stmt_length > 0 || std.len(self.runtime_stmt_blob) > 0 ? self.runtime_stmt_field(id, 17, -1) : self.get_stmt(id).else_block_id; }
+    func runtime_stmt_body_block(self: VbsProgram, id: Int) -> Int { return self.mapped_stmt_length > 0 || std.len(self.runtime_stmt_blob) > 0 ? self.runtime_stmt_field(id, 18, -1) : self.get_stmt(id).body_block_id; }
+    func runtime_stmt_case_count(self: VbsProgram, id: Int) -> Int { return self.mapped_stmt_length > 0 || std.len(self.runtime_stmt_blob) > 0 ? self.runtime_stmt_field(id, 20, 0) : self.get_stmt(id).case_clause_ids.len(); }
+    func runtime_stmt_case(self: VbsProgram, id: Int, index: Int) -> Int { return self.mapped_stmt_length > 0 || std.len(self.runtime_stmt_blob) > 0 ? self.runtime_mapped_blob_int(self.runtime_stmt_ids_blob, self.mapped_stmt_ids_offset, self.mapped_stmt_ids_length, self.runtime_stmt_field(id, 19, 0) + index, -1) : self.get_stmt(id).case_clause_ids.get(index); }
+    func runtime_block_count(self: VbsProgram) -> Int { return self.mapped_block_length > 0 ? self.mapped_block_length / 16 : (std.len(self.runtime_block_blob) > 0 ? std.len(self.runtime_block_blob) / 16 : self.blocks.len()); }
+    func runtime_block_stmt_count(self: VbsProgram, id: Int) -> Int { return self.mapped_block_length > 0 || std.len(self.runtime_block_blob) > 0 ? self.runtime_mapped_blob_int(self.runtime_block_blob, self.mapped_block_offset, self.mapped_block_length, id * 2 + 1, 0) : self.blocks.get(id).stmt_ids.len(); }
+    func runtime_block_stmt(self: VbsProgram, id: Int, index: Int) -> Int { return self.mapped_block_length > 0 || std.len(self.runtime_block_blob) > 0 ? self.runtime_mapped_blob_int(self.runtime_meta_ids_blob, self.mapped_meta_ids_offset, self.mapped_meta_ids_length, self.runtime_mapped_blob_int(self.runtime_block_blob, self.mapped_block_offset, self.mapped_block_length, id * 2, 0) + index, -1) : self.blocks.get(id).stmt_ids.get(index); }
+    func runtime_case_expr_count(self: VbsProgram, id: Int) -> Int { return self.mapped_case_length > 0 || std.len(self.runtime_case_blob) > 0 ? self.runtime_mapped_blob_int(self.runtime_case_blob, self.mapped_case_offset, self.mapped_case_length, id * 4 + 1, 0) : self.case_clauses.get(id).expr_ids.len(); }
+    func runtime_case_expr(self: VbsProgram, id: Int, index: Int) -> Int { return self.mapped_case_length > 0 || std.len(self.runtime_case_blob) > 0 ? self.runtime_mapped_blob_int(self.runtime_meta_ids_blob, self.mapped_meta_ids_offset, self.mapped_meta_ids_length, self.runtime_mapped_blob_int(self.runtime_case_blob, self.mapped_case_offset, self.mapped_case_length, id * 4, 0) + index, -1) : self.case_clauses.get(id).expr_ids.get(index); }
+    func runtime_case_block(self: VbsProgram, id: Int) -> Int { return self.mapped_case_length > 0 || std.len(self.runtime_case_blob) > 0 ? self.runtime_mapped_blob_int(self.runtime_case_blob, self.mapped_case_offset, self.mapped_case_length, id * 4 + 2, -1) : self.case_clauses.get(id).block_id; }
+    func runtime_case_is_else(self: VbsProgram, id: Int) -> Bool { return self.mapped_case_length > 0 || std.len(self.runtime_case_blob) > 0 ? self.runtime_mapped_blob_int(self.runtime_case_blob, self.mapped_case_offset, self.mapped_case_length, id * 4 + 3, 0) != 0 : self.case_clauses.get(id).is_else; }
+    func runtime_routine_count(self: VbsProgram) -> Int { return self.mapped_routine_length > 0 ? self.mapped_routine_length / 72 : (std.len(self.runtime_routine_blob) > 0 ? std.len(self.runtime_routine_blob) / 72 : self.routine_names.len()); }
+    func runtime_routine_name(self: VbsProgram, id: Int) -> String { if self.mapped_routine_length == 0 && std.len(self.runtime_routine_blob) == 0 { return self.routine_names.get(id); } let s: Int = self.runtime_mapped_blob_int(self.runtime_routine_blob, self.mapped_routine_offset, self.mapped_routine_length, id * 9, 0); return self.runtime_strings.get_unchecked(s); }
+    func runtime_routine_owner(self: VbsProgram, id: Int) -> String { if self.mapped_routine_length == 0 && std.len(self.runtime_routine_blob) == 0 { return self.routine_owner_classes.get(id); } let s: Int = self.runtime_mapped_blob_int(self.runtime_routine_blob, self.mapped_routine_offset, self.mapped_routine_length, id * 9 + 1, 0); return self.runtime_strings.get_unchecked(s); }
+    func runtime_routine_is_function(self: VbsProgram, id: Int) -> Bool { return self.mapped_routine_length > 0 || std.len(self.runtime_routine_blob) > 0 ? self.runtime_mapped_blob_int(self.runtime_routine_blob, self.mapped_routine_offset, self.mapped_routine_length, id * 9 + 2, 0) != 0 : self.routine_is_functions.get(id) != 0; }
+    func runtime_routine_param_count(self: VbsProgram, id: Int) -> Int { return self.mapped_routine_length > 0 || std.len(self.runtime_routine_blob) > 0 ? self.runtime_mapped_blob_int(self.runtime_routine_blob, self.mapped_routine_offset, self.mapped_routine_length, id * 9 + 4, 0) : asp.runtime.unpack_string_parts(self.routine_param_names.get(id)).len(); }
+    func runtime_routine_param_name(self: VbsProgram, id: Int, index: Int) -> String { if self.mapped_routine_length == 0 && std.len(self.runtime_routine_blob) == 0 { return asp.runtime.unpack_string_parts(self.routine_param_names.get(id)).get(index); } let s: Int = self.runtime_mapped_blob_int(self.runtime_meta_ids_blob, self.mapped_meta_ids_offset, self.mapped_meta_ids_length, self.runtime_mapped_blob_int(self.runtime_routine_blob, self.mapped_routine_offset, self.mapped_routine_length, id * 9 + 3, 0) + index, 0); return self.runtime_strings.get_unchecked(s); }
+    func runtime_routine_param_by_ref(self: VbsProgram, id: Int, index: Int) -> Int { return self.mapped_routine_length > 0 || std.len(self.runtime_routine_blob) > 0 ? self.runtime_mapped_blob_int(self.runtime_meta_ids_blob, self.mapped_meta_ids_offset, self.mapped_meta_ids_length, self.runtime_mapped_blob_int(self.runtime_routine_blob, self.mapped_routine_offset, self.mapped_routine_length, id * 9 + 5, 0) + index, 0) : unpack_int_parts(self.routine_param_by_refs.get(id)).get(index); }
+    func runtime_routine_block(self: VbsProgram, id: Int) -> Int { return self.mapped_routine_length > 0 || std.len(self.runtime_routine_blob) > 0 ? self.runtime_mapped_blob_int(self.runtime_routine_blob, self.mapped_routine_offset, self.mapped_routine_length, id * 9 + 7, -1) : self.routine_block_ids.get(id); }
+    func runtime_routine_writes_mask(self: VbsProgram, id: Int) -> Int { return self.mapped_routine_length > 0 || std.len(self.runtime_routine_blob) > 0 ? self.runtime_mapped_blob_int(self.runtime_routine_blob, self.mapped_routine_offset, self.mapped_routine_length, id * 9 + 8, 0) : self.routine_writes_param_masks.get(id); }
+
+    // Routine lookup uses open addressing over the frozen hash table. Hash
+    // matches are always confirmed by folded names to make collisions benign.
+    func runtime_find_routine(self: VbsProgram, name: String, owner: String = "") -> Int {
+        let cap: Int = (self.mapped_routine_hash_length > 0 ? self.mapped_routine_hash_length : std.len(self.runtime_routine_hash_blob)) / 16;
+        if cap <= 0 { return self.routine_index.get_or(self.routine_lookup_key(name, owner), -1); }
+        let hash: Int = self.runtime_routine_hash(name, owner);
+        let probe: Int = 0;
+        loop probe < cap {
+            let slot: Int = ((hash % cap) + probe) % cap;
+            let id: Int = self.runtime_mapped_blob_int(self.runtime_routine_hash_blob, self.mapped_routine_hash_offset, self.mapped_routine_hash_length, slot * 2 + 1, -1);
+            if id < 0 { return -1; }
+            if self.runtime_mapped_blob_int(self.runtime_routine_hash_blob, self.mapped_routine_hash_offset, self.mapped_routine_hash_length, slot * 2, -1) == hash && strings.equal_fold_ascii(name, self.runtime_routine_name(id)) && strings.equal_fold_ascii(owner, self.runtime_routine_owner(id)) { return id; }
+            probe += 1;
+        }
+        return -1;
+    }
+    func runtime_find_routine_kind(self: VbsProgram, name: String, owner: String, want_function: Bool) -> Int {
+        let cap: Int = (self.mapped_routine_hash_length > 0 ? self.mapped_routine_hash_length : std.len(self.runtime_routine_hash_blob)) / 16;
+        if cap <= 0 { return self.routine_index.get_or(self.routine_kind_lookup_key(name, owner, want_function), -1); }
+        let hash: Int = self.runtime_routine_hash(name, owner);
+        let probe: Int = 0;
+        loop probe < cap {
+            let slot: Int = ((hash % cap) + probe) % cap;
+            let id: Int = self.runtime_mapped_blob_int(self.runtime_routine_hash_blob, self.mapped_routine_hash_offset, self.mapped_routine_hash_length, slot * 2 + 1, -1);
+            if id < 0 { return -1; }
+            if self.runtime_mapped_blob_int(self.runtime_routine_hash_blob, self.mapped_routine_hash_offset, self.mapped_routine_hash_length, slot * 2, -1) == hash
+            && strings.equal_fold_ascii(name, self.runtime_routine_name(id))
+            && strings.equal_fold_ascii(owner, self.runtime_routine_owner(id))
+            && self.runtime_routine_is_function(id) == want_function {
+                return id;
+            }
+            probe += 1;
+        }
+        return -1;
+    }
+    func runtime_class_count(self: VbsProgram) -> Int { return self.mapped_class_length > 0 ? self.mapped_class_length / 24 : (std.len(self.runtime_class_blob) > 0 ? std.len(self.runtime_class_blob) / 24 : self.classes.len()); }
+    func runtime_class_name(self: VbsProgram, id: Int) -> String { return self.mapped_class_length > 0 || std.len(self.runtime_class_blob) > 0 ? self.runtime_strings.get_unchecked(self.runtime_mapped_blob_int(self.runtime_class_blob, self.mapped_class_offset, self.mapped_class_length, id * 3, 0)) : self.classes.get(id).name; }
+    func runtime_class_field_count(self: VbsProgram, id: Int) -> Int { return self.mapped_class_length > 0 || std.len(self.runtime_class_blob) > 0 ? self.runtime_mapped_blob_int(self.runtime_class_blob, self.mapped_class_offset, self.mapped_class_length, id * 3 + 2, 0) : self.classes.get(id).field_names.len(); }
+    func runtime_class_field_name(self: VbsProgram, id: Int, index: Int) -> String { if self.mapped_class_length == 0 && std.len(self.runtime_class_blob) == 0 { return self.classes.get(id).field_names.get(index); } let f: Int = self.runtime_mapped_blob_int(self.runtime_class_blob, self.mapped_class_offset, self.mapped_class_length, id * 3 + 1, 0) + index; return self.runtime_strings.get_unchecked(self.runtime_mapped_blob_int(self.runtime_class_field_blob, self.mapped_class_field_offset, self.mapped_class_field_length, f * 3, 0)); }
+    func runtime_class_field_bound_count(self: VbsProgram, id: Int, index: Int) -> Int { if self.mapped_class_length == 0 && std.len(self.runtime_class_blob) == 0 { return unpack_int_parts(self.classes.get(id).field_bound_expr_packs.get(index)).len(); } let f: Int = self.runtime_mapped_blob_int(self.runtime_class_blob, self.mapped_class_offset, self.mapped_class_length, id * 3 + 1, 0) + index; return self.runtime_mapped_blob_int(self.runtime_class_field_blob, self.mapped_class_field_offset, self.mapped_class_field_length, f * 3 + 2, 0); }
+    func runtime_class_field_bound(self: VbsProgram, id: Int, index: Int, bound: Int) -> Int { if self.mapped_class_length == 0 && std.len(self.runtime_class_blob) == 0 { return unpack_int_parts(self.classes.get(id).field_bound_expr_packs.get(index)).get(bound); } let f: Int = self.runtime_mapped_blob_int(self.runtime_class_blob, self.mapped_class_offset, self.mapped_class_length, id * 3 + 1, 0) + index; return self.runtime_mapped_blob_int(self.runtime_meta_ids_blob, self.mapped_meta_ids_offset, self.mapped_meta_ids_length, self.runtime_mapped_blob_int(self.runtime_class_field_blob, self.mapped_class_field_offset, self.mapped_class_field_length, f * 3 + 1, 0) + bound, -1); }
+
+    // Metadata appenders keep denormalized routine tables index-aligned. These
+    // tables survive after parser objects are released.
+    func add_block(self: VbsProgram, block: VbsStmtBlock) -> Int {
+        let id: Int = self.blocks.len();
+        _ = self.blocks.push(block);
+        return id;
+    }
+
+    func add_routine(self: VbsProgram, routine: VbsRoutineDef) -> Int {
+        let id: Int = self.routines.len();
+        let by_ref_parts: collections.Vector<String> = new collections.Vector<String>();
+        let i: Int = 0;
+        loop i < routine.param_by_refs.len() {
+            if routine.param_by_refs.get(i) != 0 {
+                routine.has_by_ref = true;
+            }
+            _ = by_ref_parts.push(strconv.itoa(routine.param_by_refs.get(i)));
+            i += 1;
+        }
+        routine.fast_scalar = false;
+        _ = self.routines.push(routine);
+        _ = self.routine_names.push(routine.name);
+        _ = self.routine_owner_classes.push(routine.owner_class);
+        _ = self.routine_is_functions.push(routine.is_function ? 1 : 0);
+        _ = self.routine_param_names.push(asp.runtime.pack_string_parts(routine.param_names));
+        _ = self.routine_param_by_refs.push(asp.runtime.pack_string_parts(by_ref_parts));
+        _ = self.routine_block_ids.push(routine.block_id);
+        _ = self.routine_writes_param_masks.push(routine.writes_param_mask);
+        return id;
+    }
+
+    func routine_lookup_key(self: VbsProgram, name: String, owner_class: String = "") -> String {
+        return strings.to_lower_ascii(name) + "|" + strings.to_lower_ascii(owner_class);
+    }
+
+    func routine_kind_lookup_key(self: VbsProgram, name: String, owner_class: String, is_function: Bool) -> String {
+        return (is_function ? "function|" : "sub|") + self.routine_lookup_key(name, owner_class);
+    }
+
+    // Conservative eligibility analysis for the native scalar routine path.
+    // Any construct requiring object dispatch, dynamic binding, or unsupported
+    // control flow rejects the whole block; correctness takes priority over a
+    // partial fast path.
+    func stmt_scalar_identifier_target(self: VbsProgram, stmt_id: Int) -> String {
+        if stmt_id < 0 || stmt_id >= self.stmts.len() {
+            return "";
+        }
+        if std.len(self.get_stmt(stmt_id).target_name) != 0 {
+            return self.get_stmt(stmt_id).target_name;
+        }
+        let target_expr_id: Int = self.get_stmt(stmt_id).target_expr_id;
+        if target_expr_id < 0 || target_expr_id >= self.exprs.len() {
+            return "";
+        }
+        let target_kind: VbsExprKind = self.get_expr(target_expr_id).kind;
+        if target_kind == VbsExprIdentifier {
+            return self.get_expr(target_expr_id).text;
+        }
+        let left_id: Int = self.get_expr(target_expr_id).left_id;
+        if target_kind == VbsExprCall
+        && left_id >= 0
+        && left_id < self.exprs.len()
+        && std.len(self.get_expr(target_expr_id).text) == 0
+        && self.get_expr(target_expr_id).arg_ids.len() == 0
+        && self.get_expr(left_id).kind == VbsExprIdentifier {
+            return self.get_expr(left_id).text;
+        }
+        return "";
+    }
+
+    func expr_is_fast_scalar(self: VbsProgram, expr_id: Int, unsafe_call_names: collections.Vector<String>) -> Bool {
+        if expr_id < 0 || expr_id >= self.exprs.len() {
+            return false;
+        }
+        let expr_kind: VbsExprKind = self.get_expr(expr_id).kind;
+        if expr_kind == VbsExprString || expr_kind == VbsExprInteger || expr_kind == VbsExprFloat || expr_kind == VbsExprBool || expr_kind == VbsExprNothing || expr_kind == VbsExprIdentifier || expr_kind == VbsExprNew {
+            return true;
+        }
+        if expr_kind == VbsExprNeg || expr_kind == VbsExprNot {
+            let left_id: Int = self.get_expr(expr_id).left_id;
+            return self.expr_is_fast_scalar(left_id, unsafe_call_names);
+        }
+        if expr_kind == VbsExprConcat || expr_kind == VbsExprEq || expr_kind == VbsExprNe || expr_kind == VbsExprIs || expr_kind == VbsExprLt || expr_kind == VbsExprLe || expr_kind == VbsExprGt || expr_kind == VbsExprGe || expr_kind == VbsExprAdd || expr_kind == VbsExprSub || expr_kind == VbsExprMul || expr_kind == VbsExprDiv || expr_kind == VbsExprIntDiv || expr_kind == VbsExprMod || expr_kind == VbsExprAnd || expr_kind == VbsExprOr || expr_kind == VbsExprXor || expr_kind == VbsExprPow {
+            let left_id: Int = self.get_expr(expr_id).left_id;
+            let right_id: Int = self.get_expr(expr_id).right_id;
+            return self.expr_is_fast_scalar(left_id, unsafe_call_names) && self.expr_is_fast_scalar(right_id, unsafe_call_names);
+        }
+        if expr_kind == VbsExprCall {
+            let i: Int = 0;
+            let arg_count: Int = self.get_expr(expr_id).arg_ids.len();
+            let left_id: Int = self.get_expr(expr_id).left_id;
+            if left_id >= 0 && !self.expr_is_fast_scalar(left_id, unsafe_call_names) {
+                return false;
+            }
+            loop i < arg_count {
+                let arg_id: Int = self.get_expr(expr_id).arg_ids.get(i);
+                if !self.expr_is_fast_scalar(arg_id, unsafe_call_names) {
+                    return false;
+                }
+                i += 1;
+            }
+            if left_id >= 0 || std.len(self.get_expr(expr_id).text) == 0 {
+                return left_id >= 0;
+            }
+            i = 0;
+            loop i < unsafe_call_names.len() {
+                if strings.equal_fold_ascii(unsafe_call_names.get(i), self.get_expr(expr_id).text) {
+                    return false;
+                }
+                i += 1;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    func block_writes_parameters(self: VbsProgram, block_id: Int, param_names: collections.Vector<String>) -> Bool {
+        if block_id < 0 || block_id >= self.blocks.len() {
+            return true;
+        }
+        let stmt_ids: collections.Vector<Int> = self.blocks.get(block_id).stmt_ids;
+        let i: Int = 0;
+        loop i < stmt_ids.len() {
+            let stmt_id: Int = stmt_ids.get(i);
+            if stmt_id >= 0 && stmt_id < self.stmts.len() {
+                let stmt: VbsStmtNode = self.get_stmt(stmt_id);
+                if stmt.kind == VbsStmtAssign || stmt.kind == VbsStmtSetAssign {
+                    let target_name: String = self.stmt_scalar_identifier_target(stmt_id);
+                    let j: Int = 0;
+                    loop j < param_names.len() {
+                        if strings.equal_fold_ascii(target_name, param_names.get(j)) {
+                            return true;
+                        }
+                        j += 1;
+                    }
+                }
+                if stmt.kind == VbsStmtIf {
+                    if self.block_writes_parameters(stmt.then_block_id, param_names) || (stmt.else_block_id >= 0 && self.block_writes_parameters(stmt.else_block_id, param_names)) {
+                        return true;
+                    }
+                } else if stmt.kind == VbsStmtWhile || stmt.kind == VbsStmtDoLoop || stmt.kind == VbsStmtFor || stmt.kind == VbsStmtForEach {
+                    if self.block_writes_parameters(stmt.body_block_id, param_names) {
+                        return true;
+                    }
+                }
+            }
+            i += 1;
+        }
+        return false;
+    }
+
+    func block_parameter_write_mask(self: VbsProgram, block_id: Int, param_names: collections.Vector<String>) -> Int {
+        if block_id < 0 || block_id >= self.blocks.len() {
+            return 2147483647;
+        }
+        let writes_mask: Int = 0;
+        let i: Int = 0;
+        let stmt_count: Int = self.blocks.get(block_id).stmt_ids.len();
+        loop i < stmt_count {
+            let stmt_id: Int = self.blocks.get(block_id).stmt_ids.get(i);
+            if stmt_id >= 0 && stmt_id < self.stmts.len() {
+                let stmt_kind: VbsStmtKind = self.get_stmt(stmt_id).kind;
+                if stmt_kind == VbsStmtAssign || stmt_kind == VbsStmtSetAssign {
+                    let target_name: String = self.stmt_scalar_identifier_target(stmt_id);
+                    let j: Int = 0;
+                    loop j < param_names.len() && j < 31 {
+                        if strings.equal_fold_ascii(target_name, param_names.get(j)) {
+                            writes_mask = writes_mask | (1 << j);
+                        }
+                        j += 1;
+                    }
+                }
+                if stmt_kind == VbsStmtIf {
+                    let then_block_id: Int = self.get_stmt(stmt_id).then_block_id;
+                    let else_block_id: Int = self.get_stmt(stmt_id).else_block_id;
+                    writes_mask = writes_mask | self.block_parameter_write_mask(then_block_id, param_names);
+                    if else_block_id >= 0 {
+                        writes_mask = writes_mask | self.block_parameter_write_mask(else_block_id, param_names);
+                    }
+                } else if stmt_kind == VbsStmtWhile || stmt_kind == VbsStmtDoLoop || stmt_kind == VbsStmtFor || stmt_kind == VbsStmtForEach {
+                    let body_block_id: Int = self.get_stmt(stmt_id).body_block_id;
+                    writes_mask = writes_mask | self.block_parameter_write_mask(body_block_id, param_names);
+                }
+            }
+            i += 1;
+        }
+        return writes_mask;
+    }
+
+    func block_writes_byref_parameters(self: VbsProgram, block_id: Int, param_names: collections.Vector<String>, param_by_refs: collections.Vector<Int>) -> Bool {
+        if block_id < 0 || block_id >= self.blocks.len() {
+            return true;
+        }
+        let stmt_ids: collections.Vector<Int> = self.blocks.get(block_id).stmt_ids;
+        let i: Int = 0;
+        loop i < stmt_ids.len() {
+            let stmt_id: Int = stmt_ids.get(i);
+            if stmt_id >= 0 && stmt_id < self.stmts.len() {
+                let stmt: VbsStmtNode = self.get_stmt(stmt_id);
+                if stmt.kind == VbsStmtAssign || stmt.kind == VbsStmtSetAssign {
+                    let target_name: String = self.stmt_scalar_identifier_target(stmt_id);
+                    let j: Int = 0;
+                    loop j < param_names.len() {
+                        if j < param_by_refs.len() && param_by_refs.get(j) != 0 && strings.equal_fold_ascii(target_name, param_names.get(j)) {
+                            return true;
+                        }
+                        j += 1;
+                    }
+                }
+                if stmt.kind == VbsStmtIf {
+                    if self.block_writes_byref_parameters(stmt.then_block_id, param_names, param_by_refs) || (stmt.else_block_id >= 0 && self.block_writes_byref_parameters(stmt.else_block_id, param_names, param_by_refs)) {
+                        return true;
+                    }
+                } else if stmt.kind == VbsStmtWhile || stmt.kind == VbsStmtDoLoop || stmt.kind == VbsStmtFor || stmt.kind == VbsStmtForEach {
+                    if self.block_writes_byref_parameters(stmt.body_block_id, param_names, param_by_refs) {
+                        return true;
+                    }
+                }
+            }
+            i += 1;
+        }
+        return false;
+    }
+
+    func block_is_fast_scalar(self: VbsProgram, block_id: Int, unsafe_call_names: collections.Vector<String>) -> Bool {
+        if block_id < 0 || block_id >= self.blocks.len() {
+            return false;
+        }
+        let i: Int = 0;
+        let stmt_count: Int = self.blocks.get(block_id).stmt_ids.len();
+        loop i < stmt_count {
+            let stmt_id: Int = self.blocks.get(block_id).stmt_ids.get(i);
+            if stmt_id < 0 || stmt_id >= self.stmts.len() {
+                return false;
+            }
+            let stmt_kind: VbsStmtKind = self.get_stmt(stmt_id).kind;
+            if stmt_kind == VbsStmtNoop || stmt_kind == VbsStmtOptionExplicit || stmt_kind == VbsStmtExitFunction || stmt_kind == VbsStmtExitSub || stmt_kind == VbsStmtExitProperty {
+                i += 1;
+                skip;
+            }
+            if stmt_kind == VbsStmtOnErrorResumeNext || stmt_kind == VbsStmtOnErrorGoto0 {
+                i += 1;
+                skip;
+            }
+            if stmt_kind == VbsStmtDim {
+                let j: Int = 0;
+                let bound_count: Int = self.get_stmt(stmt_id).target_arg_ids.len();
+                loop j < bound_count {
+                    if !self.expr_is_fast_scalar(self.get_stmt(stmt_id).target_arg_ids.get(j), unsafe_call_names) {
+                        return false;
+                    }
+                    j += 1;
+                }
+                i += 1;
+                skip;
+            }
+            if stmt_kind == VbsStmtConst {
+                let j: Int = 0;
+                let expr_count: Int = self.get_stmt(stmt_id).expr_ids.len();
+                loop j < expr_count {
+                    if !self.expr_is_fast_scalar(self.get_stmt(stmt_id).expr_ids.get(j), unsafe_call_names) {
+                        return false;
+                    }
+                    j += 1;
+                }
+                i += 1;
+                skip;
+            }
+            if stmt_kind == VbsStmtReDim {
+                return false;
+            }
+            if stmt_kind == VbsStmtAssign || stmt_kind == VbsStmtSetAssign {
+                let value_expr_id: Int = self.get_stmt(stmt_id).value_expr_id;
+                if !self.expr_is_fast_scalar(value_expr_id, unsafe_call_names) {
+                    return false;
+                }
+                i += 1;
+                skip;
+            }
+            if stmt_kind == VbsStmtIf {
+                let cond_expr_id: Int = self.get_stmt(stmt_id).cond_expr_id;
+                let then_block_id: Int = self.get_stmt(stmt_id).then_block_id;
+                let else_block_id: Int = self.get_stmt(stmt_id).else_block_id;
+                if !self.expr_is_fast_scalar(cond_expr_id, unsafe_call_names) || !self.block_is_fast_scalar(then_block_id, unsafe_call_names) || (else_block_id >= 0 && !self.block_is_fast_scalar(else_block_id, unsafe_call_names)) {
+                    return false;
+                }
+                i += 1;
+                skip;
+            }
+            if stmt_kind == VbsStmtWhile || stmt_kind == VbsStmtDoLoop {
+                let cond_expr_id: Int = self.get_stmt(stmt_id).cond_expr_id;
+                let extra_expr_id: Int = self.get_stmt(stmt_id).extra_expr_id;
+                let body_block_id: Int = self.get_stmt(stmt_id).body_block_id;
+                if (cond_expr_id >= 0 && !self.expr_is_fast_scalar(cond_expr_id, unsafe_call_names)) || (extra_expr_id >= 0 && !self.expr_is_fast_scalar(extra_expr_id, unsafe_call_names)) || !self.block_is_fast_scalar(body_block_id, unsafe_call_names) {
+                    return false;
+                }
+                i += 1;
+                skip;
+            }
+            if stmt_kind == VbsStmtFor {
+                let value_expr_id: Int = self.get_stmt(stmt_id).value_expr_id;
+                let extra_expr_id: Int = self.get_stmt(stmt_id).extra_expr_id;
+                let extra_expr_id2: Int = self.get_stmt(stmt_id).extra_expr_id2;
+                let body_block_id: Int = self.get_stmt(stmt_id).body_block_id;
+                if !self.expr_is_fast_scalar(value_expr_id, unsafe_call_names) || !self.expr_is_fast_scalar(extra_expr_id, unsafe_call_names) || (extra_expr_id2 >= 0 && !self.expr_is_fast_scalar(extra_expr_id2, unsafe_call_names)) || !self.block_is_fast_scalar(body_block_id, unsafe_call_names) {
+                    return false;
+                }
+                i += 1;
+                skip;
+            }
+            if stmt_kind == VbsStmtCall {
+                let j: Int = 0;
+                let arg_count: Int = self.get_stmt(stmt_id).call_arg_ids.len();
+                loop j < arg_count {
+                    let arg_id: Int = self.get_stmt(stmt_id).call_arg_ids.get(j);
+                    if !self.expr_is_fast_scalar(arg_id, unsafe_call_names) {
+                        return false;
+                    }
+                    j += 1;
+                }
+                i += 1;
+                skip;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    func bind_static_routine_ids(self: VbsProgram) -> Void {
+        self.routine_index = new collections.Map<String, Int>();
+        let i: Int = 0;
+        loop i < self.routine_names.len() {
+            let owner_class: String = i < self.routine_owner_classes.len() ? self.routine_owner_classes.get(i) : "";
+            _ = self.routine_index.set(self.routine_lookup_key(self.routine_names.get(i), owner_class), i);
+            let is_function: Bool = i < self.routine_is_functions.len() && self.routine_is_functions.get(i) != 0;
+            _ = self.routine_index.set(self.routine_kind_lookup_key(self.routine_names.get(i), owner_class, is_function), i);
+            i += 1;
+        }
+    }
+
+    // Recomputes optimization metadata only after all routines are known,
+    // allowing recursive and cross-routine calls to be classified consistently.
+    func refresh_routine_metadata(self: VbsProgram) -> Void {
+        // Fast-scalar eligibility is compiled into bytecode.routine_slot_counts.
+    }
+
+    func add_class(self: VbsProgram, cls: VbsClassDef) -> Int {
+        let id: Int = self.classes.len();
+        _ = self.classes.push(cls);
+        return id;
+    }
+
+    func add_case_clause(self: VbsProgram, clause: VbsCaseClause) -> Int {
+        let id: Int = self.case_clauses.len();
+        _ = self.case_clauses.push(clause);
+        return id;
+    }
+
+    func add_error(self: VbsProgram, msg: String) -> Void {
+        _ = self.errors.push(msg);
+    }
+
+    func ok(self: VbsProgram) -> Bool {
+        return self.errors.len() == 0;
+    }
+}

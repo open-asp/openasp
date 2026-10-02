@@ -1,0 +1,827 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.runtime;
+
+use asp.compiler;
+use asp.vm;
+
+use asp;
+use std;
+use fmt;
+use fs;
+use os;
+use sync;
+use strings;
+use strconv;
+use collections;
+use path;
+use time;
+use crypto.rand;
+
+extern func eg_asp_request_arena_create(initial_bytes: Int) -> Int;
+extern func eg_asp_request_arena_destroy(handle: Int) -> Void;
+extern func eg_asp_request_string_arena_enter(handle: Int) -> Int;
+extern func eg_asp_application_state_lock(path: String) -> Int;
+extern func eg_asp_application_state_unlock(handle: Int) -> Void;
+
+func application_state_lock(path: String) -> Int {
+    return eg_asp_application_state_lock(path);
+}
+
+func application_state_unlock(handle: Int) -> Void {
+    eg_asp_application_state_unlock(handle);
+}
+
+// Parsed request state exposed through the classic ASP Request object.
+// Maps provide folded-key lookup while parallel key vectors preserve incoming
+// spelling and order for enumeration. `binary_read_offset` makes BinaryRead a
+// consuming stream over the immutable body.
+class RequestData {
+    var method: String;
+    var path: String;
+    var query_string: String;
+    var body: String;
+    var binary_read_offset: Int;
+    var query: collections.Map<String, String>;
+    var form: collections.Map<String, String>;
+    var cookies: collections.Map<String, String>;
+    var query_keys: collections.Vector<String>;
+    var form_keys: collections.Vector<String>;
+    var cookie_keys: collections.Vector<String>;
+    var headers: collections.Map<String, String>;
+    var server_variables: collections.Map<String, String>;
+
+    func init(self: RequestData) -> Void {
+        self.method = "GET";
+        self.path = "/";
+        self.query_string = "";
+        self.body = "";
+        self.binary_read_offset = 0;
+        self.query = new collections.Map<String, String>();
+        self.form = new collections.Map<String, String>();
+        self.cookies = new collections.Map<String, String>();
+        self.query_keys = new collections.Vector<String>();
+        self.form_keys = new collections.Vector<String>();
+        self.cookie_keys = new collections.Vector<String>();
+        self.headers = new collections.Map<String, String>();
+        self.server_variables = new collections.Map<String, String>();
+    }
+
+    func parse_query(self: RequestData) -> Void {
+        self.query.dispose();
+        self.query_keys.dispose();
+        self.query = asp.runtime.parse_kv_pairs(self.query_string, "&", "=");
+        self.query_keys = asp.runtime.parse_kv_key_names(self.query_string, "&", "=");
+    }
+
+    func parse_form(self: RequestData) -> Void {
+        self.form.dispose();
+        self.form_keys.dispose();
+        self.form = asp.runtime.parse_kv_pairs(self.body, "&", "=");
+        self.form_keys = asp.runtime.parse_kv_key_names(self.body, "&", "=");
+    }
+
+    // URL-encoded parsing is skipped for multipart uploads because upload
+    // components require the exact raw body and parse their own boundaries.
+    func parse_form_for_content_type(self: RequestData) -> Void {
+        let content_type: String = strings.to_lower_ascii(strings.trim_space(
+            self.headers.get_or("content-type", "")
+        ));
+        if strings.starts_with(content_type, "multipart/form-data") {
+            // Classic ASP upload handlers consume the raw entity through
+            // BinaryRead. Parsing it as URL-encoded data duplicates the body
+            // and creates meaningless form keys for every multipart segment.
+            return;
+        }
+        self.parse_form();
+    }
+
+    func binary_read(self: RequestData, count: Int) -> String {
+        let remaining: Int = std.len(self.body) - self.binary_read_offset;
+        if count <= 0 || remaining <= 0 {
+            return "";
+        }
+        let read_size: Int = count < remaining ? count : remaining;
+        let start: Int = self.binary_read_offset;
+        self.binary_read_offset += read_size;
+        // Upload handlers conventionally call BinaryRead(TotalBytes). Reuse
+        // the immutable request body in that case. Partial reads use a
+        // borrowed view and materialize only the requested range.
+        if start == 0 && read_size == std.len(self.body) {
+            return self.body;
+        }
+        return std.view(self.body).slice(start, read_size).to_string();
+    }
+
+    // Releases all request-owned containers before replacing them. This method
+    // is the reuse boundary and must reset every cursor and collection.
+    func clear(self: RequestData) -> Void {
+        self.method = "GET";
+        self.path = "/";
+        self.query_string = "";
+        self.body = "";
+        self.binary_read_offset = 0;
+        self.query.dispose();
+        self.form.dispose();
+        self.cookies.dispose();
+        self.query_keys.dispose();
+        self.form_keys.dispose();
+        self.cookie_keys.dispose();
+        self.headers.dispose();
+        self.server_variables.dispose();
+        self.query = new collections.Map<String, String>();
+        self.form = new collections.Map<String, String>();
+        self.cookies = new collections.Map<String, String>();
+        self.query_keys = new collections.Vector<String>();
+        self.form_keys = new collections.Vector<String>();
+        self.cookie_keys = new collections.Vector<String>();
+        self.headers = new collections.Map<String, String>();
+        self.server_variables = new collections.Map<String, String>();
+    }
+
+    // Cookie parsing preserves the first spelling of each key while the map
+    // applies ASCII case-insensitive lookup.
+    func parse_cookies(self: RequestData, cookie_header: String) -> Void {
+        self.cookies.dispose();
+        self.cookie_keys.dispose();
+        self.cookies = new collections.Map<String, String>();
+        self.cookie_keys = new collections.Vector<String>();
+        let parts: collections.Vector<String> = strings.split(cookie_header, ";");
+        let i: Int = 0;
+        loop i < parts.len() {
+            let item: String = strings.trim_space(parts.get(i));
+            let eq: Int = strings.find_substr(item, "=");
+            if eq > 0 {
+                let original_key: String = strings.trim_space(std.substr(item, 0, eq));
+                let key: String = strings.to_lower_ascii(original_key);
+                let value: String = strings.trim_space(std.substr(item, eq + 1, std.len(item) - eq - 1));
+                if !self.cookies.has(key) {
+                    _ = self.cookie_keys.push(original_key);
+                }
+                _ = self.cookies.set(key, value);
+            }
+            i += 1;
+        }
+        _ = parts.free();
+    }
+
+    func get_value(self: RequestData, name: String) -> String {
+        let lc: String = strings.to_lower_ascii(name);
+        if self.query.has(lc) {
+            return self.query.get(lc);
+        }
+        if self.form.has(lc) {
+            return self.form.get(lc);
+        }
+        if self.cookies.has(lc) {
+            return self.cookies.get(lc);
+        }
+        if self.server_variables.has(lc) {
+            return self.server_variables.get(lc);
+        }
+        return "";
+    }
+}
+
+// Buffered response state. Text writes accumulate in a reusable builder;
+// binary writes preserve bytes. Cookie attributes are modeled separately and
+// regenerate Set-Cookie headers after every mutation.
+class ResponseData {
+    var status_code: Int;
+    var status_text: String;
+    var content_type: String;
+    var charset: String;
+    var body: String;
+    var body_builder: std.StringBuilder;
+    var body_len: Int;
+    var body_cached: Bool;
+    var binary_started: Bool;
+    var headers: collections.Map<String, String>;
+    var cookie_values: collections.Map<String, String>;
+    var cookie_expires: collections.Map<String, String>;
+    var cookie_paths: collections.Map<String, String>;
+    var base_set_cookie: String;
+    var base_set_cookie_captured: Bool;
+    var buffer_enabled: Bool;
+    var ended: Bool;
+    var redirected_to: String;
+    // The response owns the request arena during delayed FastCGI body sends.
+    // No managed reference is stored in the native arena.
+    var request_arena_handle: Int;
+
+    func init(self: ResponseData) -> Void {
+        self.status_code = 200;
+        self.status_text = "OK";
+        self.content_type = "text/html";
+        self.charset = "utf-8";
+        self.body = "";
+        self.body_builder = new std.StringBuilder(4096);
+        self.body_len = 0;
+        self.body_cached = true;
+        self.binary_started = false;
+        self.headers = new collections.Map<String, String>();
+        self.cookie_values = new collections.Map<String, String>();
+        self.cookie_expires = new collections.Map<String, String>();
+        self.cookie_paths = new collections.Map<String, String>();
+        self.base_set_cookie = "";
+        self.base_set_cookie_captured = false;
+        self.buffer_enabled = true;
+        self.ended = false;
+        self.redirected_to = "";
+        self.request_arena_handle = 0;
+    }
+
+    func write(self: ResponseData, s: String) -> Void {
+        if std.len(s) == 0 {
+            return;
+        }
+        _ = self.body_builder.append(s);
+        self.body_len += std.len(s);
+        self.body_cached = false;
+    }
+
+    func binary_write(self: ResponseData, s: String) -> Void {
+        if std.len(s) == 0 {
+            return;
+        }
+        if !self.binary_started {
+            let lower_content_type: String = strings.to_lower_ascii(strings.trim_space(self.content_type));
+            if !strings.starts_with(lower_content_type, "text/") {
+                self.binary_started = true;
+                if self.body_len != 0 {
+                    let prefix: String = self.body_text();
+                    let ignorable: Bool = true;
+                    let i: Int = 0;
+                    loop i < std.len(prefix) {
+                        let ch: Int = std.byte_at(prefix, i);
+                        if ch == '\t' || ch == '\n' || ch == '\r' || ch == ' ' {
+                            i += 1;
+                            skip;
+                        }
+                        if i + 2 < std.len(prefix)
+                            && ch == '\xEF'
+                            && std.byte_at(prefix, i + 1) == '\xBB'
+                            && std.byte_at(prefix, i + 2) == '\xBF' {
+                            i += 3;
+                            skip;
+                        }
+                        ignorable = false;
+                        break;
+                    }
+                    if ignorable {
+                        self.clear();
+                    }
+                }
+            }
+        }
+        _ = self.body_builder.append(s);
+        self.body_len += std.len(s);
+        self.body_cached = false;
+    }
+
+    func body_size(self: ResponseData) -> Int {
+        return self.body_len;
+    }
+
+    func body_text(self: ResponseData) -> String {
+        if !self.body_cached {
+            self.body = self.body_builder.to_string();
+            self.body_cached = true;
+        }
+        return self.body;
+    }
+
+    // Returns a borrowed view whenever possible. Callers that retain it must
+    // also retain this ResponseData or copy/promote the bytes first.
+    func body_view(self: ResponseData) -> std.StringView {
+        return self.body_builder.borrowed_view();
+    }
+
+    func clear(self: ResponseData) -> Void {
+        self.body = "";
+        self.body_len = 0;
+        self.body_cached = true;
+        _ = self.body_builder.free();
+        self.body_builder = new std.StringBuilder(4096);
+    }
+
+    func add_header(self: ResponseData, key: String, value: String) -> Void {
+        let normalized_key: String = strings.equal_fold_ascii(key, "cache-ctrol") ? "cache-control" : strings.to_lower_ascii(key);
+        let normalized_value: String = normalized_key == "cache-control" && strings.equal_fold_ascii(strings.trim_space(value), "no-cache")
+            ? "no-store, no-cache, must-revalidate"
+            : value;
+        _ = self.headers.set(normalized_key, normalized_value);
+    }
+
+    // Rebuilds generated cookies without discarding user-supplied Set-Cookie
+    // values captured in `base_set_cookie`.
+    func rebuild_cookie_header(self: ResponseData) -> Void {
+        let builder: std.StringBuilder = new std.StringBuilder(std.len(self.base_set_cookie) + 128);
+        _ = builder.append(self.base_set_cookie);
+        let has_header: Bool = std.len(self.base_set_cookie) != 0;
+        let keys: collections.Vector<String> = self.cookie_values.keys();
+        let i: Int = 0;
+        loop i < keys.len() {
+            let key: String = keys.get(i);
+            if has_header {
+                _ = builder.append("\r\nSet-Cookie: ");
+            }
+            _ = builder.append(key);
+            _ = builder.append("=");
+            _ = builder.append(self.cookie_values.get(key));
+            _ = builder.append("; Path=");
+            _ = builder.append(self.cookie_paths.get_or(key, "/"));
+            let expires: String = self.cookie_expires.get_or(key, "");
+            if std.len(expires) != 0 {
+                _ = builder.append("; Expires=");
+                _ = builder.append(expires);
+            }
+            has_header = true;
+            i += 1;
+        }
+        _ = keys.free();
+        let header: String = builder.to_string();
+        _ = builder.free();
+        _ = self.headers.set("set-cookie", header);
+    }
+
+    func capture_base_set_cookie(self: ResponseData) -> Void {
+        if !self.base_set_cookie_captured {
+            self.base_set_cookie = self.headers.get_or("set-cookie", "");
+            self.base_set_cookie_captured = true;
+        }
+    }
+
+    func set_cookie(self: ResponseData, name: String, value: String) -> Void {
+        self.capture_base_set_cookie();
+        _ = self.cookie_values.set(name, value);
+        self.rebuild_cookie_header();
+    }
+
+    func set_cookie_expires(self: ResponseData, name: String, value: String) -> Void {
+        self.capture_base_set_cookie();
+        _ = self.cookie_expires.set(name, value);
+        self.rebuild_cookie_header();
+    }
+
+    func set_cookie_path(self: ResponseData, name: String, value: String) -> Void {
+        self.capture_base_set_cookie();
+        _ = self.cookie_paths.set(name, std.len(value) == 0 ? "/" : value);
+        self.rebuild_cookie_header();
+    }
+
+    func redirect(self: ResponseData, location: String) -> Void {
+        self.status_code = 302;
+        self.status_text = "Found";
+        self.redirected_to = location;
+        _ = self.add_header("Location", location);
+        self.ended = true;
+    }
+
+    func set_status(self: ResponseData, status: String) -> Void {
+        let normalized: String = strings.trim_space(status);
+        let separator: Int = strings.find_substr(normalized, " ");
+        if separator > 0 {
+            let code: Int = strconv.atoi(std.substr(normalized, 0, separator));
+            if code >= 100 && code <= 999 {
+                self.status_code = code;
+                self.status_text = strings.trim_space(std.substr(normalized, separator + 1, std.len(normalized) - separator - 1));
+                return;
+            }
+        }
+        self.status_text = normalized;
+    }
+
+    func end(self: ResponseData) -> Void {
+        self.ended = true;
+    }
+
+    func clear_request(self: ResponseData) -> Void {
+        self.status_code = 200;
+        self.status_text = "OK";
+        self.content_type = "text/html";
+        self.charset = "utf-8";
+        self.clear();
+        self.binary_started = false;
+        self.headers.dispose();
+        self.cookie_values.dispose();
+        self.cookie_expires.dispose();
+        self.cookie_paths.dispose();
+        self.headers = new collections.Map<String, String>();
+        self.cookie_values = new collections.Map<String, String>();
+        self.cookie_expires = new collections.Map<String, String>();
+        self.cookie_paths = new collections.Map<String, String>();
+        self.base_set_cookie = "";
+        self.base_set_cookie_captured = false;
+        self.buffer_enabled = true;
+        self.ended = false;
+        self.redirected_to = "";
+        if self.request_arena_handle != 0 {
+            eg_asp_request_arena_destroy(self.request_arena_handle);
+            self.request_arena_handle = 0;
+        }
+    }
+}
+
+// In-process session registry. The caller provides external synchronization;
+// generated IDs use cryptographic randomness to avoid predictable sessions.
+class SessionStore {
+    var ids: collections.Vector<String>;
+    var stores: collections.Vector<KeyValueStore>;
+    var mu: sync.Mutex;
+    var next_id: Int;
+
+    func init(self: SessionStore) -> Void {
+        self.ids = new collections.Vector<String>();
+        self.stores = new collections.Vector<KeyValueStore>();
+        self.mu = new sync.Mutex();
+        self.next_id = 1;
+    }
+
+    func ensure(self: SessionStore, session_id: String) -> KeyValueStore {
+        let id: String = std.len(session_id) == 0 ? self.create_id() : session_id;
+        _ = self.mu.lock();
+        let i: Int = 0;
+        loop i < self.ids.len() {
+            if self.ids.get(i) == id {
+                let existing: KeyValueStore = self.stores.get(i);
+                _ = self.mu.unlock();
+                return existing;
+            }
+            i += 1;
+        }
+        let created: KeyValueStore = new KeyValueStore();
+        _ = self.ids.push(id);
+        _ = self.stores.push(created);
+        _ = self.mu.unlock();
+        return created;
+    }
+
+    func create_id(self: SessionStore) -> String {
+        _ = self.mu.lock();
+        let random_id: String = crypto.rand.hex(24);
+        let id: String = std.len(random_id) > 0
+            ? "egsess-" + random_id
+            : "egsess-" + strconv.itoa(time.now_us()) + "-" + strconv.itoa(os.pid()) + "-" + strconv.itoa(self.next_id);
+        self.next_id += 1;
+        _ = self.mu.unlock();
+        return id;
+    }
+}
+
+// Process-wide Application snapshot. `snapshot_from` promotes values before
+// publishing them, and the generation counter lets request-local clones detect
+// when they must refresh.
+class ApplicationState {
+    var sessions: SessionStore;
+    var initialized: Bool;
+    var starting: Bool;
+    var lock_mu: sync.Mutex;
+    var snapshot_mu: sync.Mutex;
+    var globals_snapshot: KeyValueStore;
+    var snapshot_loaded: Bool;
+    var snapshot_cacheable: Bool;
+    var snapshot_mtime_sec: Int;
+    var snapshot_mtime_nsec: Int;
+    var version: Int;
+
+    func init(self: ApplicationState) -> Void {
+        self.sessions = new SessionStore();
+        self.initialized = false;
+        self.starting = false;
+        self.lock_mu = new sync.Mutex();
+        self.snapshot_mu = new sync.Mutex();
+        self.globals_snapshot = new KeyValueStore();
+        self.snapshot_loaded = false;
+        self.snapshot_cacheable = true;
+        self.snapshot_mtime_sec = 0;
+        self.snapshot_mtime_nsec = 0;
+        self.version = 0;
+    }
+
+    func snapshot_from(self: ApplicationState, store: KeyValueStore, application_file: String) -> Void {
+        let mtime_sec, _ = fs.stat_mtime(application_file);
+        let mtime_nsec, _ = fs.stat_mtime_nsec(application_file);
+        _ = self.snapshot_mu.lock();
+        self.snapshot_loaded = true;
+        self.snapshot_mtime_sec = mtime_sec;
+        self.snapshot_mtime_nsec = mtime_nsec;
+        self.snapshot_cacheable = !store.contains_object();
+        self.globals_snapshot = self.snapshot_cacheable
+            ? store.promoted_clone()
+            : new KeyValueStore();
+        self.version += 1;
+        _ = self.snapshot_mu.unlock();
+    }
+
+    func new_globals_store(self: ApplicationState, application_file: String, objects: asp.vm.ObjectSpace) -> KeyValueStore {
+        let mtime_sec, _ = fs.stat_mtime(application_file);
+        let mtime_nsec, _ = fs.stat_mtime_nsec(application_file);
+        _ = self.snapshot_mu.lock();
+        if self.snapshot_loaded
+            && self.snapshot_cacheable
+            && self.snapshot_mtime_sec == mtime_sec
+            && self.snapshot_mtime_nsec == mtime_nsec {
+            let cached: KeyValueStore = self.globals_snapshot.clone_application_request();
+            _ = self.snapshot_mu.unlock();
+            return cached;
+        }
+
+        // Decode object-bearing values directly into the request ObjectSpace.
+        // Such stores are deliberately not retained, since their IDs are only
+        // valid in that request.
+        let loaded: KeyValueStore = asp.runtime.load_store_file(application_file, objects);
+        let fresh_mtime_sec, _ = fs.stat_mtime(application_file);
+        let fresh_mtime_nsec, _ = fs.stat_mtime_nsec(application_file);
+        self.snapshot_loaded = true;
+        self.snapshot_mtime_sec = fresh_mtime_sec;
+        self.snapshot_mtime_nsec = fresh_mtime_nsec;
+        self.snapshot_cacheable = !loaded.contains_object();
+        self.globals_snapshot = self.snapshot_cacheable
+            ? loaded.promoted_clone()
+            : new KeyValueStore();
+        self.version += 1;
+        _ = self.snapshot_mu.unlock();
+        return loaded;
+    }
+
+}
+
+// Owns all mutable state for one page request, including object resources,
+// global bindings, compiled-page roots, and the request string arena.
+//
+// `clear_request_except_response` transfers response ownership to FastCGI and
+// clears everything else. `clear_request` additionally destroys response data.
+// Compiled-page roots form an explicit chain so nested Server.Execute calls
+// remain visible to the moving GC.
+class RequestContext {
+    var root_dir: String;
+    var page_path: String;
+    var request: RequestData;
+    var response: ResponseData;
+    var application: KeyValueStore;
+    var session: KeyValueStore;
+    var session_id: String;
+    var error_state: ScriptErrorState;
+    var locals: KeyValueStore;
+    // Dense storage for the active bytecode program's statically bound globals.
+    // ctx.locals remains the dynamic spill and cross-page source of truth.
+    var global_slot_names: collections.Vector<String>;
+    var global_slot_values: collections.Vector<Variant>;
+    var global_slot_epochs: collections.Vector<Int>;
+    var global_slot_indices: collections.Map<String, Int>;
+    var global_bindings_epoch: Int;
+    var global_slots_epoch: Int;
+    var objects: asp.vm.ObjectSpace;
+    var session_timeout_minutes: Int;
+    var script_timeout_seconds: Int;
+    var session_abandoned: Bool;
+    var session_dirty: Bool;
+    var application_locked: Bool;
+    var application_lock_depth: Int;
+    var application_process_lock: Int;
+    var application_dirty: Bool;
+    var access_query_cache: collections.Map<String, String>;
+    var started_ms: Int;
+    var compiled_page_root: CompiledPageRoot;
+    var compiled_page_depth: Int;
+    var compiled_page_root_0: CompiledPageRoot;
+    var compiled_page_root_1: CompiledPageRoot;
+    var compiled_page_root_2: CompiledPageRoot;
+    var compiled_page_root_3: CompiledPageRoot;
+    var compiled_page_root_4: CompiledPageRoot;
+    var compiled_page_root_5: CompiledPageRoot;
+    var compiled_page_root_6: CompiledPageRoot;
+    var compiled_page_root_7: CompiledPageRoot;
+    var request_arena_handle: Int;
+
+    func init(self: RequestContext, root_dir: String, page_path: String, application: KeyValueStore, session: KeyValueStore, session_id: String) -> Void {
+        self.root_dir = root_dir;
+        self.page_path = page_path;
+        self.request = new RequestData();
+        self.response = new ResponseData();
+        self.application = application;
+        self.session = session;
+        self.session_id = session_id;
+        self.error_state = new ScriptErrorState();
+        self.locals = new KeyValueStore();
+        self.global_slot_names = new collections.Vector<String>();
+        self.global_slot_values = new collections.Vector<Variant>();
+        self.global_slot_epochs = new collections.Vector<Int>();
+        self.global_slot_indices = new collections.Map<String, Int>();
+        self.global_bindings_epoch = 0;
+        self.global_slots_epoch = -1;
+        self.objects = new asp.vm.ObjectSpace();
+        self.session_timeout_minutes = 20;
+        self.script_timeout_seconds = 90;
+        self.session_abandoned = false;
+        self.session_dirty = false;
+        self.application_locked = false;
+        self.application_lock_depth = 0;
+        self.application_process_lock = -1;
+        self.application_dirty = false;
+        self.access_query_cache = new collections.Map<String, String>();
+        self.started_ms = time.now_ms();
+        self.compiled_page_root = new CompiledPageRoot();
+        self.compiled_page_depth = 0;
+        self.compiled_page_root_0 = new CompiledPageRoot();
+        self.compiled_page_root_1 = new CompiledPageRoot();
+        self.compiled_page_root_2 = new CompiledPageRoot();
+        self.compiled_page_root_3 = new CompiledPageRoot();
+        self.compiled_page_root_4 = new CompiledPageRoot();
+        self.compiled_page_root_5 = new CompiledPageRoot();
+        self.compiled_page_root_6 = new CompiledPageRoot();
+        self.compiled_page_root_7 = new CompiledPageRoot();
+        self.request_arena_handle = eg_asp_request_arena_create(16384);
+        self.response.request_arena_handle = self.request_arena_handle;
+        _ = eg_asp_request_string_arena_enter(self.request_arena_handle);
+    }
+
+    func refresh_global_slots(self: RequestContext) -> Void {
+        let i: Int = 0;
+        loop i < self.global_slot_names.len() {
+            _ = self.global_slot_values.set(i, self.locals.get_or_empty(self.global_slot_names.get(i)));
+            _ = self.global_slot_epochs.set(i, self.global_bindings_epoch);
+            i += 1;
+        }
+        self.global_slots_epoch = self.global_bindings_epoch;
+    }
+
+    func prepare_global_slots(self: RequestContext, names: collections.Vector<String>) -> Void {
+        let same_layout: Bool = names.len() == self.global_slot_names.len();
+        let i: Int = 0;
+        loop same_layout && i < names.len() {
+            if names.get(i) != self.global_slot_names.get(i) {
+                same_layout = false;
+            }
+            i += 1;
+        }
+        if !same_layout {
+            self.global_slot_names = new collections.Vector<String>();
+            self.global_slot_values = new collections.Vector<Variant>();
+            self.global_slot_epochs = new collections.Vector<Int>();
+            self.global_slot_indices = new collections.Map<String, Int>();
+            i = 0;
+            loop i < names.len() {
+                let name: String = names.get(i);
+                _ = self.global_slot_names.push(name);
+                _ = self.global_slot_values.push(self.locals.get_or_empty(name));
+                _ = self.global_slot_epochs.push(self.global_bindings_epoch);
+                _ = self.global_slot_indices.set(name, i);
+                i += 1;
+            }
+            self.global_slots_epoch = self.global_bindings_epoch;
+        }
+    }
+
+    func invalidate_global_slots(self: RequestContext) -> Void {
+        self.global_bindings_epoch += 1;
+    }
+
+    func global_slot_value(self: RequestContext, slot: Int) -> Variant {
+        if slot < 0 || slot >= self.global_slot_values.len() {
+            return asp.runtime.variant_empty();
+        }
+        if slot >= self.global_slot_epochs.len()
+        || self.global_slot_epochs.get(slot) != self.global_bindings_epoch {
+            _ = self.global_slot_values.set(slot, self.locals.get_or_empty(self.global_slot_names.get(slot)));
+            if slot < self.global_slot_epochs.len() {
+                _ = self.global_slot_epochs.set(slot, self.global_bindings_epoch);
+            }
+        }
+        return self.global_slot_values.get(slot);
+    }
+
+    func set_global_binding(self: RequestContext, name: String, value: Variant) -> Void {
+        _ = self.locals.set(name, value);
+        self.global_bindings_epoch += 1;
+        let slot: Int = self.global_slot_indices.get_or(strings.to_lower_ascii(name), -1);
+        if slot >= 0 && slot < self.global_slot_values.len() {
+            _ = self.global_slot_values.set(slot, value);
+            _ = self.global_slot_epochs.set(slot, self.global_bindings_epoch);
+        }
+    }
+
+    func set_global_slot(self: RequestContext, slot: Int, value: Variant) -> Void {
+        if slot < 0 || slot >= self.global_slot_names.len() {
+            return;
+        }
+        self.set_global_binding(self.global_slot_names.get(slot), value);
+    }
+
+    // Page-root push/pop must be balanced around nested execution. The root
+    // pins the page/program graph while bytecode and mmap views are active.
+    func push_compiled_page(self: RequestContext, page: CompiledPage) -> Void {
+        let root: CompiledPageRoot = new CompiledPageRoot();
+        root.link(page, new CompiledPageRoot());
+        if self.compiled_page_depth == 0 {
+            self.compiled_page_root_0 = root;
+        } else if self.compiled_page_depth == 1 {
+            self.compiled_page_root_1 = root;
+        } else if self.compiled_page_depth == 2 {
+            self.compiled_page_root_2 = root;
+        } else if self.compiled_page_depth == 3 {
+            self.compiled_page_root_3 = root;
+        } else if self.compiled_page_depth == 4 {
+            self.compiled_page_root_4 = root;
+        } else if self.compiled_page_depth == 5 {
+            self.compiled_page_root_5 = root;
+        } else if self.compiled_page_depth == 6 {
+            self.compiled_page_root_6 = root;
+        } else if self.compiled_page_depth == 7 {
+            self.compiled_page_root_7 = root;
+        } else {
+            self.compiled_page_root = root;
+        }
+        self.compiled_page_depth += 1;
+    }
+
+    func active_compiled_page_root(self: RequestContext) -> CompiledPageRoot {
+        if self.compiled_page_depth == 1 {
+            return self.compiled_page_root_0;
+        }
+        if self.compiled_page_depth == 2 {
+            return self.compiled_page_root_1;
+        }
+        if self.compiled_page_depth == 3 {
+            return self.compiled_page_root_2;
+        }
+        if self.compiled_page_depth == 4 {
+            return self.compiled_page_root_3;
+        }
+        if self.compiled_page_depth == 5 {
+            return self.compiled_page_root_4;
+        }
+        if self.compiled_page_depth == 6 {
+            return self.compiled_page_root_5;
+        }
+        if self.compiled_page_depth == 7 {
+            return self.compiled_page_root_6;
+        }
+        if self.compiled_page_depth == 8 {
+            return self.compiled_page_root_7;
+        }
+        return self.compiled_page_root;
+    }
+
+    func pop_compiled_page(self: RequestContext) -> Void {
+        if self.compiled_page_depth <= 0 {
+            return;
+        }
+        self.compiled_page_depth -= 1;
+    }
+
+    func clear_request(self: RequestContext) -> Void {
+        // Break the request graph in place so native vector/map storage is released
+        // as one boundary operation instead of waiting for a full-heap collection.
+        self.request.clear();
+        self.response.clear_request();
+        self.request_arena_handle = 0;
+        self.clear_request_state();
+    }
+
+    func clear_request_except_response(self: RequestContext) -> Void {
+        self.request.clear();
+        self.clear_request_state();
+        // Ownership is now exclusively with ResponseData until the borrowed
+        // FastCGI body view has finished sending.
+        self.request_arena_handle = 0;
+    }
+
+    func clear_request_state(self: RequestContext) -> Void {
+        self.locals.clear();
+        self.global_slot_names.clear();
+        self.global_slot_values.clear();
+        self.global_slot_epochs.clear();
+        self.global_slot_indices.dispose();
+        self.global_slot_indices = new collections.Map<String, Int>();
+        self.global_bindings_epoch = 0;
+        self.global_slots_epoch = -1;
+        self.objects.clear();
+        self.error_state.clear();
+        self.page_path = "";
+        self.session_id = "";
+        self.session_timeout_minutes = 20;
+        self.script_timeout_seconds = 90;
+        self.session_abandoned = false;
+        self.session_dirty = false;
+        self.application_locked = false;
+        self.application_lock_depth = 0;
+        self.application_process_lock = -1;
+        self.application_dirty = false;
+        self.access_query_cache.dispose();
+        self.access_query_cache = new collections.Map<String, String>();
+        self.started_ms = 0;
+        self.compiled_page_root = new CompiledPageRoot();
+        self.compiled_page_depth = 0;
+        self.compiled_page_root_0 = new CompiledPageRoot();
+        self.compiled_page_root_1 = new CompiledPageRoot();
+        self.compiled_page_root_2 = new CompiledPageRoot();
+        self.compiled_page_root_3 = new CompiledPageRoot();
+        self.compiled_page_root_4 = new CompiledPageRoot();
+        self.compiled_page_root_5 = new CompiledPageRoot();
+        self.compiled_page_root_6 = new CompiledPageRoot();
+        self.compiled_page_root_7 = new CompiledPageRoot();
+    }
+}

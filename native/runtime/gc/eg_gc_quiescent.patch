@@ -1,0 +1,36 @@
+--- a/runtime/core/eg_gc_roots.c
++++ b/runtime/core/eg_gc_roots.c
+@@ -19,7 +19,6 @@
+ }
+ 
+ static eg_gc_obj_t* eg_gc_obj_from_payload_mode(void* p, int conservative) {
+-    (void)conservative;
+     if (!p) return NULL;
+     uintptr_t pv = (uintptr_t)p;
+     uintptr_t minv = __atomic_load_n(&eg_gc_heap_min, __ATOMIC_ACQUIRE);
+@@ -35,7 +34,10 @@
+      * their intrinsic header tags directly instead of linearly scanning a
+      * list that can contain hundreds of thousands of temporary strings.
+      */
+-    if (!__atomic_load_n(&eg_gc_enabled_fast_latch, __ATOMIC_ACQUIRE)) {
++    /* Conservative words may point into unmapped gaps or guard pages inside
++     * the heap address envelope. Never dereference them before membership
++     * validation, even while precise request-owned pointers use the shortcut. */
++    if (!conservative && !__atomic_load_n(&eg_gc_enabled_fast_latch, __ATOMIC_ACQUIRE)) {
+         if (h->magic != EG_GC_MAGIC) return NULL;
+         if (h->self_tag != (((uintptr_t)h) ^ EG_GC_SELF_TAG_KEY)) return NULL;
+         return h;
+--- a/runtime/core/eg_gc.c
++++ b/runtime/core/eg_gc.c
+@@ -1852,6 +1852,11 @@
+ void eg_gc_dispose_safepoint(void) {
+     eg_gc_refresh_disabled();
+     if (!eg_gc_enabled) return;
++    /* Request quiescence also disables write barriers and defers allocation
++     * publication. Disposal must not advance an existing collection here.
++     * Keep freed-byte/event counters intact for a safepoint after leave. */
++    if (!__atomic_load_n(&eg_gc_enabled_fast_latch, __ATOMIC_ACQUIRE)) return;
++
+     if (eg_gc_in_finalizer) return;
+ 
+     uint64_t freed = __atomic_exchange_n(&eg_gc_dispose_freed_bytes, 0, __ATOMIC_ACQ_REL);

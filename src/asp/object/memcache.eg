@@ -1,0 +1,336 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.object;
+
+use asp;
+use asp.runtime;
+use asp.vm;
+
+use collections;
+use net.memcache;
+use protocol.memcache;
+use std;
+use strconv;
+use strings;
+
+// RuntimeObject fields hold Memcache configuration only; ObjectSpace owns the
+// live connection keyed by obj_id. Every command checks that ownership and
+// translates protocol failures into the component's VBScript error surface.
+func memcache_timeout(obj: asp.vm.RuntimeObject) -> Int {
+    return obj.cursor > 0 ? obj.cursor : 5000;
+}
+
+func memcache_protocol_mode(name: String) -> protocol.memcache.ProtocolMode {
+    let mode: String = strings.to_lower_ascii(strings.trim_space(name));
+    if mode == "binary" {
+        return protocol.memcache.MEMCACHE_BINARY;
+    }
+    if mode == "meta" {
+        return protocol.memcache.MEMCACHE_META;
+    }
+    return protocol.memcache.MEMCACHE_TEXT;
+}
+
+func memcache_protocol_name(obj: asp.vm.RuntimeObject) -> String {
+    let mode: String = strings.to_lower_ascii(strings.trim_space(obj.class_name));
+    return mode == "binary" || mode == "meta" ? mode : "text";
+}
+
+func memcache_config(obj: asp.vm.RuntimeObject) -> protocol.memcache.Config {
+    let cfg: protocol.memcache.Config = new protocol.memcache.Config();
+    cfg.host = std.len(obj.text_value) > 0 ? obj.text_value : "127.0.0.1";
+    cfg.port = obj.int_value > 0 ? obj.int_value : 11211;
+    cfg.protocol_mode = memcache_protocol_mode(obj.class_name);
+    cfg.timeout_ms = memcache_timeout(obj);
+    cfg.read_timeout_ms = cfg.timeout_ms;
+    cfg.write_timeout_ms = cfg.timeout_ms;
+    cfg.use_tls = obj.transaction_active;
+    cfg.tls_verify = obj.lock_type >= 0;
+    cfg.tls_ca_file = obj.transaction_backup_path;
+    return cfg;
+}
+
+func memcache_raise_error(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj: asp.vm.RuntimeObject, operation: String, err: ErrCode) -> Void {
+    evaluator.raise_runtime_error(ctx, 13000 + (err => Int), operation + " failed with Memcache error " + strconv.itoa(err => Int), obj.prog_id);
+}
+
+func memcache_require_open(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject, operation: String) -> Bool {
+    if obj.opened && ctx.objects.has_memcache_connection(obj_id) {
+        return true;
+    }
+    evaluator.raise_runtime_error(ctx, 91, operation + " requires an open Memcache connection", obj.prog_id);
+    return false;
+}
+
+func memcache_open(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject, values: collections.Vector<asp.runtime.Variant>) -> asp.runtime.Variant {
+    if values.len() > 0 {
+        obj.text_value = values.get(0).to_output_string();
+    }
+    if values.len() > 1 {
+        obj.int_value = asp.variant_to_int(values.get(1));
+    }
+    if values.len() > 2 {
+        obj.cursor = asp.variant_to_int(values.get(2));
+    }
+    ctx.objects.close_memcache_connection(obj_id);
+    let conn, err = net.memcache.connect(memcache_config(obj));
+    if err != std.OK {
+        memcache_raise_error(evaluator, ctx, obj, "Open", err);
+        return asp.runtime.variant_empty();
+    }
+    ctx.objects.put_memcache_connection(obj_id, conn);
+    obj.opened = true;
+    evaluator.set_object(ctx, obj_id, obj);
+    return asp.runtime.variant_empty();
+}
+
+func memcache_get(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject, key: String, with_cas: Bool) -> asp.runtime.Variant {
+    if !memcache_require_open(evaluator, ctx, obj_id, obj, with_cas ? "Gets" : "Get") {
+        return asp.runtime.variant_empty();
+    }
+    let conn: net.memcache.Conn = ctx.objects.take_memcache_connection(obj_id);
+    let item, err = with_cas ? conn.gets(key) : conn.get(key);
+    ctx.objects.put_memcache_connection(obj_id, conn);
+    if err == std.ERR_NOT_FOUND {
+        obj.auxiliary_int = 0;
+        obj.native_rows_handle = 0;
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_null();
+    }
+    if err != std.OK {
+        memcache_raise_error(evaluator, ctx, obj, with_cas ? "Gets" : "Get", err);
+        return asp.runtime.variant_empty();
+    }
+    obj.auxiliary_int = item.flags;
+    obj.native_rows_handle = item.cas => Int;
+    evaluator.set_object(ctx, obj_id, obj);
+    return asp.runtime.variant_string(item.value);
+}
+
+// Shared implementation for set/add/replace/append/prepend. Expiry, flags, and
+// payload remain separate typed protocol fields.
+func memcache_storage(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject, operation: String, values: collections.Vector<asp.runtime.Variant>) -> asp.runtime.Variant {
+    if values.len() < 2 {
+        evaluator.raise_runtime_error(ctx, 450, operation + " requires key and value", obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    if !memcache_require_open(evaluator, ctx, obj_id, obj, operation) {
+        return asp.runtime.variant_empty();
+    }
+    let key: String = values.get(0).to_output_string();
+    let value: String = values.get(1).to_output_string();
+    let flags: Int = values.len() > 2 ? asp.variant_to_int(values.get(2)) : 0;
+    let ttl: Int = values.len() > 3 ? asp.variant_to_int(values.get(3)) : 0;
+    let conn: net.memcache.Conn = ctx.objects.take_memcache_connection(obj_id);
+    let err: ErrCode = operation == "Set" ? conn.set(key, value, flags, ttl)
+        : (operation == "Add" ? conn.add(key, value, flags, ttl)
+        : (operation == "Replace" ? conn.replace(key, value, flags, ttl)
+        : (operation == "Append" ? conn.append(key, value) : conn.prepend(key, value))));
+    ctx.objects.put_memcache_connection(obj_id, conn);
+    if err != std.OK {
+        memcache_raise_error(evaluator, ctx, obj, operation, err);
+        return asp.runtime.variant_bool(false);
+    }
+    return asp.runtime.variant_bool(true);
+}
+
+func memcache_simple_mutation(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject, operation: String, values: collections.Vector<asp.runtime.Variant>) -> asp.runtime.Variant {
+    if values.len() < 1 || ((operation == "Touch" || operation == "Incr" || operation == "Decr") && values.len() < 2) {
+        evaluator.raise_runtime_error(ctx, 450, operation + " has missing arguments", obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    if !memcache_require_open(evaluator, ctx, obj_id, obj, operation) {
+        return asp.runtime.variant_empty();
+    }
+    let key: String = values.get(0).to_output_string();
+    let conn: net.memcache.Conn = ctx.objects.take_memcache_connection(obj_id);
+    let err: ErrCode = std.OK;
+    let number: UInt64 = 0;
+    if operation == "Delete" {
+        err = conn.delete(key);
+    } else if operation == "Touch" {
+        err = conn.touch(key, asp.variant_to_int(values.get(1)));
+    } else if operation == "Incr" {
+        number, err = conn.incr(key, asp.variant_to_int(values.get(1)) => UInt64);
+    } else {
+        number, err = conn.decr(key, asp.variant_to_int(values.get(1)) => UInt64);
+    }
+    ctx.objects.put_memcache_connection(obj_id, conn);
+    if err != std.OK {
+        memcache_raise_error(evaluator, ctx, obj, operation, err);
+        return asp.runtime.variant_empty();
+    }
+    if operation == "Incr" || operation == "Decr" {
+        return asp.runtime.variant_int(number => Int);
+    }
+    return asp.runtime.variant_bool(true);
+}
+
+func memcache_cas(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject, values: collections.Vector<asp.runtime.Variant>) -> asp.runtime.Variant {
+    if values.len() < 3 {
+        evaluator.raise_runtime_error(ctx, 450, "CAS requires key, value, and CAS token", obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    if !memcache_require_open(evaluator, ctx, obj_id, obj, "CAS") {
+        return asp.runtime.variant_empty();
+    }
+    let flags: Int = values.len() > 3 ? asp.variant_to_int(values.get(3)) : 0;
+    let ttl: Int = values.len() > 4 ? asp.variant_to_int(values.get(4)) : 0;
+    let conn: net.memcache.Conn = ctx.objects.take_memcache_connection(obj_id);
+    let err: ErrCode = conn.cas(values.get(0).to_output_string(), values.get(1).to_output_string(), flags, ttl, asp.variant_to_int(values.get(2)) => UInt64);
+    ctx.objects.put_memcache_connection(obj_id, conn);
+    if err != std.OK {
+        memcache_raise_error(evaluator, ctx, obj, "CAS", err);
+        return asp.runtime.variant_bool(false);
+    }
+    return asp.runtime.variant_bool(true);
+}
+
+func memcache_stats(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject, section: String) -> asp.runtime.Variant {
+    if !memcache_require_open(evaluator, ctx, obj_id, obj, "Stats") {
+        return asp.runtime.variant_empty();
+    }
+    let conn: net.memcache.Conn = ctx.objects.take_memcache_connection(obj_id);
+    let stats, err = conn.stats(section);
+    ctx.objects.put_memcache_connection(obj_id, conn);
+    if err != std.OK {
+        memcache_raise_error(evaluator, ctx, obj, "Stats", err);
+        return asp.runtime.variant_empty();
+    }
+    let result_id: Int = ctx.objects.create_component("OpenASP.JSON.Object");
+    let result: asp.vm.RuntimeObject = ctx.objects.get(result_id);
+    let keys: collections.Vector<String> = stats.keys();
+    let i: Int = 0;
+    loop i < keys.len() {
+        let key: String = keys.get(i);
+        _ = result.items.push(asp.runtime.variant_string(key));
+        _ = result.items.push(asp.runtime.variant_string(stats.get(key)));
+        i += 1;
+    }
+    evaluator.set_object(ctx, result_id, result);
+    return asp.runtime.variant_object(result_id);
+}
+
+func memcache_version_or_flush(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject, operation: String, delay: Int = 0) -> asp.runtime.Variant {
+    if !memcache_require_open(evaluator, ctx, obj_id, obj, operation) {
+        return asp.runtime.variant_empty();
+    }
+    let conn: net.memcache.Conn = ctx.objects.take_memcache_connection(obj_id);
+    let err: ErrCode = std.OK;
+    let version: String = "";
+    if operation == "Version" {
+        version, err = conn.version();
+    } else {
+        err = conn.flush_all(delay);
+    }
+    ctx.objects.put_memcache_connection(obj_id, conn);
+    if err != std.OK {
+        memcache_raise_error(evaluator, ctx, obj, operation, err);
+        return asp.runtime.variant_empty();
+    }
+    return operation == "Version" ? asp.runtime.variant_string(version) : asp.runtime.variant_bool(true);
+}
+
+// Case-insensitive COM-style dispatcher. Configuration setters affect the next
+// connection; active socket ownership remains exclusively in ObjectSpace.
+func invoke_memcache(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    let name: String = strings.to_lower_ascii(member);
+    if name == "open" || name == "connect" {
+        return memcache_open(evaluator, ctx, obj_id, obj, values);
+    }
+    if name == "close" {
+        ctx.objects.close_memcache_connection(obj_id);
+        obj.opened = false;
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if name == "get" || name == "gets" {
+        if values.len() < 1 {
+            evaluator.raise_runtime_error(ctx, 450, member + " requires a key", obj.prog_id);
+            return asp.runtime.variant_empty();
+        }
+        return memcache_get(evaluator, ctx, obj_id, obj, values.get(0).to_output_string(), name == "gets");
+    }
+    if name == "set" || name == "add" || name == "replace" || name == "append" || name == "prepend" {
+        let operation: String = name == "set" ? "Set" : (name == "add" ? "Add" : (name == "replace" ? "Replace" : (name == "append" ? "Append" : "Prepend")));
+        return memcache_storage(evaluator, ctx, obj_id, obj, operation, values);
+    }
+    if name == "delete" || name == "touch" || name == "incr" || name == "decr" {
+        let operation: String = name == "delete" ? "Delete" : (name == "touch" ? "Touch" : (name == "incr" ? "Incr" : "Decr"));
+        return memcache_simple_mutation(evaluator, ctx, obj_id, obj, operation, values);
+    }
+    if name == "cas" {
+        return memcache_cas(evaluator, ctx, obj_id, obj, values);
+    }
+    if name == "stats" {
+        return memcache_stats(evaluator, ctx, obj_id, obj, values.len() > 0 ? values.get(0).to_output_string() : "");
+    }
+    if name == "version" {
+        return memcache_version_or_flush(evaluator, ctx, obj_id, obj, "Version");
+    }
+    if name == "flushall" {
+        return memcache_version_or_flush(evaluator, ctx, obj_id, obj, "FlushAll", values.len() > 0 ? asp.variant_to_int(values.get(0)) : 0);
+    }
+    if name == "state" {
+        return asp.runtime.variant_int(obj.opened && ctx.objects.has_memcache_connection(obj_id) ? 1 : 0);
+    }
+    if name == "lastflags" {
+        return asp.runtime.variant_int(obj.auxiliary_int);
+    }
+    if name == "lastcas" {
+        return asp.runtime.variant_int(obj.native_rows_handle);
+    }
+    if name == "host" || name == "port" || name == "timeout" || name == "protocol" || name == "tls" || name == "tlsverify" || name == "cafile" {
+        if is_set && values.len() > 0 {
+            if obj.opened {
+                evaluator.raise_runtime_error(ctx, 5, "cannot change Memcache connection settings while open", obj.prog_id);
+                return asp.runtime.variant_empty();
+            }
+            if name == "host" {
+                obj.text_value = values.get(values.len() - 1).to_output_string();
+            } else if name == "port" {
+                obj.int_value = asp.variant_to_int(values.get(values.len() - 1));
+            } else if name == "timeout" {
+                obj.cursor = asp.variant_to_int(values.get(values.len() - 1));
+            } else if name == "protocol" {
+                let mode: String = strings.to_lower_ascii(values.get(values.len() - 1).to_output_string());
+                if mode != "text" && mode != "meta" && mode != "binary" {
+                    evaluator.raise_runtime_error(ctx, 5, "Protocol must be text, meta, or binary", obj.prog_id);
+                    return asp.runtime.variant_empty();
+                }
+                obj.class_name = mode;
+            } else if name == "tls" {
+                obj.transaction_active = asp.variant_to_int(values.get(values.len() - 1)) != 0;
+            } else if name == "tlsverify" {
+                obj.lock_type = asp.variant_to_int(values.get(values.len() - 1)) == 0 ? -1 : 1;
+            } else {
+                obj.transaction_backup_path = values.get(values.len() - 1).to_output_string();
+            }
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        if name == "host" {
+            return asp.runtime.variant_string(std.len(obj.text_value) > 0 ? obj.text_value : "127.0.0.1");
+        }
+        if name == "port" {
+            return asp.runtime.variant_int(obj.int_value > 0 ? obj.int_value : 11211);
+        }
+        if name == "timeout" {
+            return asp.runtime.variant_int(memcache_timeout(obj));
+        }
+        if name == "protocol" {
+            return asp.runtime.variant_string(memcache_protocol_name(obj));
+        }
+        if name == "tls" {
+            return asp.runtime.variant_bool(obj.transaction_active);
+        }
+        if name == "tlsverify" {
+            return asp.runtime.variant_bool(obj.lock_type >= 0);
+        }
+        return asp.runtime.variant_string(obj.transaction_backup_path);
+    }
+    evaluator.raise_runtime_error(ctx, 438, "Memcache member not found or has invalid arguments: " + member, obj.prog_id);
+    return asp.runtime.variant_empty();
+}

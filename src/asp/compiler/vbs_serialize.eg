@@ -1,0 +1,797 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.compiler;
+
+use asp.runtime;
+
+use asp;
+use std;
+use strings;
+use strconv;
+use collections;
+use time;
+
+extern func __object_is_null(obj: Any) -> Int;
+extern func eg_asp_pack_expr(kind: Int, text: String, value: Int, boolean: Int, left: Int, right: Int, args: String) -> String;
+extern func eg_asp_pack_stmt(kind: Int, names: String, exprs: String, target: Int, target_name: String, target_args: String, value: Int, extra: Int, extra2: Int, call_name: String, call_args: String, condition: Int, then_block: Int, else_block: Int, body: Int, cases: String, routine: Int, cls: Int, boolean: Int) -> String;
+
+// The cache wire format is count-prefixed and length-prefixed:
+//     <count>:<len>:<bytes><len>:<bytes>...
+// Lengths are byte counts, so embedded colons, NULs, and non-ASCII text are
+// unambiguous. Integer vectors reuse the same framing for one parser.
+func pack_int_parts(values: collections.Vector<Int>) -> String {
+    if values.len() == 0 {
+        return "0:";
+    }
+    let builder: std.StringBuilder = new std.StringBuilder(values.len() * 8 + 16);
+    _ = builder.append(strconv.itoa(values.len()));
+    _ = builder.append(":");
+    let i: Int = 0;
+    loop i < values.len() {
+        let value: String = strconv.itoa(values.get(i));
+        _ = builder.append(strconv.itoa(std.len(value)));
+        _ = builder.append(":");
+        _ = builder.append(value);
+        i += 1;
+    }
+    let out: String = builder.to_string();
+    _ = builder.free();
+    return out;
+}
+
+// Parses decimal bytes in place and avoids allocating a substring for every
+// length or integer field in a large cached program.
+func parse_decimal_range(text: String, start: Int, length: Int) -> Int {
+    return asp.runtime.parse_packed_decimal(text, start, length);
+}
+
+// Range decoders operate inside a parent field. Every computed end is checked
+// before slicing, making malformed cache data produce a partial/empty value
+// rather than an out-of-bounds read.
+func unpack_int_parts_range(text: String, range_start: Int, range_length: Int) -> collections.Vector<Int> {
+    let values: collections.Vector<Int> = new collections.Vector<Int>();
+    let range_end: Int = range_start + range_length;
+    let first_colon: Int = strings.find_substr_from(text, ":", range_start);
+    if first_colon <= range_start || first_colon >= range_end {
+        return values;
+    }
+    let count: Int = parse_decimal_range(text, range_start, first_colon - range_start);
+    values.reserve(count);
+    let pos: Int = first_colon + 1;
+    let i: Int = 0;
+    loop i < count && pos < range_end {
+        let next_colon: Int = strings.find_substr_from(text, ":", pos);
+        if next_colon < pos || next_colon >= range_end {
+            break;
+        }
+        let part_len: Int = parse_decimal_range(text, pos, next_colon - pos);
+        let start: Int = next_colon + 1;
+        if part_len < 0 || start + part_len > range_end {
+            break;
+        }
+        _ = values.push(parse_decimal_range(text, start, part_len));
+        pos = start + part_len;
+        i += 1;
+    }
+    return values;
+}
+
+func unpack_int_parts(text: String) -> collections.Vector<Int> {
+    return unpack_int_parts_range(text, 0, std.len(text));
+}
+
+func unpack_string_parts_range(text: String, range_start: Int, range_length: Int) -> collections.Vector<String> {
+    let values: collections.Vector<String> = new collections.Vector<String>();
+    let range_end: Int = range_start + range_length;
+    let first_colon: Int = strings.find_substr_from(text, ":", range_start);
+    if first_colon <= range_start || first_colon >= range_end {
+        return values;
+    }
+    let count: Int = parse_decimal_range(text, range_start, first_colon - range_start);
+    values.reserve(count);
+    let pos: Int = first_colon + 1;
+    let i: Int = 0;
+    loop i < count && pos < range_end {
+        let next_colon: Int = strings.find_substr_from(text, ":", pos);
+        if next_colon < pos || next_colon >= range_end {
+            break;
+        }
+        let part_len: Int = parse_decimal_range(text, pos, next_colon - pos);
+        let start: Int = next_colon + 1;
+        if part_len < 0 || start + part_len > range_end {
+            break;
+        }
+        _ = values.push(std.substr(text, start, part_len));
+        pos = start + part_len;
+        i += 1;
+    }
+    return values;
+}
+
+// Indexes child fields without copying them. `starts` and `lengths` are
+// parallel output vectors and are populated only in wire order.
+func serialized_part_ranges(text: String, range_start: Int, range_length: Int, starts: collections.Vector<Int>, lengths: collections.Vector<Int>) -> Bool {
+    let range_end: Int = range_start + range_length;
+    if range_start < 0 || range_length < 0 || range_end < range_start || range_end > std.len(text) {
+        return false;
+    }
+    let first_colon: Int = strings.find_substr_from(text, ":", range_start);
+    if first_colon <= range_start || first_colon >= range_end {
+        return false;
+    }
+    let count: Int = parse_decimal_range(text, range_start, first_colon - range_start);
+    if count < 0 || count > 1048576 {
+        return false;
+    }
+    starts.reserve(count);
+    lengths.reserve(count);
+    let pos: Int = first_colon + 1;
+    let i: Int = 0;
+    loop i < count && pos < range_end {
+        let next_colon: Int = strings.find_substr_from(text, ":", pos);
+        if next_colon < pos || next_colon >= range_end {
+            return false;
+        }
+        let part_len: Int = parse_decimal_range(text, pos, next_colon - pos);
+        let start: Int = next_colon + 1;
+        if part_len < 0 || start + part_len < start || start + part_len > range_end {
+            return false;
+        }
+        _ = starts.push(start);
+        _ = lengths.push(part_len);
+        pos = start + part_len;
+        i += 1;
+    }
+    return i == count && pos == range_end;
+}
+
+// Compares a format marker directly against the backing cache string.
+func serialized_part_equals(text: String, start: Int, length: Int, expected: String) -> Bool {
+    if length != std.len(expected) || start < 0 || start + length > std.len(text) {
+        return false;
+    }
+    let i: Int = 0;
+    loop i < length {
+        if std.byte_at(text, start + i) != std.byte_at(expected, i) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+// Node serializers delegate field assembly to C to avoid a chain of managed
+// temporary strings. Deserializers tolerate missing trailing fields so older
+// cache versions can retain constructor defaults.
+func serialize_vbs_expr_node(expr: VbsExprNode) -> String {
+    return eg_asp_pack_expr(expr.kind => Int, expr.text, expr.int_value, expr.bool_value ? 1 : 0, expr.left_id, expr.right_id, pack_int_parts(expr.arg_ids));
+}
+
+func deserialize_vbs_expr_node_range(text: String, range_start: Int, range_length: Int) -> VbsExprNode {
+    let expr: VbsExprNode = new VbsExprNode();
+    let range_end: Int = range_start + range_length;
+    let first_colon: Int = strings.find_substr_from(text, ":", range_start);
+    if first_colon <= range_start || first_colon >= range_end {
+        return expr;
+    }
+    let count: Int = parse_decimal_range(text, range_start, first_colon - range_start);
+    let pos: Int = first_colon + 1;
+    let field: Int = 0;
+    loop field < count && pos < range_end {
+        let next_colon: Int = strings.find_substr_from(text, ":", pos);
+        if next_colon < pos || next_colon >= range_end {
+            break;
+        }
+        let part_len: Int = parse_decimal_range(text, pos, next_colon - pos);
+        let start: Int = next_colon + 1;
+        if part_len < 0 || start + part_len > range_end {
+            break;
+        }
+        if field == 0 {
+            expr.kind = vbs_expr_kind_from_int(parse_decimal_range(text, start, part_len));
+        } else if field == 1 {
+            expr.text = std.substr(text, start, part_len);
+        } else if field == 2 {
+            expr.int_value = parse_decimal_range(text, start, part_len);
+        } else if field == 3 {
+            expr.bool_value = part_len == 1 && std.byte_at(text, start) == '1';
+        } else if field == 4 {
+            expr.left_id = parse_decimal_range(text, start, part_len);
+        } else if field == 5 {
+            expr.right_id = parse_decimal_range(text, start, part_len);
+        } else if field == 6 {
+            let args_colon: Int = strings.find_substr_from(text, ":", start);
+            let arg_count: Int = args_colon > start && args_colon < start + part_len ? parse_decimal_range(text, start, args_colon - start) : 0;
+            if arg_count > 0 {
+                expr.arg_ids = unpack_int_parts_range(text, start, part_len);
+            }
+        }
+        pos = start + part_len;
+        field += 1;
+    }
+    return expr;
+}
+
+func deserialize_vbs_expr_node(text: String) -> VbsExprNode {
+    return deserialize_vbs_expr_node_range(text, 0, std.len(text));
+}
+
+func serialize_vbs_stmt_node(stmt: VbsStmtNode) -> String {
+    return eg_asp_pack_stmt(stmt.kind => Int, asp.runtime.pack_string_parts(stmt.names), pack_int_parts(stmt.expr_ids), stmt.target_expr_id, stmt.target_name, pack_int_parts(stmt.target_arg_ids), stmt.value_expr_id, stmt.extra_expr_id, stmt.extra_expr_id2, stmt.call_name, pack_int_parts(stmt.call_arg_ids), stmt.cond_expr_id, stmt.then_block_id, stmt.else_block_id, stmt.body_block_id, pack_int_parts(stmt.case_clause_ids), stmt.routine_id, stmt.class_id, stmt.bool_value ? 1 : 0);
+}
+
+func deserialize_vbs_stmt_node_range(text: String, range_start: Int, range_length: Int) -> VbsStmtNode {
+    let stmt: VbsStmtNode = new VbsStmtNode();
+    let range_end: Int = range_start + range_length;
+    let first_colon: Int = strings.find_substr_from(text, ":", range_start);
+    if first_colon <= range_start || first_colon >= range_end {
+        return stmt;
+    }
+    let count: Int = parse_decimal_range(text, range_start, first_colon - range_start);
+    let pos: Int = first_colon + 1;
+    let field: Int = 0;
+    loop field < count && pos < range_end {
+        let next_colon: Int = strings.find_substr_from(text, ":", pos);
+        if next_colon < pos || next_colon >= range_end {
+            break;
+        }
+        let part_len: Int = parse_decimal_range(text, pos, next_colon - pos);
+        let start: Int = next_colon + 1;
+        if part_len < 0 || start + part_len > range_end {
+            break;
+        }
+        if field == 0 {
+            stmt.kind = vbs_stmt_kind_from_int(parse_decimal_range(text, start, part_len));
+        } else if field == 1 {
+            stmt.names = unpack_string_parts_range(text, start, part_len);
+        } else if field == 2 {
+            stmt.expr_ids = unpack_int_parts_range(text, start, part_len);
+        } else if field == 3 {
+            stmt.target_expr_id = parse_decimal_range(text, start, part_len);
+        } else if field == 4 {
+            stmt.target_name = std.substr(text, start, part_len);
+        } else if field == 5 {
+            stmt.target_arg_ids = unpack_int_parts_range(text, start, part_len);
+        } else if field == 6 {
+            stmt.value_expr_id = parse_decimal_range(text, start, part_len);
+        } else if field == 7 {
+            stmt.extra_expr_id = parse_decimal_range(text, start, part_len);
+        } else if field == 8 {
+            stmt.extra_expr_id2 = parse_decimal_range(text, start, part_len);
+        } else if field == 9 {
+            stmt.call_name = std.substr(text, start, part_len);
+        } else if field == 10 {
+            stmt.call_arg_ids = unpack_int_parts_range(text, start, part_len);
+        } else if field == 11 {
+            stmt.cond_expr_id = parse_decimal_range(text, start, part_len);
+        } else if field == 12 {
+            stmt.then_block_id = parse_decimal_range(text, start, part_len);
+        } else if field == 13 {
+            stmt.else_block_id = parse_decimal_range(text, start, part_len);
+        } else if field == 14 {
+            stmt.body_block_id = parse_decimal_range(text, start, part_len);
+        } else if field == 15 {
+            stmt.case_clause_ids = unpack_int_parts_range(text, start, part_len);
+        } else if field == 16 {
+            stmt.routine_id = parse_decimal_range(text, start, part_len);
+        } else if field == 17 {
+            stmt.class_id = parse_decimal_range(text, start, part_len);
+        } else if field == 18 {
+            stmt.bool_value = part_len == 1 && std.byte_at(text, start) == '1';
+        }
+        pos = start + part_len;
+        field += 1;
+    }
+    return stmt;
+}
+
+func deserialize_vbs_stmt_node(text: String) -> VbsStmtNode {
+    return deserialize_vbs_stmt_node_range(text, 0, std.len(text));
+}
+
+// Blocks, classes, and case clauses are small metadata records. They use the
+// same framing as nodes so nested vectors remain self-delimiting.
+func serialize_vbs_stmt_block(block: VbsStmtBlock) -> String {
+    return pack_int_parts(block.stmt_ids);
+}
+
+func deserialize_vbs_stmt_block(text: String) -> VbsStmtBlock {
+    let block: VbsStmtBlock = new VbsStmtBlock();
+    block.stmt_ids = unpack_int_parts(text);
+    return block;
+}
+
+func serialize_vbs_class_def(cls: VbsClassDef) -> String {
+    let parts: collections.Vector<String> = new collections.Vector<String>();
+    _ = parts.push(cls.name);
+    _ = parts.push(asp.runtime.pack_string_parts(cls.field_names));
+    _ = parts.push(pack_int_parts(cls.routine_ids));
+    _ = parts.push(asp.runtime.pack_string_parts(cls.field_bound_expr_packs));
+    return asp.runtime.pack_string_parts(parts);
+}
+
+func deserialize_vbs_class_def(text: String) -> VbsClassDef {
+    let cls: VbsClassDef = new VbsClassDef();
+    let parts: collections.Vector<String> = asp.runtime.unpack_string_parts(text);
+    if parts.len() >= 1 {
+        cls.name = parts.get(0);
+    }
+    if parts.len() >= 2 {
+        cls.field_names = asp.runtime.unpack_string_parts(parts.get(1));
+    }
+    if parts.len() >= 3 {
+        cls.routine_ids = unpack_int_parts(parts.get(2));
+    }
+    if parts.len() >= 4 {
+        cls.field_bound_expr_packs = asp.runtime.unpack_string_parts(parts.get(3));
+    }
+    return cls;
+}
+
+func serialize_vbs_case_clause(clause: VbsCaseClause) -> String {
+    let parts: collections.Vector<String> = new collections.Vector<String>();
+    _ = parts.push(pack_int_parts(clause.expr_ids));
+    _ = parts.push(strconv.itoa(clause.block_id));
+    _ = parts.push(clause.is_else ? "1" : "0");
+    return asp.runtime.pack_string_parts(parts);
+}
+
+func deserialize_vbs_case_clause(text: String) -> VbsCaseClause {
+    let clause: VbsCaseClause = new VbsCaseClause();
+    let parts: collections.Vector<String> = asp.runtime.unpack_string_parts(text);
+    if parts.len() >= 1 {
+        clause.expr_ids = unpack_int_parts(parts.get(0));
+    }
+    if parts.len() >= 2 {
+        clause.block_id = strconv.atoi(parts.get(1));
+    }
+    if parts.len() >= 3 {
+        clause.is_else = parts.get(2) == "1";
+    }
+    return clause;
+}
+
+// Rehydrates object-shaped routine metadata from parallel persisted vectors.
+// This is required by compiler analyses; runtime access can remain packed.
+func rebuild_vbs_program_routines(program: VbsProgram) -> Void {
+    program.routines = new collections.Vector<VbsRoutineDef>();
+    program.routine_index = new collections.Map<String, Int>();
+    let i: Int = 0;
+    loop i < program.routine_names.len() {
+        let routine: VbsRoutineDef = new VbsRoutineDef();
+        routine.name = program.routine_names.get(i);
+        routine.owner_class = i < program.routine_owner_classes.len() ? program.routine_owner_classes.get(i) : "";
+        routine.is_function = i < program.routine_is_functions.len() && program.routine_is_functions.get(i) != 0;
+        routine.param_names = i < program.routine_param_names.len() ? asp.runtime.unpack_string_parts(program.routine_param_names.get(i)) : new collections.Vector<String>();
+        let by_ref_parts: collections.Vector<String> = i < program.routine_param_by_refs.len() ? asp.runtime.unpack_string_parts(program.routine_param_by_refs.get(i)) : new collections.Vector<String>();
+        routine.param_by_refs = new collections.Vector<Int>();
+        let j: Int = 0;
+        loop j < by_ref_parts.len() {
+            _ = routine.param_by_refs.push(strconv.atoi(by_ref_parts.get(j)));
+            if strconv.atoi(by_ref_parts.get(j)) != 0 {
+                routine.has_by_ref = true;
+            }
+            j += 1;
+        }
+        routine.block_id = i < program.routine_block_ids.len() ? program.routine_block_ids.get(i) : -1;
+        routine.writes_param_mask = i < program.routine_writes_param_masks.len() ? program.routine_writes_param_masks.get(i) : 0;
+        _ = program.routines.push(routine);
+        i += 1;
+    }
+    program.bind_static_routine_ids();
+    program.refresh_routine_metadata();
+}
+
+// Appends one framed field. Callers own the outer count and field order.
+func append_serialized_part(builder: std.StringBuilder, value: String) -> Void {
+    _ = builder.append(strconv.itoa(std.len(value)));
+    _ = builder.append(":");
+    _ = builder.append(value);
+}
+
+// The following packers preserve table IDs by serializing entries in vector
+// order. Reordering would invalidate every cross-reference in the program.
+func pack_vbs_expr_nodes(program: VbsProgram) -> String {
+    let builder: std.StringBuilder = new std.StringBuilder(program.exprs.len() * 64 + 16);
+    _ = builder.append(strconv.itoa(program.exprs.len()));
+    _ = builder.append(":");
+    let i: Int = 0;
+    loop i < program.exprs.len() {
+        append_serialized_part(builder, serialize_vbs_expr_node(program.get_expr(i)));
+        i += 1;
+    }
+    let out: String = builder.to_string();
+    _ = builder.free();
+    return out;
+}
+
+func pack_vbs_stmt_nodes(program: VbsProgram) -> String {
+    let builder: std.StringBuilder = new std.StringBuilder(program.stmts.len() * 96 + 16);
+    _ = builder.append(strconv.itoa(program.stmts.len()));
+    _ = builder.append(":");
+    let i: Int = 0;
+    loop i < program.stmts.len() {
+        append_serialized_part(builder, serialize_vbs_stmt_node(program.get_stmt(i)));
+        i += 1;
+    }
+    let out: String = builder.to_string();
+    _ = builder.free();
+    return out;
+}
+
+func pack_vbs_stmt_blocks(program: VbsProgram) -> String {
+    let builder: std.StringBuilder = new std.StringBuilder(program.blocks.len() * 32 + 16);
+    _ = builder.append(strconv.itoa(program.blocks.len()));
+    _ = builder.append(":");
+    let i: Int = 0;
+    loop i < program.blocks.len() {
+        append_serialized_part(builder, serialize_vbs_stmt_block(program.blocks.get(i)));
+        i += 1;
+    }
+    let out: String = builder.to_string();
+    _ = builder.free();
+    return out;
+}
+
+func pack_vbs_classes(program: VbsProgram) -> String {
+    let builder: std.StringBuilder = new std.StringBuilder(program.classes.len() * 64 + 16);
+    _ = builder.append(strconv.itoa(program.classes.len()));
+    _ = builder.append(":");
+    let i: Int = 0;
+    loop i < program.classes.len() {
+        append_serialized_part(builder, serialize_vbs_class_def(program.classes.get(i)));
+        i += 1;
+    }
+    let out: String = builder.to_string();
+    _ = builder.free();
+    return out;
+}
+
+func pack_vbs_case_clauses(program: VbsProgram) -> String {
+    let builder: std.StringBuilder = new std.StringBuilder(program.case_clauses.len() * 32 + 16);
+    _ = builder.append(strconv.itoa(program.case_clauses.len()));
+    _ = builder.append(":");
+    let i: Int = 0;
+    loop i < program.case_clauses.len() {
+        append_serialized_part(builder, serialize_vbs_case_clause(program.case_clauses.get(i)));
+        i += 1;
+    }
+    let out: String = builder.to_string();
+    _ = builder.free();
+    return out;
+}
+
+// Writes the complete versioned cache payload. Version 3 adds routine write
+// masks; deserialization retains compatibility with version 2.
+func serialize_vbs_program(program: VbsProgram) -> String {
+    let builder: std.StringBuilder = new std.StringBuilder(1048576);
+    _ = builder.append("17:");
+    append_serialized_part(builder, "vbsprog3");
+    // Runtime bytecode never reads the original source. Persisting it duplicates
+    // the full preprocessed page and inflates both cache I/O and retained heap.
+    append_serialized_part(builder, "");
+    append_serialized_part(builder, strconv.itoa(program.root_block_id));
+    append_serialized_part(builder, strconv.itoa(program.root_expr_id));
+    append_serialized_part(builder, pack_vbs_expr_nodes(program));
+    append_serialized_part(builder, pack_vbs_stmt_nodes(program));
+    append_serialized_part(builder, pack_vbs_stmt_blocks(program));
+    append_serialized_part(builder, asp.runtime.pack_string_parts(program.routine_names));
+    append_serialized_part(builder, asp.runtime.pack_string_parts(program.routine_owner_classes));
+    append_serialized_part(builder, pack_int_parts(program.routine_is_functions));
+    append_serialized_part(builder, asp.runtime.pack_string_parts(program.routine_param_names));
+    append_serialized_part(builder, asp.runtime.pack_string_parts(program.routine_param_by_refs));
+    append_serialized_part(builder, pack_int_parts(program.routine_block_ids));
+    append_serialized_part(builder, pack_int_parts(program.routine_writes_param_masks));
+    append_serialized_part(builder, pack_vbs_classes(program));
+    append_serialized_part(builder, pack_vbs_case_clauses(program));
+    append_serialized_part(builder, asp.runtime.pack_string_parts(program.errors));
+    let out: String = builder.to_string();
+    _ = builder.free();
+    return out;
+}
+
+// Compatibility loader that owns copied substrings. It is simple and useful
+// when the source buffer cannot outlive the returned program.
+func deserialize_vbs_program_copying(text: String) -> VbsProgram {
+    let program: VbsProgram = new VbsProgram();
+    let parts: collections.Vector<String> = asp.runtime.unpack_string_parts(text);
+    if parts.len() < 1 || (parts.get(0) != "vbsprog2" && parts.get(0) != "vbsprog3") {
+        _ = program.add_error("invalid serialized VbsProgram");
+        return program;
+    }
+    if parts.len() >= 2 {
+        program.source_text = parts.get(1);
+    }
+    if parts.len() >= 3 {
+        program.root_block_id = strconv.atoi(parts.get(2));
+    }
+    if parts.len() >= 4 {
+        program.root_expr_id = strconv.atoi(parts.get(3));
+    }
+    if parts.len() >= 5 {
+        let packed_exprs: String = parts.get(4);
+        program.packed_exprs = packed_exprs;
+        let first_colon: Int = strings.find_substr(packed_exprs, ":");
+        let count: Int = first_colon > 0 ? parse_decimal_range(packed_exprs, 0, first_colon) : 0;
+        program.exprs.reserve(count);
+        program.expr_starts.reserve(count);
+        program.expr_lengths.reserve(count);
+        program.expr_decoded.reserve(count);
+        program.expr_arg_packs.reserve(count);
+        let pos: Int = first_colon + 1;
+        let i: Int = 0;
+        let undecoded_expr: VbsExprNode = new VbsExprNode();
+        loop i < count && pos < std.len(packed_exprs) {
+            let next_colon: Int = strings.find_substr_from(packed_exprs, ":", pos);
+            if next_colon < pos {
+                break;
+            }
+            let part_len: Int = parse_decimal_range(packed_exprs, pos, next_colon - pos);
+            let start: Int = next_colon + 1;
+            if part_len < 0 || start + part_len > std.len(packed_exprs) {
+                break;
+            }
+            _ = program.exprs.push(undecoded_expr);
+            _ = program.expr_starts.push(start);
+            _ = program.expr_lengths.push(part_len);
+            _ = program.expr_decoded.push(0);
+            _ = program.expr_arg_packs.push("");
+            pos = start + part_len;
+            i += 1;
+        }
+    }
+    if parts.len() >= 6 {
+        let packed_stmts: String = parts.get(5);
+        program.packed_stmts = packed_stmts;
+        let first_colon: Int = strings.find_substr(packed_stmts, ":");
+        let count: Int = first_colon > 0 ? parse_decimal_range(packed_stmts, 0, first_colon) : 0;
+        program.stmts.reserve(count);
+        program.stmt_starts.reserve(count);
+        program.stmt_lengths.reserve(count);
+        program.stmt_decoded.reserve(count);
+        program.stmt_target_arg_packs.reserve(count);
+        program.stmt_call_arg_packs.reserve(count);
+        let pos: Int = first_colon + 1;
+        let i: Int = 0;
+        let undecoded_stmt: VbsStmtNode = new VbsStmtNode();
+        loop i < count && pos < std.len(packed_stmts) {
+            let next_colon: Int = strings.find_substr_from(packed_stmts, ":", pos);
+            if next_colon < pos {
+                break;
+            }
+            let part_len: Int = parse_decimal_range(packed_stmts, pos, next_colon - pos);
+            let start: Int = next_colon + 1;
+            if part_len < 0 || start + part_len > std.len(packed_stmts) {
+                break;
+            }
+            _ = program.stmts.push(undecoded_stmt);
+            _ = program.stmt_starts.push(start);
+            _ = program.stmt_lengths.push(part_len);
+            _ = program.stmt_decoded.push(0);
+            _ = program.stmt_target_arg_packs.push("");
+            _ = program.stmt_call_arg_packs.push("");
+            pos = start + part_len;
+            i += 1;
+        }
+    }
+    if parts.len() >= 7 {
+        let block_parts: collections.Vector<String> = asp.runtime.unpack_string_parts(parts.get(6));
+        let i: Int = 0;
+        loop i < block_parts.len() {
+            _ = program.blocks.push(deserialize_vbs_stmt_block(block_parts.get(i)));
+            i += 1;
+        }
+    }
+    if parts.len() >= 8 {
+        program.routine_names = asp.runtime.unpack_string_parts(parts.get(7));
+    }
+    if parts.len() >= 9 {
+        program.routine_owner_classes = asp.runtime.unpack_string_parts(parts.get(8));
+    }
+    if parts.len() >= 10 {
+        program.routine_is_functions = unpack_int_parts(parts.get(9));
+    }
+    if parts.len() >= 11 {
+        program.routine_param_names = asp.runtime.unpack_string_parts(parts.get(10));
+    }
+    if parts.len() >= 12 {
+        program.routine_param_by_refs = asp.runtime.unpack_string_parts(parts.get(11));
+    }
+    if parts.len() >= 13 {
+        program.routine_block_ids = unpack_int_parts(parts.get(12));
+    }
+    if parts.len() >= 14 {
+        if parts.get(0) == "vbsprog3" {
+            program.routine_writes_param_masks = unpack_int_parts(parts.get(13));
+        }
+    }
+    let class_parts_index: Int = parts.get(0) == "vbsprog3" ? 14 : 13;
+    if parts.len() > class_parts_index {
+        let class_parts: collections.Vector<String> = asp.runtime.unpack_string_parts(parts.get(class_parts_index));
+        let i: Int = 0;
+        loop i < class_parts.len() {
+            _ = program.classes.push(deserialize_vbs_class_def(class_parts.get(i)));
+            i += 1;
+        }
+    }
+    let clause_parts_index: Int = class_parts_index + 1;
+    if parts.len() > clause_parts_index {
+        let clause_parts: collections.Vector<String> = asp.runtime.unpack_string_parts(parts.get(clause_parts_index));
+        let i: Int = 0;
+        loop i < clause_parts.len() {
+            _ = program.case_clauses.push(deserialize_vbs_case_clause(clause_parts.get(i)));
+            i += 1;
+        }
+    }
+    let errors_index: Int = clause_parts_index + 1;
+    if parts.len() > errors_index {
+        program.errors = asp.runtime.unpack_string_parts(parts.get(errors_index));
+    }
+    rebuild_vbs_program_routines(program);
+    return program;
+}
+
+// Materializes one indexed child field when a component actually requires a
+// managed String.
+func serialized_part_text(text: String, starts: collections.Vector<Int>, lengths: collections.Vector<Int>, index: Int) -> String {
+    if index < 0 || index >= starts.len() || index >= lengths.len() {
+        return "";
+    }
+    return std.substr(text, starts.get(index), lengths.get(index));
+}
+
+// Preferred loader for resident cache buffers. Expression and statement slots
+// begin as shared placeholders; their byte ranges point into `text` and are
+// decoded on first access. The backing string must therefore outlive program.
+func deserialize_vbs_program_range(text: String, range_start: Int, range_length: Int) -> VbsProgram {
+    let program: VbsProgram = new VbsProgram();
+    let starts: collections.Vector<Int> = new collections.Vector<Int>();
+    let lengths: collections.Vector<Int> = new collections.Vector<Int>();
+    if !serialized_part_ranges(text, range_start, range_length, starts, lengths) || starts.len() < 1 {
+        _ = program.add_error("invalid serialized VbsProgram");
+        return program;
+    }
+    let version3: Bool = serialized_part_equals(text, starts.get(0), lengths.get(0), "vbsprog3");
+    if !version3 && !serialized_part_equals(text, starts.get(0), lengths.get(0), "vbsprog2") {
+        _ = program.add_error("invalid serialized VbsProgram");
+        return program;
+    }
+    if starts.len() >= 2 {
+        program.source_text = serialized_part_text(text, starts, lengths, 1);
+    }
+    if starts.len() >= 3 {
+        program.root_block_id = parse_decimal_range(text, starts.get(2), lengths.get(2));
+    }
+    if starts.len() >= 4 {
+        program.root_expr_id = parse_decimal_range(text, starts.get(3), lengths.get(3));
+    }
+    if starts.len() >= 5 {
+        let packed_start: Int = starts.get(4);
+        let packed_length: Int = lengths.get(4);
+        let packed_end: Int = packed_start + packed_length;
+        program.packed_exprs = text;
+        let first_colon: Int = strings.find_substr_from(text, ":", packed_start);
+        let count: Int = first_colon > packed_start && first_colon < packed_end ? parse_decimal_range(text, packed_start, first_colon - packed_start) : 0;
+        program.exprs.reserve(count);
+        program.expr_starts.reserve(count);
+        program.expr_lengths.reserve(count);
+        program.expr_decoded.reserve(count);
+        program.expr_arg_packs.reserve(count);
+        let pos: Int = first_colon + 1;
+        let i: Int = 0;
+        let undecoded_expr: VbsExprNode = new VbsExprNode();
+        loop i < count && pos < packed_end {
+            let next_colon: Int = strings.find_substr_from(text, ":", pos);
+            if next_colon < pos || next_colon >= packed_end {
+                break;
+            }
+            let part_len: Int = parse_decimal_range(text, pos, next_colon - pos);
+            let start: Int = next_colon + 1;
+            if part_len < 0 || start + part_len > packed_end {
+                break;
+            }
+            _ = program.exprs.push(undecoded_expr);
+            _ = program.expr_starts.push(start);
+            _ = program.expr_lengths.push(part_len);
+            _ = program.expr_decoded.push(0);
+            _ = program.expr_arg_packs.push("");
+            pos = start + part_len;
+            i += 1;
+        }
+    }
+    if starts.len() >= 6 {
+        let packed_start: Int = starts.get(5);
+        let packed_length: Int = lengths.get(5);
+        let packed_end: Int = packed_start + packed_length;
+        program.packed_stmts = text;
+        let first_colon: Int = strings.find_substr_from(text, ":", packed_start);
+        let count: Int = first_colon > packed_start && first_colon < packed_end ? parse_decimal_range(text, packed_start, first_colon - packed_start) : 0;
+        program.stmts.reserve(count);
+        program.stmt_starts.reserve(count);
+        program.stmt_lengths.reserve(count);
+        program.stmt_decoded.reserve(count);
+        program.stmt_target_arg_packs.reserve(count);
+        program.stmt_call_arg_packs.reserve(count);
+        let pos: Int = first_colon + 1;
+        let i: Int = 0;
+        let undecoded_stmt: VbsStmtNode = new VbsStmtNode();
+        loop i < count && pos < packed_end {
+            let next_colon: Int = strings.find_substr_from(text, ":", pos);
+            if next_colon < pos || next_colon >= packed_end {
+                break;
+            }
+            let part_len: Int = parse_decimal_range(text, pos, next_colon - pos);
+            let start: Int = next_colon + 1;
+            if part_len < 0 || start + part_len > packed_end {
+                break;
+            }
+            _ = program.stmts.push(undecoded_stmt);
+            _ = program.stmt_starts.push(start);
+            _ = program.stmt_lengths.push(part_len);
+            _ = program.stmt_decoded.push(0);
+            _ = program.stmt_target_arg_packs.push("");
+            _ = program.stmt_call_arg_packs.push("");
+            pos = start + part_len;
+            i += 1;
+        }
+    }
+    if starts.len() >= 7 {
+        let block_parts: collections.Vector<String> = asp.runtime.unpack_string_parts(serialized_part_text(text, starts, lengths, 6));
+        let i: Int = 0;
+        loop i < block_parts.len() {
+            _ = program.blocks.push(deserialize_vbs_stmt_block(block_parts.get(i)));
+            i += 1;
+        }
+    }
+    if starts.len() >= 8 {
+        program.routine_names = asp.runtime.unpack_string_parts(serialized_part_text(text, starts, lengths, 7));
+    }
+    if starts.len() >= 9 {
+        program.routine_owner_classes = asp.runtime.unpack_string_parts(serialized_part_text(text, starts, lengths, 8));
+    }
+    if starts.len() >= 10 {
+        program.routine_is_functions = unpack_int_parts_range(text, starts.get(9), lengths.get(9));
+    }
+    if starts.len() >= 11 {
+        program.routine_param_names = asp.runtime.unpack_string_parts(serialized_part_text(text, starts, lengths, 10));
+    }
+    if starts.len() >= 12 {
+        program.routine_param_by_refs = asp.runtime.unpack_string_parts(serialized_part_text(text, starts, lengths, 11));
+    }
+    if starts.len() >= 13 {
+        program.routine_block_ids = unpack_int_parts_range(text, starts.get(12), lengths.get(12));
+    }
+    if starts.len() >= 14 && version3 {
+        program.routine_writes_param_masks = unpack_int_parts_range(text, starts.get(13), lengths.get(13));
+    }
+    let class_parts_index: Int = version3 ? 14 : 13;
+    if starts.len() > class_parts_index {
+        let class_parts: collections.Vector<String> = asp.runtime.unpack_string_parts(serialized_part_text(text, starts, lengths, class_parts_index));
+        let i: Int = 0;
+        loop i < class_parts.len() {
+            _ = program.classes.push(deserialize_vbs_class_def(class_parts.get(i)));
+            i += 1;
+        }
+    }
+    let clause_parts_index: Int = class_parts_index + 1;
+    if starts.len() > clause_parts_index {
+        let clause_parts: collections.Vector<String> = asp.runtime.unpack_string_parts(serialized_part_text(text, starts, lengths, clause_parts_index));
+        let i: Int = 0;
+        loop i < clause_parts.len() {
+            _ = program.case_clauses.push(deserialize_vbs_case_clause(clause_parts.get(i)));
+            i += 1;
+        }
+    }
+    let errors_index: Int = clause_parts_index + 1;
+    if starts.len() > errors_index {
+        program.errors = asp.runtime.unpack_string_parts(serialized_part_text(text, starts, lengths, errors_index));
+    }
+    rebuild_vbs_program_routines(program);
+    return program;
+}
+
+// Convenience wrapper for a payload occupying the entire backing string.
+func deserialize_vbs_program(text: String) -> VbsProgram {
+    return deserialize_vbs_program_range(text, 0, std.len(text));
+}

@@ -1,0 +1,67 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.server;
+
+use asp;
+use asp.runtime;
+
+use std;
+use collections;
+use path;
+use strings;
+
+// Adapts CGI parameter names to the engine's HTTP model. Header keys are
+// normalized for lookup, while the complete original parameter set is retained
+// in ServerVariables for compatibility.
+class FastcgiRequestMapper {
+    func init(self: FastcgiRequestMapper) -> Void {
+    }
+
+    // SCRIPT_FILENAME takes precedence because it is the web server's resolved
+    // path. SCRIPT_NAME is joined to the configured root only as a fallback.
+    func build_context(self: FastcgiRequestMapper, engine: asp.AspEngine, req: FastcgiInboundRequest) -> asp.runtime.RequestContext {
+        let script_filename: String = req.params.has("SCRIPT_FILENAME") ? req.params.get("SCRIPT_FILENAME") : "";
+        let script_name: String = req.params.get_or("SCRIPT_NAME", "");
+        let page_path: String = std.len(script_filename) != 0 ? script_filename : path.join_path(engine.root_dir, script_name);
+        let method: String = req.params.get_or("REQUEST_METHOD", "GET");
+        let query_string: String = req.params.get_or("QUERY_STRING", "");
+        let cookie_header: String = req.params.get_or("HTTP_COOKIE", "");
+        let session_id: String = engine.session_id_from_cookie(cookie_header);
+        let ctx: asp.runtime.RequestContext = engine.new_context(page_path, method, query_string, req.stdin_data, session_id);
+        let param_keys: collections.Vector<String> = req.params.keys();
+        let i: Int = 0;
+        loop i < param_keys.len() {
+            let key: String = param_keys.get(i);
+            let lc: String = strings.to_lower_ascii(key);
+            let value: String = req.params.get(key);
+            if strings.starts_with(lc, "http_") {
+                let header_name: String = strings.replace_all(std.substr(lc, 5, std.len(lc) - 5), "_", "-");
+                _ = ctx.request.headers.set(header_name, value);
+            } else if lc == "content_type" {
+                _ = ctx.request.headers.set("content-type", value);
+            } else if lc == "content_length" {
+                _ = ctx.request.headers.set("content-length", value);
+            } else if lc == "remote_addr" {
+                _ = ctx.request.headers.set("remote-addr", value);
+            } else if lc == "remote_port" {
+                _ = ctx.request.headers.set("remote-port", value);
+            }
+            i += 1;
+        }
+        if std.len(cookie_header) != 0 {
+            _ = ctx.request.headers.set("cookie", cookie_header);
+            _ = ctx.request.parse_cookies(cookie_header);
+        }
+        _ = ctx.request.parse_form_for_content_type();
+        engine.populate_server_variables(ctx, std.len(script_name) != 0 ? script_name : page_path, method, query_string);
+        i = 0;
+        loop i < param_keys.len() {
+            let key: String = param_keys.get(i);
+            _ = ctx.request.server_variables.set(strings.to_lower_ascii(key), req.params.get(key));
+            i += 1;
+        }
+        _ = param_keys.free();
+        return ctx;
+    }
+}

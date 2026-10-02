@@ -1,0 +1,25 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.runtime;
+
+use std;
+use strings;
+
+extern func eg_charset_convert(input: String, from_charset: String, to_charset: String) -> String;
+
+// Charset names are protocol metadata and are compared after trimming and
+// ASCII folding. UTF-8 aliases bypass iconv and preserve the original string.
+func charset_is_utf8(charset: String) -> Bool {
+    let normalized: String = strings.to_lower_ascii(strings.trim_space(charset));
+    return normalized == "utf-8" || normalized == "utf8";
+}
+
+// Converts text through the native iconv wrapper only when encodings differ.
+// Empty input is returned directly to avoid allocating an equivalent string.
+func transcode_text(input: String, from_charset: String, to_charset: String) -> String {
+    if std.len(input) == 0 || strings.equal_fold_ascii(strings.trim_space(from_charset), strings.trim_space(to_charset)) {
+        return input;
+    }
+    return eg_charset_convert(input, from_charset, to_charset);
+}

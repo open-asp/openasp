@@ -1,0 +1,726 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp;
+
+use asp.object.database;
+use asp.runtime;
+use asp.compiler;
+use asp.vm;
+use asp.object;
+
+use std;
+use fs;
+use path;
+use strings;
+use strconv;
+use collections;
+use os;
+use os.process;
+use time;
+
+extern func __gc_keepalive(obj: Any) -> Void;
+
+// CreateObject is both a compatibility boundary and a privilege boundary.
+// Process-capable providers are checked on every creation; invocation performs
+// the same check again so restored Session/Application objects cannot bypass a
+// command-line policy change.
+func evaluator_objects_create_object_by_progid(evaluator: Evaluator, ctx: asp.runtime.RequestContext, prog_id: String) -> asp.runtime.Variant {
+    if strings.equal_fold_ascii(strings.trim_space(prog_id), "Shell.Application") && !shell_application_enabled() {
+        evaluator.raise_runtime_error(ctx, 70, "Shell.Application is disabled; restart OpenASP with --shell-enable=on to enable command execution", "Shell.Application");
+        return asp.runtime.variant_nothing();
+    }
+    if strings.equal_fold_ascii(strings.trim_space(prog_id), "OpenASP.Process") && !process_component_enabled() {
+        evaluator.raise_runtime_error(ctx, 70, "OpenASP.Process is disabled; restart OpenASP with --process-enable=on to enable process execution", "OpenASP.Process");
+        return asp.runtime.variant_nothing();
+    }
+    let object_id: Int = ctx.objects.create_component(prog_id);
+    if object_id != 0 {
+        return asp.runtime.variant_object(object_id);
+    }
+    evaluator.raise_runtime_error(ctx, 429, "unsupported CreateObject provider: " + prog_id, "Server");
+    return asp.runtime.variant_nothing();
+}
+
+// Route state-heavy Dictionary and ADO objects through evaluator-owned logic;
+// stateless component families use the registry dispatcher. keepalive protects
+// argument storage across native calls that may trigger collection.
+func evaluator_objects_invoke_component(evaluator: Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    let kind: asp.object.ComponentKind = asp.object.kind_of(obj);
+    if kind == asp.object.ComponentDictionary {
+        let result: asp.runtime.Variant = evaluator.invoke_dictionary(ctx, obj_id, member, values, is_set);
+        _ = __gc_keepalive(values);
+        return result;
+    }
+    if kind == asp.object.ComponentAdoConnection {
+        let result: asp.runtime.Variant = evaluator.invoke_ado_connection(ctx, obj_id, member, values, is_set);
+        _ = __gc_keepalive(values);
+        return result;
+    }
+    if kind == asp.object.ComponentAdoRecordset {
+        let result: asp.runtime.Variant = evaluator.invoke_ado_recordset(ctx, obj_id, member, values, is_set);
+        _ = __gc_keepalive(values);
+        return result;
+    }
+    let result: asp.runtime.Variant = asp.object.invoke(evaluator, ctx, kind, obj_id, member, values, is_set);
+    _ = __gc_keepalive(values);
+    return result;
+}
+
+// Snapshot an enumerable into independent Variants before entering For Each.
+// Collection objects encode child object ids in text_value; int_value is the
+// authoritative count and prevents malformed trailing ids from being exposed.
+func evaluator_objects_enumerate_values(evaluator: Evaluator, ctx: asp.runtime.RequestContext, v: asp.runtime.Variant) -> collections.Vector<asp.runtime.Variant> {
+    let out: collections.Vector<asp.runtime.Variant> = new collections.Vector<asp.runtime.Variant>();
+    if v.kind == asp.runtime.VariantArray {
+        let i: Int = 0;
+        loop i < v.array_data.items.len() {
+            _ = out.push(v.array_data.items.get(i).clone());
+            i += 1;
+        }
+        return out;
+    }
+    if v.kind == asp.runtime.VariantObject {
+        let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, v.object_value);
+        if obj.kind == asp.vm.RuntimeObjectDictionary {
+            let i: Int = 0;
+            loop i < obj.store.entries.len() {
+                _ = out.push(asp.runtime.variant_string(obj.store.entries.get(i).store_key));
+                i += 1;
+            }
+        } else if asp.object.kind_of(obj) == asp.object.ComponentJsonObject {
+            let i: Int = 0;
+            loop i + 1 < obj.items.len() {
+                _ = out.push(asp.runtime.variant_string(obj.items.get(i).to_output_string()));
+                i += 2;
+            }
+        } else if asp.object.kind_of(obj) == asp.object.ComponentMatchCollection
+            || asp.object.kind_of(obj) == asp.object.ComponentXmlNodeList
+            || asp.object.kind_of(obj) == asp.object.ComponentFileCollection
+            || asp.object.kind_of(obj) == asp.object.ComponentFolderCollection {
+            let ids: collections.Vector<String> = strings.split(obj.text_value, ",");
+            let i: Int = 0;
+            loop i < obj.int_value && i < ids.len() {
+                _ = out.push(asp.runtime.variant_object(strconv.atoi(ids.get(i))));
+                i += 1;
+            }
+        } else if asp.object.kind_of(obj) == asp.object.ComponentSubMatches {
+            let i: Int = 0;
+            loop i < obj.int_value {
+                _ = out.push(asp.runtime.variant_string(asp.object.match_capture_at(obj.text_value, i)));
+                i += 1;
+            }
+        }
+    }
+    return out;
+}
+
+func evaluator_objects_enumerate_request_keys(ctx: asp.runtime.RequestContext, name: String) -> collections.Vector<asp.runtime.Variant> {
+    let out: collections.Vector<asp.runtime.Variant> = new collections.Vector<asp.runtime.Variant>();
+    let keys: collections.Vector<String> = strings.equal_fold_ascii(name, "Request.Form")
+    ? ctx.request.form_keys
+    : (strings.equal_fold_ascii(name, "Request.QueryString") ? ctx.request.query_keys : ctx.request.cookie_keys);
+    let i: Int = 0;
+    loop i < keys.len() {
+        _ = out.push(asp.runtime.variant_string(keys.get(i)));
+        i += 1;
+    }
+    return out;
+}
+
+func evaluator_objects_enumerate_expr_values(evaluator: Evaluator, program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, expr_id: Int, value: asp.runtime.Variant) -> collections.Vector<asp.runtime.Variant> {
+    if expr_id >= 0 && expr_id < program.runtime_expr_count() {
+        let expr: asp.compiler.VbsExprNode = program.snapshot_expr(expr_id);
+        if expr.kind == asp.compiler.VbsExprIdentifier
+            && (strings.equal_fold_ascii(expr.text, "Request.Form")
+                || strings.equal_fold_ascii(expr.text, "Request.QueryString")
+                || strings.equal_fold_ascii(expr.text, "Request.Cookies")) {
+            return evaluator_objects_enumerate_request_keys(ctx, expr.text);
+        }
+    }
+    return evaluator_objects_enumerate_values(evaluator, ctx, value);
+}
+
+// Functional multidimensional update used when the caller needs copy-on-write.
+// The in-place variant below is preferred once array ownership is exclusive.
+func evaluator_objects_set_array_value(target: asp.runtime.Variant, values: collections.Vector<asp.runtime.Variant>, dimension: Int, set_value: asp.runtime.Variant) -> asp.runtime.Variant {
+    let updated: asp.runtime.Variant = target.clone();
+    let index: Int = variant_to_int(values.get(dimension));
+    if dimension + 1 == values.len() {
+        _ = updated.array_data.items.set(index, set_value);
+    } else {
+        _ = updated.array_data.items.set(index, evaluator_objects_set_array_value(updated.array_data.items.get(index), values, dimension + 1, set_value));
+    }
+    return updated;
+}
+
+// Walk and detach each shared array level before mutation. Bounds are validated
+// at every dimension to report VBScript error 9 without corrupting a parent.
+func evaluator_objects_assign_array_value_in_place(evaluator: Evaluator, ctx: asp.runtime.RequestContext, target: asp.runtime.Variant, values: collections.Vector<asp.runtime.Variant>, set_value: asp.runtime.Variant) -> Bool {
+    if values.len() < 1 {
+        evaluator.raise_runtime_error(ctx, 450, "array index required", "VBScript");
+        return false;
+    }
+    let current: asp.runtime.Variant = target;
+    let dimension: Int = 0;
+    loop dimension < values.len() {
+        let index: Int = variant_to_int(values.get(dimension));
+        if current.kind != asp.runtime.VariantArray || index < 0 || index >= current.array_data.items.len() {
+            evaluator.raise_runtime_error(ctx, 9, "subscript out of range: dimension=" + strconv.itoa(dimension + 1) + ", index=" + strconv.itoa(index) + ", length=" + strconv.itoa(current.kind == asp.runtime.VariantArray ? current.array_data.items.len() : 0) + ", kind=" + strconv.itoa(current.kind => Int) + ", isSet=true", "VBScript");
+            return false;
+        }
+        current.ensure_array_writable();
+        if dimension + 1 == values.len() {
+            _ = current.array_data.items.set(index, set_value);
+            return true;
+        }
+        current = current.array_data.items.get(index);
+        dimension += 1;
+    }
+    return false;
+}
+
+func evaluator_objects_invoke_array(evaluator: Evaluator, program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, scope: asp.vm.Scope, target: asp.runtime.Variant, arg_ids: collections.Vector<Int>, is_set: Bool, set_value: asp.runtime.Variant) -> asp.runtime.Variant {
+    let values: collections.Vector<asp.runtime.Variant> = new collections.Vector<asp.runtime.Variant>();
+    let i: Int = 0;
+    loop i < arg_ids.len() {
+        _ = values.push(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(i)));
+        i += 1;
+    }
+    return evaluator_objects_invoke_array_values(evaluator, ctx, target, values, is_set, set_value);
+}
+
+func evaluator_objects_invoke_array_values(evaluator: Evaluator, ctx: asp.runtime.RequestContext, target: asp.runtime.Variant, values: collections.Vector<asp.runtime.Variant>, is_set: Bool, set_value: asp.runtime.Variant, target_name: String = "") -> asp.runtime.Variant {
+    if values.len() < 1 {
+        evaluator.raise_runtime_error(ctx, 450, "array index required", "VBScript");
+        return asp.runtime.variant_empty();
+    }
+    if !is_set && values.len() == 1 {
+        let index_value: asp.runtime.Variant = values.get(0);
+        let index: Int = variant_to_int(index_value);
+        _ = __gc_keepalive(values);
+        _ = __gc_keepalive(index_value);
+        if target.kind != asp.runtime.VariantArray || index < 0 || index >= target.array_data.items.len() {
+            evaluator.raise_runtime_error(ctx, 9, "subscript out of range: dimension=1, index=" + strconv.itoa(index) + ", length=" + strconv.itoa(target.kind == asp.runtime.VariantArray ? target.array_data.items.len() : 0) + ", kind=" + strconv.itoa(target.kind => Int) + ", isSet=false" + (std.len(target_name) > 0 ? ", target=" + target_name : ""), "VBScript");
+            return asp.runtime.variant_empty();
+        }
+        let out: asp.runtime.Variant = target.array_data.items.get(index);
+        _ = __gc_keepalive(target);
+        return out;
+    }
+    let current: asp.runtime.Variant = target;
+    let dimension: Int = 0;
+    loop dimension < values.len() {
+        let index: Int = variant_to_int(values.get(dimension));
+        if current.kind != asp.runtime.VariantArray || index < 0 || index >= current.array_data.items.len() {
+            evaluator.raise_runtime_error(ctx, 9, "subscript out of range: dimension=" + strconv.itoa(dimension + 1) + ", index=" + strconv.itoa(index) + ", length=" + strconv.itoa(current.kind == asp.runtime.VariantArray ? current.array_data.items.len() : 0) + ", kind=" + strconv.itoa(current.kind => Int) + ", isSet=" + (is_set ? "true" : "false") + (std.len(target_name) > 0 ? ", target=" + target_name : ""), "VBScript");
+            return asp.runtime.variant_empty();
+        }
+        current = current.array_data.items.get(index);
+        dimension += 1;
+    }
+    if !is_set {
+        return current;
+    }
+    return evaluator_objects_set_array_value(target, values, 0, set_value);
+}
+
+func evaluator_objects_dictionary_sync_display_keys(obj: asp.vm.RuntimeObject) -> Void {
+    if obj.items.len() == obj.store.entries.len() {
+        return;
+    }
+    obj.items = new collections.Vector<asp.runtime.Variant>();
+    let i: Int = 0;
+    loop i < obj.store.entries.len() {
+        _ = obj.items.push(asp.runtime.variant_string(obj.store.entries.get(i).store_key));
+        i += 1;
+    }
+}
+
+func evaluator_objects_dictionary_display_key_index(obj: asp.vm.RuntimeObject, key: String) -> Int {
+    let i: Int = 0;
+    loop i < obj.items.len() {
+        if strings.equal_fold_ascii(obj.items.get(i).to_output_string(), key) {
+            return i;
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+// Implement Scripting.Dictionary while preserving first-insert display casing
+// separately from the store's case-insensitive lookup key.
+func evaluator_objects_invoke_dictionary(evaluator: Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    if strings.equal_fold_ascii(member, "Add") && values.len() >= 2 {
+        let key: String = values.get(0).to_output_string();
+        evaluator_objects_dictionary_sync_display_keys(obj);
+        if evaluator_objects_dictionary_display_key_index(obj, key) < 0 {
+            _ = obj.items.push(asp.runtime.variant_string(key));
+        }
+        _ = obj.store.set(key, values.get(1));
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "Exists") && values.len() >= 1 {
+        return asp.runtime.variant_bool(obj.store.has(values.get(0).to_output_string()));
+    }
+    if strings.equal_fold_ascii(member, "Remove") && values.len() >= 1 {
+        let key: String = values.get(0).to_output_string();
+        evaluator_objects_dictionary_sync_display_keys(obj);
+        let display_index: Int = evaluator_objects_dictionary_display_key_index(obj, key);
+        _ = obj.store.delete(key);
+        if display_index >= 0 {
+            _ = obj.items.remove(display_index, asp.runtime.variant_empty());
+        }
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "RemoveAll") {
+        _ = obj.store.clear();
+        obj.items = new collections.Vector<asp.runtime.Variant>();
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "Count") {
+        return asp.runtime.variant_int(obj.store.entries.len());
+    }
+    if strings.equal_fold_ascii(member, "Keys") {
+        let items: collections.Vector<asp.runtime.Variant> = new collections.Vector<asp.runtime.Variant>();
+        evaluator_objects_dictionary_sync_display_keys(obj);
+        let i: Int = 0;
+        loop i < obj.items.len() {
+            _ = items.push(asp.runtime.variant_string(obj.items.get(i).to_output_string()));
+            i += 1;
+        }
+        return asp.runtime.variant_array(items);
+    }
+    if strings.equal_fold_ascii(member, "Items") {
+        let items: collections.Vector<asp.runtime.Variant> = new collections.Vector<asp.runtime.Variant>();
+        let i: Int = 0;
+        loop i < obj.store.entries.len() {
+            _ = items.push(obj.store.entries.get(i));
+            i += 1;
+        }
+        return asp.runtime.variant_array(items);
+    }
+    if (strings.equal_fold_ascii(member, "Item") || std.len(member) == 0) && values.len() >= 1 {
+        if is_set && values.len() >= 2 {
+            let key: String = values.get(0).to_output_string();
+            evaluator_objects_dictionary_sync_display_keys(obj);
+            if evaluator_objects_dictionary_display_key_index(obj, key) < 0 {
+                _ = obj.items.push(asp.runtime.variant_string(key));
+            }
+            _ = obj.store.set(key, values.get(1));
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return obj.store.get_or_empty(values.get(0).to_output_string());
+    }
+    evaluator.raise_runtime_error(ctx, 438, "dictionary member not found: " + member, "Scripting.Dictionary");
+    return asp.runtime.variant_empty();
+}
+
+// ADO Connection is a facade over one selected native driver. Open parses and
+// stores normalized connection parameters; Execute binds each returned
+// Recordset back to this object so later Update/Close reaches the same driver.
+func evaluator_objects_invoke_ado_connection(evaluator: Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool = false) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    if strings.equal_fold_ascii(member, "ConnectionString") {
+        if is_set && values.len() >= 1 {
+            let conn: String = values.get(values.len() - 1).to_output_string();
+            _ = obj.store.set("connectionstring", asp.runtime.variant_string(conn));
+            let parts: collections.Map<String, String> = parse_connection_string(conn);
+            let keys: collections.Vector<String> = parts.keys();
+            let i: Int = 0;
+            loop i < keys.len() {
+                _ = obj.store.set(keys.get(i), asp.runtime.variant_string(parts.get(keys.get(i))));
+                i += 1;
+            }
+            _ = keys.free();
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return obj.store.get_or_empty("connectionstring");
+    }
+    if strings.equal_fold_ascii(member, "Data Source") || strings.equal_fold_ascii(member, "DataSource") || strings.equal_fold_ascii(member, "Database") {
+        let key_name: String = strings.to_lower_ascii(member);
+        if is_set && values.len() >= 1 {
+            _ = obj.store.set(key_name, asp.runtime.variant_string(values.get(values.len() - 1).to_output_string()));
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return obj.store.get_or_empty(key_name);
+    }
+    if strings.equal_fold_ascii(member, "Open") {
+        obj.opened = true;
+        let provider_value: String = "";
+        let server_value: String = "";
+        let database_value: String = "";
+        if values.len() >= 1 {
+            let conn: String = values.get(0).to_output_string();
+            _ = obj.store.set("connectionstring", asp.runtime.variant_string(conn));
+            let parts: collections.Vector<String> = strings.split(conn, ";");
+            let i: Int = 0;
+            loop i < parts.len() {
+                let part: String = strings.trim_space(parts.get(i));
+                let eq: Int = strings.find_substr(part, "=");
+                if eq > 0 {
+                    let key: String = strings.to_lower_ascii(strings.trim_space(std.substr(part, 0, eq)));
+                    let value: String = strings.trim_space(std.substr(part, eq + 1, std.len(part) - eq - 1));
+                    _ = obj.store.set(key, asp.runtime.variant_string(value));
+                    if key == "provider" {
+                        provider_value = value;
+                    } else if key == "server" || key == "host" || (key == "data source" && std.len(server_value) == 0) {
+                        server_value = value;
+                    }
+                    if key == "database" || (key == "initial catalog" && std.len(database_value) == 0) {
+                        database_value = value;
+                    }
+                }
+                i += 1;
+            }
+        }
+        obj.database_driver_kind = asp.object.database.db_driver_kind_from_provider(provider_value) => Int;
+        if obj.database_driver_kind == (asp.object.database.DatabaseDriverUnknown => Int) {
+            evaluator.raise_runtime_error(ctx, 3706, "provider is not registered: " + provider_value, "ADODB.Connection");
+            return asp.runtime.variant_empty();
+        }
+        if obj.database_driver_kind == (asp.object.database.DatabaseDriverMysql => Int) {
+            if !asp.object.database.mysql_open(evaluator, ctx, obj_id, obj) {
+                obj.opened = false;
+            }
+        }
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "Close") {
+        if obj.database_driver_kind == (asp.object.database.DatabaseDriverMysql => Int) || ctx.objects.has_mysql_connection(obj_id) {
+            asp.object.database.mysql_close(ctx, obj_id);
+            obj.opened = false;
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        if obj.transaction_active && std.len(obj.transaction_backup_path) > 0 {
+            let db_path: String = asp_host_path(obj.store.get_or_empty("data source").to_output_string());
+            let _, restore_err = fs.copy(obj.transaction_backup_path, db_path);
+            if restore_err != OK {
+                evaluator.raise_runtime_error(ctx, 3000, "failed to roll back active MDB transaction while closing connection", "ADODB.Connection");
+                return asp.runtime.variant_empty();
+            }
+            let _, _ = fs.remove(obj.transaction_backup_path);
+            invalidate_access_query_cache(ctx, db_path);
+            obj.transaction_active = false;
+            obj.transaction_backup_path = "";
+        }
+        obj.opened = false;
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "BeginTrans") {
+        if obj.database_driver_kind != (asp.object.database.DatabaseDriverMdbtools => Int) {
+            return asp.runtime.variant_int(0);
+        }
+        if obj.transaction_active {
+            evaluator.raise_runtime_error(ctx, 3000, "nested MDB transactions are not supported", "ADODB.Connection");
+            return asp.runtime.variant_empty();
+        }
+        let db_path: String = asp_host_path(obj.store.get_or_empty("data source").to_output_string());
+        let backup_path: String = db_path + ".egret-txn-" + strconv.itoa(obj_id) + "-" + strconv.itoa(time.now_ms());
+        let _, copy_err = fs.copy(db_path, backup_path);
+        if copy_err != OK {
+            evaluator.raise_runtime_error(ctx, 3000, "failed to create MDB transaction snapshot: " + backup_path, "ADODB.Connection");
+            return asp.runtime.variant_empty();
+        }
+        obj.transaction_active = true;
+        obj.transaction_backup_path = backup_path;
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_int(1);
+    }
+    if strings.equal_fold_ascii(member, "CommitTrans") {
+        if obj.database_driver_kind != (asp.object.database.DatabaseDriverMdbtools => Int) || !obj.transaction_active {
+            return asp.runtime.variant_int(0);
+        }
+        let _, remove_err = fs.remove(obj.transaction_backup_path);
+        if remove_err != OK {
+            evaluator.raise_runtime_error(ctx, 3000, "failed to remove MDB transaction snapshot: " + obj.transaction_backup_path, "ADODB.Connection");
+            return asp.runtime.variant_empty();
+        }
+        obj.transaction_active = false;
+        obj.transaction_backup_path = "";
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_int(0);
+    }
+    if strings.equal_fold_ascii(member, "RollbackTrans") {
+        if obj.database_driver_kind != (asp.object.database.DatabaseDriverMdbtools => Int) || !obj.transaction_active {
+            return asp.runtime.variant_int(0);
+        }
+        let db_path: String = asp_host_path(obj.store.get_or_empty("data source").to_output_string());
+        let _, restore_err = fs.copy(obj.transaction_backup_path, db_path);
+        if restore_err != OK {
+            evaluator.raise_runtime_error(ctx, 3000, "failed to restore MDB transaction snapshot: " + obj.transaction_backup_path, "ADODB.Connection");
+            return asp.runtime.variant_empty();
+        }
+        let _, _ = fs.remove(obj.transaction_backup_path);
+        invalidate_access_query_cache(ctx, db_path);
+        obj.transaction_active = false;
+        obj.transaction_backup_path = "";
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_int(0);
+    }
+    if strings.equal_fold_ascii(member, "Execute") {
+        if values.len() >= 1 {
+            let sql_text: String = values.get(0).kind == asp.runtime.VariantString ? values.get(0).string_value : values.get(0).to_output_string();
+            if obj.database_driver_kind == (asp.object.database.DatabaseDriverMysql => Int) {
+                return asp.object.database.mysql_execute(evaluator, ctx, obj_id, sql_text);
+            }
+            if obj.database_driver_kind == (asp.object.database.DatabaseDriverMdbtools => Int) {
+                return evaluator.execute_access(ctx, obj, sql_text);
+            }
+            return asp.object.database.sqlite_execute(evaluator, ctx, obj, sql_text);
+        }
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "State") {
+        if obj.database_driver_kind == (asp.object.database.DatabaseDriverMysql => Int) {
+            return asp.runtime.variant_int(ctx.objects.has_mysql_connection(obj_id) ? 1 : 0);
+        }
+        return asp.runtime.variant_int(obj.opened ? 1 : 0);
+    }
+    evaluator.raise_runtime_error(ctx, 438, "connection member not found: " + member, "ADODB.Connection");
+    return asp.runtime.variant_empty();
+}
+
+// Recordset dispatch centralizes cursor, field, edit, and close semantics.
+// Native row buffers belong to the request arena; persistent object stores must
+// therefore serialize values rather than retaining pointers into those rows.
+func evaluator_objects_invoke_ado_recordset(evaluator: Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    if strings.equal_fold_ascii(member, "CursorType") || strings.equal_fold_ascii(member, "LockType") {
+        if is_set && values.len() >= 1 {
+            let property_value: Int = variant_to_int(values.get(values.len() - 1));
+            if strings.equal_fold_ascii(member, "CursorType") {
+                obj.cursor_type = property_value;
+            } else {
+                obj.lock_type = property_value;
+            }
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_int(strings.equal_fold_ascii(member, "CursorType") ? obj.cursor_type : obj.lock_type);
+    }
+    if strings.equal_fold_ascii(member, "ActiveConnection") {
+        if is_set && values.len() >= 1 {
+            let property_value: asp.runtime.Variant = values.get(values.len() - 1);
+            if property_value.kind == asp.runtime.VariantNothing {
+                obj.active_connection_id = 0;
+            } else if property_value.kind == asp.runtime.VariantObject && evaluator.get_object(ctx, property_value.object_value).kind == asp.vm.RuntimeObjectAdoConnection {
+                obj.active_connection_id = property_value.object_value;
+            } else {
+                evaluator.raise_runtime_error(ctx, 13, "ActiveConnection must be an ADODB.Connection object", "ADODB.Recordset");
+                return asp.runtime.variant_empty();
+            }
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return obj.active_connection_id > 0 ? asp.runtime.variant_object(obj.active_connection_id) : asp.runtime.variant_nothing();
+    }
+    if strings.equal_fold_ascii(member, "Source") {
+        if is_set && values.len() >= 1 {
+            obj.text_value = values.get(values.len() - 1).to_output_string();
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_string(obj.text_value);
+    }
+    if strings.equal_fold_ascii(member, "Open") {
+        let connection_id: Int = values.len() >= 2 && values.get(1).kind == asp.runtime.VariantObject ? values.get(1).object_value : obj.active_connection_id;
+        if connection_id <= 0 && values.len() >= 2 && values.get(1).kind == asp.runtime.VariantString {
+            connection_id = ctx.objects.create_ado_connection();
+            let open_values: collections.Vector<asp.runtime.Variant> = new collections.Vector<asp.runtime.Variant>();
+            _ = open_values.push(values.get(1));
+            _ = evaluator_objects_invoke_ado_connection(evaluator, ctx, connection_id, "Open", open_values);
+            if evaluator.statement_failed {
+                return asp.runtime.variant_empty();
+            }
+        }
+        if connection_id > 0 {
+            let conn: asp.vm.RuntimeObject = evaluator.get_object(ctx, connection_id);
+            if conn.kind == asp.vm.RuntimeObjectAdoConnection {
+                let sql_text: String = values.len() >= 1 ? (values.get(0).kind == asp.runtime.VariantString ? values.get(0).string_value : values.get(0).to_output_string()) : obj.text_value;
+                let opened: asp.runtime.Variant = conn.database_driver_kind == (asp.object.database.DatabaseDriverMysql => Int)
+                ? asp.object.database.mysql_execute(evaluator, ctx, connection_id, sql_text)
+                : (conn.database_driver_kind == (asp.object.database.DatabaseDriverMdbtools => Int)
+                    ? evaluator.execute_access(ctx, conn, sql_text)
+                    : asp.object.database.sqlite_execute(evaluator, ctx, conn, sql_text));
+                if opened.kind == asp.runtime.VariantObject {
+                    let loaded: asp.vm.RuntimeObject = evaluator.get_object(ctx, opened.object_value);
+                    let connection_store: asp.runtime.KeyValueStore = conn.store;
+                    let store_index: Int = 0;
+                    loop store_index < connection_store.entries.len() && store_index < connection_store.entries.len() {
+                        let value: asp.runtime.Variant = connection_store.entries.get(store_index);
+                        _ = loaded.store.set(value.store_key, value);
+                        store_index += 1;
+                    }
+                    loaded.database_driver_kind = conn.database_driver_kind;
+                    loaded.cursor_type = obj.cursor_type;
+                    loaded.lock_type = obj.lock_type;
+                    loaded.active_connection_id = connection_id;
+                    _ = ctx.objects.set(obj_id, loaded);
+                    return asp.runtime.variant_empty();
+                }
+                return asp.runtime.variant_empty();
+            }
+        }
+        obj.opened = true;
+        if values.len() >= 1 {
+            obj.text_value = values.get(0).kind == asp.runtime.VariantString ? values.get(0).string_value : values.get(0).to_output_string();
+        }
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "Close") {
+        obj.opened = false;
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "MoveNext") {
+        if obj.cursor < obj.row_count() {
+            obj.cursor += 1;
+        } else {
+            obj.cursor = obj.row_count();
+        }
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "MoveFirst") {
+        obj.cursor = 0;
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "EOF") {
+        return asp.runtime.variant_bool(obj.cursor >= obj.row_count());
+    }
+    if strings.equal_fold_ascii(member, "BOF") {
+        return asp.runtime.variant_bool(obj.row_count() == 0);
+    }
+    if strings.equal_fold_ascii(member, "RecordCount") {
+        return asp.runtime.variant_int(obj.row_count());
+    }
+    if strings.equal_fold_ascii(member, "PageSize") {
+        if is_set && values.len() >= 1 {
+            let size: Int = variant_to_int(values.get(values.len() - 1));
+            if size <= 0 {
+                evaluator.raise_runtime_error(ctx, 3001, "PageSize must be greater than zero", "ADODB.Recordset");
+                return asp.runtime.variant_empty();
+            }
+            obj.page_size = size;
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_int(obj.page_size);
+    }
+    if strings.equal_fold_ascii(member, "AbsolutePage") {
+        if is_set && values.len() >= 1 {
+            let page: Int = variant_to_int(values.get(values.len() - 1));
+            if page <= 0 {
+                evaluator.raise_runtime_error(ctx, 3001, "AbsolutePage must be greater than zero", "ADODB.Recordset");
+                return asp.runtime.variant_empty();
+            }
+            let offset: Int = (page - 1) * obj.page_size;
+            obj.cursor = offset < obj.row_count() ? offset : obj.row_count();
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        if obj.row_count() == 0 {
+            return asp.runtime.variant_int(1);
+        }
+        return asp.runtime.variant_int((obj.cursor / obj.page_size) + 1);
+    }
+    if strings.equal_fold_ascii(member, "PageCount") {
+        if obj.row_count() == 0 {
+            return asp.runtime.variant_int(0);
+        }
+        return asp.runtime.variant_int((obj.row_count() + obj.page_size - 1) / obj.page_size);
+    }
+    if strings.equal_fold_ascii(member, "Update") {
+        let update_sql: String = evaluator.recordset_update_sql(ctx, obj);
+        if std.len(update_sql) == 0 {
+            evaluator.raise_runtime_error(ctx, 438, "recordset update target is not writable", "ADODB.Recordset");
+            return asp.runtime.variant_empty();
+        }
+        if std.len(obj.secondary_text) > 0 {
+            _ = asp.object.database.mysql_execute(evaluator, ctx, strconv.atoi(obj.secondary_text), update_sql);
+        } else if obj.database_driver_kind == (asp.object.database.DatabaseDriverMdbtools => Int) {
+            _ = evaluator.execute_access(ctx, obj, update_sql);
+        } else {
+            _ = asp.object.database.sqlite_execute(evaluator, ctx, obj, update_sql);
+        }
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "GetRows") {
+        let fields: collections.Vector<asp.runtime.Variant> = new collections.Vector<asp.runtime.Variant>();
+        let field_index: Int = 0;
+        loop field_index < obj.items.len() {
+            let values_by_record: collections.Vector<asp.runtime.Variant> = new collections.Vector<asp.runtime.Variant>();
+            let field_name: String = obj.items.get(field_index).to_output_string();
+            let row_index: Int = obj.cursor;
+            loop row_index < obj.row_count() {
+                let value: asp.runtime.Variant = obj.has_native_rows()
+                    ? obj.native_cell(row_index, field_index)
+                    : obj.rows.get(row_index).get_or_empty(field_name).clone();
+                _ = values_by_record.push(value);
+                row_index += 1;
+            }
+            _ = fields.push(asp.runtime.variant_array(values_by_record));
+            field_index += 1;
+        }
+        obj.cursor = obj.row_count();
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_array(fields);
+    }
+    if (strings.equal_fold_ascii(member, "Fields") || strings.equal_fold_ascii(member, "Item") || std.len(member) == 0) && values.len() >= 1 {
+        if obj.cursor >= 0 && obj.cursor < obj.row_count() {
+            let field_selector: asp.runtime.Variant = values.get(0);
+            let field_name: String = field_selector.to_output_string();
+            let field_index: Int = obj.native_column_index(field_name);
+            if field_selector.kind == asp.runtime.VariantInt || field_selector.kind == asp.runtime.VariantFloat {
+                field_index = variant_to_int(field_selector);
+                if field_index < 0 || field_index >= obj.items.len() {
+                    evaluator.raise_runtime_error(ctx, 3265, "recordset field index out of range: " + strconv.itoa(field_index), "ADODB.Recordset");
+                    return asp.runtime.variant_empty();
+                }
+                field_name = obj.items.get(field_index).to_output_string();
+            }
+            if field_index < 0 || field_index >= obj.items.len() {
+                return asp.runtime.variant_empty();
+            }
+            if is_set && values.len() >= 2 {
+                let updated_value: asp.runtime.Variant = values.get(values.len() - 1);
+                if obj.has_native_rows() {
+                    _ = obj.set_native_cell(obj.cursor, field_index, updated_value, false);
+                } else {
+                    let row: asp.runtime.KeyValueStore = obj.rows.get(obj.cursor);
+                    let updated_row: asp.runtime.KeyValueStore = row.clone();
+                    _ = updated_row.set(field_name, updated_value);
+                    _ = obj.rows.set(obj.cursor, updated_row);
+                }
+                evaluator.set_object(ctx, obj_id, obj);
+                return asp.runtime.variant_empty();
+            }
+            let field_value: asp.runtime.Variant = obj.has_native_rows()
+                ? obj.native_cell(obj.cursor, field_index)
+                : obj.rows.get(obj.cursor).get_or_empty(field_name);
+            return field_value;
+        }
+        return asp.runtime.variant_empty();
+    }
+    if is_set {
+        evaluator.raise_runtime_error(ctx, 438, "recordset property is read-only: " + member, "ADODB.Recordset");
+        return asp.runtime.variant_empty();
+    }
+    evaluator.raise_runtime_error(ctx, 438, "recordset member not found: " + member, "ADODB.Recordset");
+    return asp.runtime.variant_empty();
+}

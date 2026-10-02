@@ -1,0 +1,11 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+use asp;
+
+// Thin process boundary: OpenAspFile owns option parsing, engine lifetime, and
+// exit-code policy so this entry point contains no duplicated startup state.
+func main(argc: Int, argv: Int) -> Int {
+    print_openasp_startup_information();
+    return (new asp.OpenAspFile()).run(argc, argv);
+}

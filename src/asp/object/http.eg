@@ -1,0 +1,179 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.object;
+
+use asp;
+use asp.runtime;
+use asp.vm;
+
+use collections;
+use net;
+use net.http;
+use net.tcp;
+use net.tls;
+use net.url;
+use std;
+use strconv;
+use strings;
+
+// Parse status metadata from the raw response head. Invalid or incomplete
+// status lines are reported as zero/empty and handled by the caller.
+func http_status_from_raw(raw: String) -> Int {
+    let line_end: Int = strings.index(raw, "\r\n");
+    let line: String = line_end >= 0 ? std.substr(raw, 0, line_end) : raw;
+    let first_space: Int = strings.index(line, " ");
+    if first_space < 0 {
+        return 0;
+    }
+    let second_space: Int = strings.index_from(line, " ", first_space + 1);
+    let code: String = second_space >= 0 ? std.substr(line, first_space + 1, second_space - first_space - 1) : std.substr(line, first_space + 1, std.len(line) - first_space - 1);
+    return strconv.atoi(code);
+}
+
+func http_status_text_from_raw(raw: String) -> String {
+    let line_end: Int = strings.index(raw, "\r\n");
+    let line: String = line_end >= 0 ? std.substr(raw, 0, line_end) : raw;
+    let first_space: Int = strings.index(line, " ");
+    let second_space: Int = first_space >= 0 ? strings.index_from(line, " ", first_space + 1) : -1;
+    return second_space >= 0 ? std.substr(line, second_space + 1, std.len(line) - second_space - 1) : "";
+}
+
+// Build an HTTP/1.1 request from component state. Host and Content-Length are
+// derived rather than trusted from stale caller headers.
+func http_build_request(obj: asp.vm.RuntimeObject, url: net.url.URL, body: String) -> String {
+    let method: String = obj.class_name;
+    let request_path: String = std.len(url.path) > 0 ? url.path : "/";
+    let request: String = method + " " + request_path + " HTTP/1.1\r\nHost: " + url.host + "\r\nUser-Agent: egret-asp-xmlhttp\r\nAccept: */*\r\nConnection: close\r\n";
+    let has_content_length: Bool = strings.contains_ascii_case(obj.auxiliary_text, "content-length:");
+    request += obj.auxiliary_text;
+    if std.len(body) > 0 && !has_content_length {
+        request += "Content-Length: " + strconv.itoa(std.len(body)) + "\r\n";
+    }
+    return request + "\r\n" + body;
+}
+
+// Execute the request synchronously, split headers/body, and publish all result
+// fields together on the RuntimeObject so getters cannot observe partial state.
+func http_send_request(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, body: String) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    let raw_url: String = obj.default_member;
+    let url, parse_err = net.url.parse(raw_url);
+    if parse_err != std.OK {
+        evaluator.raise_runtime_error(ctx, -2147012890, "invalid URL: " + raw_url, obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    let request: String = http_build_request(obj, url, body);
+    let raw: String = "";
+    let io_err: ErrCode = std.OK;
+    let timeout_ms: Int = -1;
+    if strings.equal_fold_ascii(url.scheme, "https") {
+        let port: Int = url.port > 0 ? url.port : 443;
+        let handle, connect_err = net.tls.connect(url.host, port, timeout_ms > 0 ? timeout_ms : -1);
+        if connect_err != std.OK {
+            io_err = connect_err;
+        } else {
+            let _, send_err = net.tls.send(handle, request, timeout_ms > 0 ? timeout_ms : -1);
+            if send_err != std.OK {
+                io_err = send_err;
+            } else {
+                _ = net.clear_last_error();
+                raw = net.http.http_recv_all_tls(handle, 16777216, timeout_ms > 0 ? timeout_ms : -1);
+                io_err = net.last_err_code();
+            }
+            _ = net.tls.close(handle);
+        }
+    } else {
+        let port: Int = url.port > 0 ? url.port : 80;
+        let fd, connect_err = net.tcp.connect(url.host, port, timeout_ms > 0 ? timeout_ms : -1);
+        if connect_err != std.OK {
+            io_err = connect_err;
+        } else {
+            let _, send_err = net.tcp.send(fd, request, timeout_ms > 0 ? timeout_ms : -1);
+            if send_err != std.OK {
+                io_err = send_err;
+            } else {
+                _ = net.clear_last_error();
+                raw = net.http.http_recv_all_tcp(fd, 16777216, timeout_ms > 0 ? timeout_ms : -1);
+                io_err = net.last_err_code();
+            }
+            _ = net.tcp.close(fd);
+        }
+    }
+    if io_err != std.OK {
+        obj.cursor = 4;
+        evaluator.raise_runtime_error(ctx, -2147012894, "HTTP request failed", obj.prog_id);
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    let response_body: String = net.http.response_body(raw);
+    obj.secondary_text = raw;
+    obj.text_value = response_body;
+    obj.int_value = http_status_from_raw(raw);
+    obj.cursor = 4;
+    evaluator.set_object(ctx, obj_id, obj);
+    return asp.runtime.variant_empty();
+}
+
+// Emulate the synchronous MSXML XMLHTTP surface. Asynchronous mode is rejected
+// because request-owned objects cannot safely outlive RequestContext.
+func invoke_xml_http(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    _ = is_set;
+    if strings.equal_fold_ascii(member, "open") && values.len() > 1 {
+        obj.class_name = strings.to_upper_ascii(values.get(0).to_output_string());
+        obj.default_member = values.get(1).to_output_string();
+        if values.len() > 2 {
+            obj.opened = values.get(2).is_truthy();
+        }
+        obj.cursor = 1;
+        obj.int_value = 0;
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "setRequestHeader") && values.len() > 1 {
+        obj.auxiliary_text += values.get(0).to_output_string() + ": " + values.get(1).to_output_string() + "\r\n";
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "setTimeouts") {
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "send") {
+        return http_send_request(evaluator, ctx, obj_id, values.len() > 0 ? values.get(0).to_output_string() : "");
+    }
+    if strings.equal_fold_ascii(member, "abort") {
+        obj.cursor = 0;
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "getResponseHeader") && values.len() > 0 {
+        let separator: Int = strings.index(obj.secondary_text, "\r\n\r\n");
+        let headers: String = separator >= 0 ? std.substr(obj.secondary_text, 0, separator + 2) : "";
+        return asp.runtime.variant_string(net.http.header_value(strings.to_lower_ascii(headers), strings.to_lower_ascii(values.get(0).to_output_string())));
+    }
+    if strings.equal_fold_ascii(member, "getAllResponseHeaders") {
+        let separator: Int = strings.index(obj.secondary_text, "\r\n\r\n");
+        return asp.runtime.variant_string(separator >= 0 ? std.substr(obj.secondary_text, 0, separator + 2) : "");
+    }
+    if strings.equal_fold_ascii(member, "responseXML") {
+        let document_id: Int = ctx.objects.create_component("MSXML2.DOMDocument");
+        _ = dom_load_xml(evaluator, ctx, document_id, obj.text_value);
+        return asp.runtime.variant_object(document_id);
+    }
+    let key: String = strings.to_lower_ascii(member);
+    if key == "readystate" {
+        return asp.runtime.variant_int(obj.cursor);
+    }
+    if key == "status" {
+        return asp.runtime.variant_int(obj.int_value);
+    }
+    if key == "statustext" {
+        return asp.runtime.variant_string(http_status_text_from_raw(obj.secondary_text));
+    }
+    if key == "responsetext" || key == "responsebody" {
+        return asp.runtime.variant_string(obj.text_value);
+    }
+    evaluator.raise_runtime_error(ctx, 438, "XMLHTTP member not found: " + member, obj.prog_id);
+    return asp.runtime.variant_empty();
+}

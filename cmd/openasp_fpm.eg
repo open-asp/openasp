@@ -1,0 +1,11 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+use asp.server;
+
+// The FastCGI frontend is async because its accept loop multiplexes worker
+// connections; OpenAspFpm remains the sole owner of server lifecycle policy.
+async func main(argc: Int, argv: Int) -> Int {
+    print_openasp_startup_information();
+    return await (new asp.server.OpenAspFpm()).run(argc, argv);
+}

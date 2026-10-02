@@ -1,0 +1,938 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.object;
+
+use asp;
+use asp.runtime;
+use asp.vm;
+
+use collections;
+use net;
+use net.http;
+use net.tcp;
+use net.tls;
+use net.url;
+use std;
+use strconv;
+use strings;
+
+extern func eg_openasp_sha256(input: String) -> String;
+extern func eg_openasp_hmac_sha256(key: String, input: String) -> String;
+extern func eg_openasp_base64_encode(input: String, url_safe: Int) -> String;
+extern func eg_openasp_base64_decode(input: String, url_safe: Int) -> String;
+extern func eg_openasp_random_bytes(count: Int) -> String;
+extern func eg_openasp_constant_time_equals(left: String, right: String) -> Int;
+extern func eg_openasp_json_validate(input: String) -> Int;
+extern func eg_openasp_json_minify(input: String) -> String;
+extern func eg_openasp_json_escape(input: String) -> String;
+extern func eg_openasp_process_run(executable: String, arguments: String, directory: String, stdin_data: String, timeout_ms: Int, max_output: Int) -> String;
+extern func eg_openasp_process_start(executable: String, arguments: String, directory: String) -> Int;
+extern func eg_openasp_process_wait(pid: Int, timeout_ms: Int) -> Int;
+extern func eg_openasp_process_terminate(pid: Int, signal_number: Int) -> Int;
+extern func eg_openasp_process_fork() -> Int;
+extern func eg_openasp_process_waitpid(pid: Int, timeout_ms: Int) -> String;
+extern func eg_openasp_process_signal(pid: Int, signal_number: Int) -> Int;
+extern func eg_openasp_process_exit(exit_code: Int) -> Int;
+extern func eg_vbs_chr_w(codepoint: Int) -> String;
+
+// Recursive-descent JSON parser whose object values are stored as alternating
+// key/value Variants in ObjectSpace. source is immutable; pos is the byte
+// cursor; failed/error_text latch the first structural failure.
+class OpenAspJsonParser {
+    var ctx: asp.runtime.RequestContext;
+    var source: String;
+    var offset: Int;
+    var failed: Bool;
+
+    func init(self: OpenAspJsonParser, ctx: asp.runtime.RequestContext, source: String) -> Void {
+        self.ctx = ctx;
+        self.source = source;
+        self.offset = 0;
+        self.failed = false;
+    }
+
+    func skip_space(self: OpenAspJsonParser) -> Void {
+        loop self.offset < std.len(self.source) {
+            let ch: Int = std.byte_at(self.source, self.offset);
+            if ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r' {
+                return;
+            }
+            self.offset += 1;
+        }
+    }
+
+    func parse_string(self: OpenAspJsonParser) -> String {
+        if self.offset >= std.len(self.source) || std.byte_at(self.source, self.offset) != '"' {
+            self.failed = true;
+            return "";
+        }
+        self.offset += 1;
+        let out: String = "";
+        loop self.offset < std.len(self.source) {
+            let ch: Int = std.byte_at(self.source, self.offset);
+            self.offset += 1;
+            if ch == '"' {
+                return out;
+            }
+            if ch != '\\' {
+                out += std.substr(self.source, self.offset - 1, 1);
+                skip;
+            }
+            if self.offset >= std.len(self.source) {
+                self.failed = true;
+                return "";
+            }
+            let escaped: Int = std.byte_at(self.source, self.offset);
+            self.offset += 1;
+            if escaped == '"' || escaped == '\\' || escaped == '/' {
+                out += std.substr(self.source, self.offset - 1, 1);
+            } else if escaped == 'b' {
+                out += eg_vbs_chr_w(8);
+            } else if escaped == 'f' {
+                out += eg_vbs_chr_w(12);
+            } else if escaped == 'n' {
+                out += "\n";
+            } else if escaped == 'r' {
+                out += "\r";
+            } else if escaped == 't' {
+                out += "\t";
+            } else if escaped == 'u' && self.offset + 4 <= std.len(self.source) {
+                let digits: String = std.substr(self.source, self.offset, 4);
+                let codepoint: Int = 0;
+                let i: Int = 0;
+                loop i < 4 {
+                    let nibble: Int = asp.runtime.hex_nibble(std.byte_at(digits, i));
+                    if nibble < 0 {
+                        self.failed = true;
+                        return "";
+                    }
+                    codepoint = codepoint * 16 + nibble;
+                    i += 1;
+                }
+                self.offset += 4;
+                if codepoint >= 55296 && codepoint <= 56319 {
+                    if self.offset + 6 > std.len(self.source)
+                    || std.byte_at(self.source, self.offset) != '\\'
+                    || std.byte_at(self.source, self.offset + 1) != 'u' {
+                        self.failed = true;
+                        return "";
+                    }
+                    let low: Int = 0;
+                    let j: Int = 0;
+                    loop j < 4 {
+                        let nibble: Int = asp.runtime.hex_nibble(std.byte_at(self.source, self.offset + 2 + j));
+                        if nibble < 0 {
+                            self.failed = true;
+                            return "";
+                        }
+                        low = low * 16 + nibble;
+                        j += 1;
+                    }
+                    if low < 56320 || low > 57343 {
+                        self.failed = true;
+                        return "";
+                    }
+                    self.offset += 6;
+                    codepoint = 65536 + ((codepoint - 55296) * 1024) + (low - 56320);
+                } else if codepoint >= 56320 && codepoint <= 57343 {
+                    self.failed = true;
+                    return "";
+                }
+                out += eg_vbs_chr_w(codepoint);
+            } else {
+                self.failed = true;
+                return "";
+            }
+        }
+        self.failed = true;
+        return "";
+    }
+
+    // Parse one complete JSON value. The depth limit bounds adversarial nesting
+    // before recursion can exhaust the native stack.
+    func parse_value(self: OpenAspJsonParser, depth: Int = 0) -> asp.runtime.Variant {
+        self.skip_space();
+        if depth > 128 || self.offset >= std.len(self.source) {
+            self.failed = true;
+            return asp.runtime.variant_empty();
+        }
+        let ch: Int = std.byte_at(self.source, self.offset);
+        if ch == '"' {
+            return asp.runtime.variant_string(self.parse_string());
+        }
+        if ch == '[' {
+            self.offset += 1;
+            let items: collections.Vector<asp.runtime.Variant> = new collections.Vector<asp.runtime.Variant>();
+            self.skip_space();
+            if self.offset < std.len(self.source) && std.byte_at(self.source, self.offset) == ']' {
+                self.offset += 1;
+                return asp.runtime.variant_array(items);
+            }
+            loop !self.failed {
+                _ = items.push(self.parse_value(depth + 1));
+                self.skip_space();
+                if self.offset < std.len(self.source) && std.byte_at(self.source, self.offset) == ']' {
+                    self.offset += 1;
+                    return asp.runtime.variant_array(items);
+                }
+                if self.offset >= std.len(self.source) || std.byte_at(self.source, self.offset) != ',' {
+                    self.failed = true;
+                    return asp.runtime.variant_empty();
+                }
+                self.offset += 1;
+            }
+        }
+        if ch == '{' {
+            self.offset += 1;
+            let object_id: Int = self.ctx.objects.create_component("OpenASP.JSON.Object");
+            let object: asp.vm.RuntimeObject = self.ctx.objects.get(object_id);
+            self.skip_space();
+            if self.offset < std.len(self.source) && std.byte_at(self.source, self.offset) == '}' {
+                self.offset += 1;
+                return asp.runtime.variant_object(object_id);
+            }
+            loop !self.failed {
+                self.skip_space();
+                let key: String = self.parse_string();
+                self.skip_space();
+                if self.failed || self.offset >= std.len(self.source) || std.byte_at(self.source, self.offset) != ':' {
+                    self.failed = true;
+                    return asp.runtime.variant_empty();
+                }
+                self.offset += 1;
+                let parsed_value: asp.runtime.Variant = self.parse_value(depth + 1);
+                let existing: Int = json_object_key_index(object, key);
+                if existing >= 0 {
+                    _ = object.items.set(existing + 1, parsed_value);
+                } else {
+                    _ = object.items.push(asp.runtime.variant_string(key));
+                    _ = object.items.push(parsed_value);
+                }
+                self.skip_space();
+                if self.offset < std.len(self.source) && std.byte_at(self.source, self.offset) == '}' {
+                    self.offset += 1;
+                    return asp.runtime.variant_object(object_id);
+                }
+                if self.offset >= std.len(self.source) || std.byte_at(self.source, self.offset) != ',' {
+                    self.failed = true;
+                    return asp.runtime.variant_empty();
+                }
+                self.offset += 1;
+            }
+        }
+        let start: Int = self.offset;
+        loop self.offset < std.len(self.source) {
+            let current: Int = std.byte_at(self.source, self.offset);
+            if current == ',' || current == ']' || current == '}' || current == ' ' || current == '\t' || current == '\n' || current == '\r' {
+                break;
+            }
+            self.offset += 1;
+        }
+        let token: String = std.substr(self.source, start, self.offset - start);
+        if token == "true" {
+            return asp.runtime.variant_bool(true);
+        }
+        if token == "false" {
+            return asp.runtime.variant_bool(false);
+        }
+        if token == "null" {
+            return asp.runtime.variant_null();
+        }
+        if strings.contains(token, ".") || strings.contains_ascii_case(token, "e") {
+            return asp.runtime.variant_float(strconv.parse_float64(token));
+        }
+        return asp.runtime.variant_int(strconv.atoi(token));
+    }
+}
+
+// Serialize supported Variants with cycle/depth protection. Runtime objects are
+// read through request ObjectSpace and never expose internal ids in JSON.
+func json_stringify_variant(ctx: asp.runtime.RequestContext, value: asp.runtime.Variant, depth: Int = 0) -> String {
+    if depth > 128 {
+        return "null";
+    }
+    if value.kind == asp.runtime.VariantNull || value.kind == asp.runtime.VariantEmpty || value.kind == asp.runtime.VariantNothing {
+        return "null";
+    }
+    if value.kind == asp.runtime.VariantBool {
+        return value.bool_value ? "true" : "false";
+    }
+    if value.kind == asp.runtime.VariantInt {
+        return strconv.itoa(value.int_value);
+    }
+    if value.kind == asp.runtime.VariantFloat {
+        return strconv.format_float64(value.float_value);
+    }
+    if value.kind == asp.runtime.VariantString || value.kind == asp.runtime.VariantDate {
+        return "\"" + eg_openasp_json_escape(value.to_output_string()) + "\"";
+    }
+    if value.kind == asp.runtime.VariantArray {
+        let output: String = "[";
+        let i: Int = 0;
+        loop i < value.array_data.items.len() {
+            if i > 0 {
+                output += ",";
+            }
+            output += json_stringify_variant(ctx, value.array_data.items.get(i), depth + 1);
+            i += 1;
+        }
+        return output + "]";
+    }
+    if value.kind == asp.runtime.VariantObject {
+        let object: asp.vm.RuntimeObject = ctx.objects.get(value.object_value);
+        if kind_of(object) == ComponentJsonObject {
+            let output: String = "{";
+            let i: Int = 0;
+            loop i + 1 < object.items.len() {
+                if i > 0 {
+                    output += ",";
+                }
+                output += "\"" + eg_openasp_json_escape(object.items.get(i).to_output_string()) + "\":" + json_stringify_variant(ctx, object.items.get(i + 1), depth + 1);
+                i += 2;
+            }
+            return output + "}";
+        }
+        if object.kind == asp.vm.RuntimeObjectDictionary {
+            let output: String = "{";
+            let i: Int = 0;
+            loop i < object.store.entries.len() {
+                if i > 0 {
+                    output += ",";
+                }
+                let entry: asp.runtime.Variant = object.store.entries.get(i);
+                output += "\"" + eg_openasp_json_escape(entry.store_key) + "\":" + json_stringify_variant(ctx, entry, depth + 1);
+                i += 1;
+            }
+            return output + "}";
+        }
+    }
+    return "null";
+}
+
+func json_object_key_index(object: asp.vm.RuntimeObject, key: String) -> Int {
+    let i: Int = 0;
+    loop i + 1 < object.items.len() {
+        if object.items.get(i).to_output_string() == key {
+            return i;
+        }
+        i += 2;
+    }
+    return -1;
+}
+
+func invoke_json_object(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let object: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    let name: String = strings.to_lower_ascii(member);
+    if (name == "item" || std.len(member) == 0) && values.len() > 0 {
+        let key: String = values.get(0).to_output_string();
+        let index: Int = json_object_key_index(object, key);
+        if is_set && values.len() > 1 {
+            if index >= 0 {
+                _ = object.items.set(index + 1, values.get(1));
+            } else {
+                _ = object.items.push(asp.runtime.variant_string(key));
+                _ = object.items.push(values.get(1));
+            }
+            evaluator.set_object(ctx, obj_id, object);
+            return asp.runtime.variant_empty();
+        }
+        return index >= 0 ? object.items.get(index + 1) : asp.runtime.variant_empty();
+    }
+    if name == "exists" && values.len() > 0 {
+        return asp.runtime.variant_bool(json_object_key_index(object, values.get(0).to_output_string()) >= 0);
+    }
+    if name == "count" {
+        return asp.runtime.variant_int(object.items.len() / 2);
+    }
+    if name == "keys" || name == "items" {
+        let result: collections.Vector<asp.runtime.Variant> = new collections.Vector<asp.runtime.Variant>();
+        let i: Int = name == "keys" ? 0 : 1;
+        loop i < object.items.len() {
+            _ = result.push(object.items.get(i));
+            i += 2;
+        }
+        return asp.runtime.variant_array(result);
+    }
+    evaluator.raise_runtime_error(ctx, 438, "JSON object member not found: " + member, "OpenASP.JSON.Object");
+    return asp.runtime.variant_empty();
+}
+
+func invoke_json(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    _ = obj_id;
+    _ = is_set;
+    let name: String = strings.to_lower_ascii(member);
+    if name == "validate" && values.len() > 0 {
+        return asp.runtime.variant_bool(eg_openasp_json_validate(values.get(0).to_output_string()) != 0);
+    }
+    if name == "minify" && values.len() > 0 {
+        let input: String = values.get(0).to_output_string();
+        if eg_openasp_json_validate(input) == 0 {
+            evaluator.raise_runtime_error(ctx, 5, "invalid JSON input; verify commas, quotes, and nesting", "OpenASP.JSON");
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_string(eg_openasp_json_minify(input));
+    }
+    if name == "escape" && values.len() > 0 {
+        return asp.runtime.variant_string(eg_openasp_json_escape(values.get(0).to_output_string()));
+    }
+    if name == "stringify" && values.len() > 0 {
+        let output: String = json_stringify_variant(ctx, values.get(0));
+        if eg_openasp_json_validate(output) == 0 {
+            evaluator.raise_runtime_error(ctx, 5, "value cannot be represented as valid JSON; check numeric values and nesting", "OpenASP.JSON");
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_string(output);
+    }
+    if name == "parse" && values.len() > 0 {
+        let input: String = values.get(0).to_output_string();
+        if eg_openasp_json_validate(input) == 0 {
+            evaluator.raise_runtime_error(ctx, 5, "invalid JSON input; verify commas, quotes, and nesting", "OpenASP.JSON");
+            return asp.runtime.variant_empty();
+        }
+        let parser: OpenAspJsonParser = new OpenAspJsonParser(ctx, input);
+        let result: asp.runtime.Variant = parser.parse_value();
+        parser.skip_space();
+        if parser.failed || parser.offset != std.len(input) {
+            evaluator.raise_runtime_error(ctx, 5, "invalid JSON input near byte " + strconv.itoa(parser.offset), "OpenASP.JSON");
+            return asp.runtime.variant_empty();
+        }
+        return result;
+    }
+    evaluator.raise_runtime_error(ctx, 438, "JSON member not found: " + member, "OpenASP.JSON");
+    return asp.runtime.variant_empty();
+}
+
+func invoke_crypto(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    _ = obj_id;
+    _ = is_set;
+    let name: String = strings.to_lower_ascii(member);
+    if name == "sha256" && values.len() > 0 {
+        return asp.runtime.variant_string(eg_openasp_sha256(values.get(0).to_output_string()));
+    }
+    if name == "hmacsha256" && values.len() > 1 {
+        return asp.runtime.variant_string(eg_openasp_hmac_sha256(values.get(0).to_output_string(), values.get(1).to_output_string()));
+    }
+    if (name == "base64encode" || name == "base64urlencode") && values.len() > 0 {
+        return asp.runtime.variant_string(eg_openasp_base64_encode(values.get(0).to_output_string(), name == "base64urlencode" ? 1 : 0));
+    }
+    if (name == "base64decode" || name == "base64urldecode") && values.len() > 0 {
+        return asp.runtime.variant_string(eg_openasp_base64_decode(values.get(0).to_output_string(), name == "base64urldecode" ? 1 : 0));
+    }
+    if name == "randombytes" {
+        let count: Int = values.len() > 0 ? asp.variant_to_int(values.get(0)) : 32;
+        if count < 1 || count > 1048576 {
+            evaluator.raise_runtime_error(ctx, 5, "RandomBytes count must be between 1 and 1048576", "OpenASP.Crypto");
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_string(eg_openasp_random_bytes(count));
+    }
+    if name == "randomhex" {
+        let count: Int = values.len() > 0 ? asp.variant_to_int(values.get(0)) : 32;
+        if count < 1 || count > 1048576 {
+            evaluator.raise_runtime_error(ctx, 5, "RandomHex count must be between 1 and 1048576", "OpenASP.Crypto");
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_string(asp.runtime.hex_encode(eg_openasp_random_bytes(count)));
+    }
+    if name == "constanttimeequals" && values.len() > 1 {
+        return asp.runtime.variant_bool(eg_openasp_constant_time_equals(values.get(0).to_output_string(), values.get(1).to_output_string()) != 0);
+    }
+    evaluator.raise_runtime_error(ctx, 438, "Crypto member not found or has invalid arguments: " + member, "OpenASP.Crypto");
+    return asp.runtime.variant_empty();
+}
+
+// Detect a complete HTTP/1 response using headers plus Content-Length or chunk
+// terminator. EOF-delimited bodies remain incomplete until the socket closes.
+func openasp_http_response_complete(raw: String, method: String) -> Bool {
+    let separator: Int = strings.index(raw, "\r\n\r\n");
+    if separator < 0 {
+        return false;
+    }
+    if strings.equal_fold_ascii(method, "HEAD") {
+        return true;
+    }
+    let headers: String = std.substr(raw, 0, separator + 2);
+    let content_length: String = net.http.header_value(strings.to_lower_ascii(headers), "content-length");
+    if std.len(content_length) > 0 {
+        return std.len(raw) >= separator + 4 + strconv.atoi(content_length);
+    }
+    if strings.contains_ascii_case(headers, "transfer-encoding: chunked") {
+        return strings.ends_with(raw, "\r\n0\r\n\r\n") || strings.contains(raw, "\r\n0\r\n\r\n");
+    }
+    return false;
+}
+
+// Perform one synchronous HTTP request and store response metadata back on the
+// component. URL parsing, TLS, timeouts, and body limits are enforced by the
+// native networking layer.
+func openasp_http_request(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, method: String, raw_url: String, body: String) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    let url, parse_error = net.url.parse(raw_url);
+    if (parse_error != std.OK || (!strings.equal_fold_ascii(url.scheme, "http") && !strings.equal_fold_ascii(url.scheme, "https"))) {
+        evaluator.raise_runtime_error(ctx, 5, "invalid HTTP URL; use an absolute http:// or https:// URL", obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    if strings.contains(method, "\r") || strings.contains(method, "\n") || strings.contains(obj.auxiliary_text, "\r\n\r\n") {
+        evaluator.raise_runtime_error(ctx, 5, "invalid HTTP method or headers; CRLF injection is not allowed", obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    let request_path: String = std.len(url.path) > 0 ? url.path : "/";
+    let request: String = strings.to_upper_ascii(method) + " " + request_path + " HTTP/1.1\r\nHost: " + url.host + "\r\nUser-Agent: OpenASP-HttpClient/1.0\r\nAccept: */*\r\nConnection: close\r\n" + obj.auxiliary_text;
+    if (std.len(body) > 0 && !strings.contains_ascii_case(obj.auxiliary_text, "content-length:")) {
+        request += "Content-Length: " + strconv.itoa(std.len(body)) + "\r\n";
+    }
+    request += "\r\n" + body;
+    let raw: String = "";
+    let io_error: ErrCode = std.OK;
+    let timeout_ms: Int = obj.cursor > 0 ? obj.cursor : 30000;
+    let maximum: Int = obj.auxiliary_int > 0 ? obj.auxiliary_int : 16777216;
+    if strings.equal_fold_ascii(url.scheme, "https") {
+        let fd, tcp_error = net.tcp.connect(url.host, url.port > 0 ? url.port : 443, timeout_ms);
+        if tcp_error != std.OK {
+            io_error = tcp_error;
+        } else {
+            let handle, connect_error = net.tls.upgrade_client_fd_ex(fd, url.host, timeout_ms, obj.lock_type >= 0, obj.transaction_backup_path);
+            if connect_error != std.OK {
+                io_error = connect_error;
+            } else {
+                let _, send_error = net.tls.send(handle, request, timeout_ms);
+                if send_error != std.OK {
+                    io_error = send_error;
+                } else {
+                    loop std.len(raw) <= maximum {
+                        let chunk, receive_error = net.tls.recv(handle, 16384, timeout_ms);
+                        if receive_error == std.ERR_EOF {
+                            break;
+                        }
+                        if receive_error != std.OK {
+                            io_error = receive_error;
+                            break;
+                        }
+                        if std.len(chunk) == 0 {
+                            break;
+                        }
+                        raw += chunk;
+                        if openasp_http_response_complete(raw, method) {
+                            break;
+                        }
+                    }
+                    if std.len(raw) > maximum {
+                        io_error = std.ERR_INVALID;
+                    }
+                }
+                _ = net.tls.close(handle);
+            }
+        }
+    } else {
+        let fd, connect_error = net.tcp.connect(url.host, url.port > 0 ? url.port : 80, timeout_ms);
+        if connect_error != std.OK {
+            io_error = connect_error;
+        } else {
+            let _, send_error = net.tcp.send(fd, request, timeout_ms);
+            if send_error != std.OK {
+                io_error = send_error;
+            } else {
+                _ = net.clear_last_error();
+                raw = net.http.http_recv_all_tcp(fd, maximum, timeout_ms);
+                io_error = net.last_err_code();
+            }
+            _ = net.tcp.close(fd);
+        }
+    }
+    if io_error != std.OK {
+        evaluator.raise_runtime_error(ctx, 12000 + (io_error => Int), "HTTP request failed with network error " + strconv.itoa(io_error => Int) + "; verify URL, TLS, and timeout", obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    obj.class_name = strings.to_upper_ascii(method);
+    obj.default_member = raw_url;
+    obj.secondary_text = raw;
+    obj.text_value = net.http.response_body(raw);
+    obj.int_value = http_status_from_raw(raw);
+    obj.opened = true;
+    evaluator.set_object(ctx, obj_id, obj);
+    return asp.runtime.variant_string(obj.text_value);
+}
+
+func invoke_http_client(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    let name: String = strings.to_lower_ascii(member);
+    if name == "setheader" && values.len() > 1 {
+        let key: String = values.get(0).to_output_string();
+        let value: String = values.get(1).to_output_string();
+        if (strings.contains(key, "\r") || strings.contains(key, "\n") || strings.contains(value, "\r") || strings.contains(value, "\n")) {
+            evaluator.raise_runtime_error(ctx, 5, "HTTP header names and values cannot contain CR or LF", obj.prog_id);
+            return asp.runtime.variant_empty();
+        }
+        obj.auxiliary_text += key + ": " + value + "\r\n";
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if name == "clearheaders" {
+        obj.auxiliary_text = "";
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if name == "timeout" {
+        if is_set && values.len() > 0 {
+            obj.cursor = asp.variant_to_int(values.get(values.len() - 1));
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_int(obj.cursor > 0 ? obj.cursor : 30000);
+    }
+    if name == "maxresponsebytes" {
+        if is_set && values.len() > 0 {
+            obj.auxiliary_int = asp.variant_to_int(values.get(values.len() - 1));
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_int(obj.auxiliary_int > 0 ? obj.auxiliary_int : 16777216);
+    }
+    if name == "tlsverify" {
+        if is_set && values.len() > 0 {
+            obj.lock_type = asp.variant_to_int(values.get(values.len() - 1)) == 0 ? -1 : 1;
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_bool(obj.lock_type >= 0);
+    }
+    if name == "cafile" {
+        if is_set && values.len() > 0 {
+            obj.transaction_backup_path = values.get(values.len() - 1).to_output_string();
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_string(obj.transaction_backup_path);
+    }
+    if name == "send" && values.len() > 1 {
+        return openasp_http_request(evaluator, ctx, obj_id, values.get(0).to_output_string(), values.get(1).to_output_string(), values.len() > 2 ? values.get(2).to_output_string() : "");
+    }
+    if name == "get" && values.len() > 0 {
+        return openasp_http_request(evaluator, ctx, obj_id, "GET", values.get(0).to_output_string(), "");
+    }
+    if name == "post" && values.len() > 1 {
+        return openasp_http_request(evaluator, ctx, obj_id, "POST", values.get(0).to_output_string(), values.get(1).to_output_string());
+    }
+    if name == "status" {
+        return asp.runtime.variant_int(obj.int_value);
+    }
+    if name == "responsebody" || name == "responsetext" {
+        return asp.runtime.variant_string(obj.text_value);
+    }
+    if name == "responseheaders" {
+        let separator: Int = strings.index(obj.secondary_text, "\r\n\r\n");
+        return asp.runtime.variant_string(separator >= 0 ? std.substr(obj.secondary_text, 0, separator + 2) : "");
+    }
+    if name == "getresponseheader" && values.len() > 0 {
+        let separator: Int = strings.index(obj.secondary_text, "\r\n\r\n");
+        let headers: String = separator >= 0 ? std.substr(obj.secondary_text, 0, separator + 2) : "";
+        return asp.runtime.variant_string(net.http.header_value(strings.to_lower_ascii(headers), strings.to_lower_ascii(values.get(0).to_output_string())));
+    }
+    evaluator.raise_runtime_error(ctx, 438, "HttpClient member not found or has invalid arguments: " + member, obj.prog_id);
+    return asp.runtime.variant_empty();
+}
+
+func openai_request(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, endpoint: String, payload: String) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    if std.len(strings.trim_space(obj.text_value)) == 0 {
+        evaluator.raise_runtime_error(ctx, 5, "APIKey is required; assign OpenASP.OpenAI.APIKey before sending a request", obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    if strings.contains(obj.text_value, "\r") || strings.contains(obj.text_value, "\n") {
+        evaluator.raise_runtime_error(ctx, 5, "APIKey cannot contain CR or LF characters", obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    let base_url: String = std.len(obj.default_member) > 0 ? obj.default_member : "https://api.openai.com/v1";
+    let http_id: Int = ctx.objects.create_component("OpenASP.HttpClient");
+    let http: asp.vm.RuntimeObject = ctx.objects.get(http_id);
+    http.cursor = obj.cursor > 0 ? obj.cursor : 120000;
+    http.auxiliary_int = obj.auxiliary_int > 0 ? obj.auxiliary_int : 16777216;
+    http.auxiliary_text = "Authorization: Bearer " + obj.text_value + "\r\nContent-Type: application/json\r\n";
+    evaluator.set_object(ctx, http_id, http);
+    let result: asp.runtime.Variant = openasp_http_request(evaluator, ctx, http_id, "POST", base_url + endpoint, payload);
+    let completed: asp.vm.RuntimeObject = evaluator.get_object(ctx, http_id);
+    obj.int_value = completed.int_value;
+    obj.secondary_text = completed.text_value;
+    evaluator.set_object(ctx, obj_id, obj);
+    return result;
+}
+
+func invoke_openai(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    let name: String = strings.to_lower_ascii(member);
+    if name == "apikey" || name == "baseurl" || name == "model" {
+        if is_set && values.len() > 0 {
+            let value: String = values.get(values.len() - 1).to_output_string();
+            if name == "apikey" {
+                obj.text_value = value;
+            } else if name == "baseurl" {
+                obj.default_member = strings.ends_with(value, "/") ? std.substr(value, 0, std.len(value) - 1) : value;
+            } else {
+                obj.class_name = value;
+            }
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_string(name == "apikey" ? obj.text_value : (name == "baseurl" ? obj.default_member : obj.class_name));
+    }
+    if name == "timeout" {
+        if is_set && values.len() > 0 {
+            obj.cursor = asp.variant_to_int(values.get(values.len() - 1));
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_int(obj.cursor > 0 ? obj.cursor : 120000);
+    }
+    if name == "maxresponsebytes" {
+        if is_set && values.len() > 0 {
+            obj.auxiliary_int = asp.variant_to_int(values.get(values.len() - 1));
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_int(obj.auxiliary_int > 0 ? obj.auxiliary_int : 16777216);
+    }
+    if name == "chatcompletions" && values.len() > 0 {
+        let input: String = values.get(0).to_output_string();
+        let payload: String = eg_openasp_json_validate(input) != 0
+            ? input
+            : "{\"model\":\"" + eg_openasp_json_escape(std.len(obj.class_name) > 0 ? obj.class_name : "gpt-4o-mini") + "\",\"messages\":[{\"role\":\"user\",\"content\":\"" + eg_openasp_json_escape(input) + "\"}]}";
+        return openai_request(evaluator, ctx, obj_id, "/chat/completions", payload);
+    }
+    if name == "responses" && values.len() > 0 {
+        let input: String = values.get(0).to_output_string();
+        let payload: String = eg_openasp_json_validate(input) != 0
+            ? input
+            : "{\"model\":\"" + eg_openasp_json_escape(std.len(obj.class_name) > 0 ? obj.class_name : "gpt-4o-mini") + "\",\"input\":\"" + eg_openasp_json_escape(input) + "\"}";
+        return openai_request(evaluator, ctx, obj_id, "/responses", payload);
+    }
+    if name == "status" {
+        return asp.runtime.variant_int(obj.int_value);
+    }
+    if name == "lastresponse" {
+        return asp.runtime.variant_string(obj.secondary_text);
+    }
+    evaluator.raise_runtime_error(ctx, 438, "OpenAI member not found or has invalid arguments: " + member, obj.prog_id);
+    return asp.runtime.variant_empty();
+}
+
+func process_packet_field(packet: String, field: Int) -> String {
+    let start: Int = 0;
+    let index: Int = 0;
+    loop index <= field {
+        let newline: Int = strings.index_from(packet, "\n", start);
+        if newline < 0 {
+            return "";
+        }
+        if index == field {
+            return std.substr(packet, start, newline - start);
+        }
+        start = newline + 1;
+        index += 1;
+    }
+    return "";
+}
+
+// Process is privileged and rechecks the runtime switch on every invocation.
+// Synchronous Run uses bounded output and timeout fields; asynchronous Start
+// stores only a pid and exposes explicit Wait/Terminate operations.
+func invoke_process(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    let name: String = strings.to_lower_ascii(member);
+    if name == "fork" {
+        let pid: Int = eg_openasp_process_fork();
+        if pid < 0 {
+            evaluator.raise_runtime_error(ctx, 5, "cannot fork process (native error " + strconv.itoa(0 - pid) + "); call Fork only before starting threads or opening worker-local resources", obj.prog_id);
+            return asp.runtime.variant_empty();
+        }
+        obj.cursor_type = pid;
+        obj.int_value = -1;
+        obj.lock_type = 0;
+        obj.page_size = 0;
+        obj.secondary_text = pid == 0 ? "child" : "forked";
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_int(pid);
+    }
+    if name == "waitpid" {
+        let pid: Int = values.len() > 0 ? asp.variant_to_int(values.get(0)) : -1;
+        let timeout_ms: Int = values.len() > 1 ? asp.variant_to_int(values.get(1)) : -1;
+        let packet: String = eg_openasp_process_waitpid(pid, timeout_ms);
+        let result_pid: Int = strconv.atoi(process_packet_field(packet, 0));
+        let exit_code: Int = strconv.atoi(process_packet_field(packet, 1));
+        let term_signal: Int = strconv.atoi(process_packet_field(packet, 2));
+        let error_number: Int = strconv.atoi(process_packet_field(packet, 3));
+        if result_pid < 0 {
+            obj.page_size = error_number;
+            obj.secondary_text = "error";
+            evaluator.set_object(ctx, obj_id, obj);
+            evaluator.raise_runtime_error(ctx, 5, "cannot wait for child process (native error " + strconv.itoa(error_number) + "); verify the PID belongs to this process and has not already been reaped", obj.prog_id);
+            return asp.runtime.variant_empty();
+        }
+        if result_pid > 0 {
+            obj.cursor_type = result_pid;
+            obj.int_value = exit_code;
+            obj.lock_type = term_signal;
+            obj.page_size = 0;
+            obj.secondary_text = "completed";
+            evaluator.set_object(ctx, obj_id, obj);
+        }
+        return asp.runtime.variant_int(result_pid);
+    }
+    if name == "signal" || name == "killpid" {
+        if values.len() < 1 {
+            evaluator.raise_runtime_error(ctx, 5, "Signal requires a positive PID", obj.prog_id);
+            return asp.runtime.variant_bool(false);
+        }
+        let pid: Int = asp.variant_to_int(values.get(0));
+        let signal_number: Int = values.len() > 1 ? asp.variant_to_int(values.get(1)) : 15;
+        return asp.runtime.variant_bool(eg_openasp_process_signal(pid, signal_number) != 0);
+    }
+    if name == "exit" {
+        let exit_code: Int = values.len() > 0 ? asp.variant_to_int(values.get(0)) : 0;
+        _ = eg_openasp_process_exit(exit_code);
+        return asp.runtime.variant_empty();
+    }
+    if name == "start" && values.len() > 0 {
+        if obj.active_connection_id > 0 {
+            let previous_exit: Int = eg_openasp_process_wait(obj.active_connection_id, 0);
+            if previous_exit == -1 {
+                evaluator.raise_runtime_error(ctx, 5, "Start requires an idle Process object; call Wait or Terminate for the current child first", obj.prog_id);
+                return asp.runtime.variant_empty();
+            }
+            obj.int_value = previous_exit;
+            obj.active_connection_id = 0;
+            obj.opened = false;
+        }
+        let raw_executable: String = values.get(0).to_output_string();
+        let executable: String = strings.contains(raw_executable, "/") || strings.contains(raw_executable, "\\") ? asp.asp_host_path(raw_executable) : raw_executable;
+        let arguments: String = values.len() > 1 ? values.get(1).to_output_string() : "";
+        let directory: String = values.len() > 2 && std.len(values.get(2).to_output_string()) > 0 ? asp.asp_host_path(values.get(2).to_output_string()) : "";
+        let pid: Int = eg_openasp_process_start(executable, arguments, directory);
+        if pid <= 0 {
+            evaluator.raise_runtime_error(ctx, 5, "cannot start process (native error " + strconv.itoa(0 - pid) + "); verify executable path, arguments, and working directory", obj.prog_id);
+            return asp.runtime.variant_empty();
+        }
+        obj.active_connection_id = pid;
+        obj.int_value = -1;
+        obj.opened = true;
+        obj.text_value = "";
+        obj.auxiliary_text = "";
+        obj.secondary_text = "running";
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_object(obj_id);
+    }
+    if name == "run" && values.len() > 0 {
+        if obj.active_connection_id > 0 {
+            evaluator.raise_runtime_error(ctx, 5, "Run requires an idle Process object; call Wait or Terminate for the current child first", obj.prog_id);
+            return asp.runtime.variant_empty();
+        }
+        let raw_executable: String = values.get(0).to_output_string();
+        let executable: String = strings.contains(raw_executable, "/") || strings.contains(raw_executable, "\\") ? asp.asp_host_path(raw_executable) : raw_executable;
+        let arguments: String = values.len() > 1 ? values.get(1).to_output_string() : "";
+        let directory: String = values.len() > 2 && std.len(values.get(2).to_output_string()) > 0 ? asp.asp_host_path(values.get(2).to_output_string()) : "";
+        let stdin_data: String = values.len() > 3 ? values.get(3).to_output_string() : "";
+        let timeout_ms: Int = values.len() > 4 ? asp.variant_to_int(values.get(4)) : (obj.cursor > 0 ? obj.cursor : 30000);
+        let max_output: Int = values.len() > 5 ? asp.variant_to_int(values.get(5)) : (obj.auxiliary_int > 0 ? obj.auxiliary_int : 4194304);
+        let packet: String = eg_openasp_process_run(executable, arguments, directory, stdin_data, timeout_ms, max_output);
+        obj.int_value = strconv.atoi(process_packet_field(packet, 0));
+        obj.opened = process_packet_field(packet, 1) == "1";
+        obj.secondary_text = obj.opened ? "timedout" : "completed";
+        let output_length: Int = strconv.atoi(process_packet_field(packet, 2));
+        let error_length: Int = strconv.atoi(process_packet_field(packet, 3));
+        let header_end: Int = strings.index_from(packet, "\n", strings.index_from(packet, "\n", strings.index_from(packet, "\n", strings.index(packet, "\n") + 1) + 1) + 1);
+        let body_start: Int = header_end + 1;
+        obj.text_value = output_length > 0 ? std.substr(packet, body_start, output_length) : "";
+        obj.auxiliary_text = error_length > 0 ? std.substr(packet, body_start + output_length, error_length) : "";
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_object(obj_id);
+    }
+    if name == "wait" {
+        if obj.active_connection_id <= 0 {
+            evaluator.raise_runtime_error(ctx, 5, "Wait requires a child started by this Process object", obj.prog_id);
+            return asp.runtime.variant_empty();
+        }
+        let timeout_ms: Int = values.len() > 0 ? asp.variant_to_int(values.get(0)) : (obj.cursor > 0 ? obj.cursor : 30000);
+        let exit_code: Int = eg_openasp_process_wait(obj.active_connection_id, timeout_ms);
+        if exit_code >= 0 {
+            obj.int_value = exit_code;
+            obj.active_connection_id = 0;
+            obj.opened = false;
+            obj.secondary_text = "completed";
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_int(exit_code);
+        }
+        if exit_code == -1 {
+            return asp.runtime.variant_int(-1);
+        }
+        evaluator.raise_runtime_error(ctx, 5, "cannot wait for process; it is not a child of the current worker or was already reaped", obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    if name == "terminate" || name == "kill" {
+        if obj.active_connection_id <= 0 {
+            evaluator.raise_runtime_error(ctx, 5, "Terminate requires a running child started by this Process object", obj.prog_id);
+            return asp.runtime.variant_bool(false);
+        }
+        let signal_number: Int = values.len() > 0 ? asp.variant_to_int(values.get(0)) : 15;
+        return asp.runtime.variant_bool(eg_openasp_process_terminate(obj.active_connection_id, signal_number) != 0);
+    }
+    if name == "isrunning" {
+        if obj.active_connection_id <= 0 {
+            return asp.runtime.variant_bool(false);
+        }
+        let exit_code: Int = eg_openasp_process_wait(obj.active_connection_id, 0);
+        if exit_code == -1 {
+            return asp.runtime.variant_bool(true);
+        }
+        if exit_code >= 0 {
+            obj.int_value = exit_code;
+            obj.active_connection_id = 0;
+            obj.opened = false;
+            obj.secondary_text = "completed";
+            evaluator.set_object(ctx, obj_id, obj);
+        } else if exit_code == -2 {
+            obj.active_connection_id = 0;
+            obj.opened = false;
+            obj.secondary_text = "unknown";
+            evaluator.set_object(ctx, obj_id, obj);
+        }
+        return asp.runtime.variant_bool(false);
+    }
+    if name == "pid" {
+        return asp.runtime.variant_int(obj.active_connection_id);
+    }
+    if name == "timeout" || name == "maxoutputbytes" {
+        if is_set && values.len() > 0 {
+            if name == "timeout" {
+                obj.cursor = asp.variant_to_int(values.get(values.len() - 1));
+            } else {
+                obj.auxiliary_int = asp.variant_to_int(values.get(values.len() - 1));
+            }
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_int(name == "timeout" ? (obj.cursor > 0 ? obj.cursor : 30000) : (obj.auxiliary_int > 0 ? obj.auxiliary_int : 4194304));
+    }
+    if name == "exitcode" {
+        return asp.runtime.variant_int(obj.int_value);
+    }
+    if name == "termsignal" {
+        return asp.runtime.variant_int(obj.lock_type);
+    }
+    if name == "lastpid" {
+        return asp.runtime.variant_int(obj.cursor_type);
+    }
+    if name == "lasterror" {
+        return asp.runtime.variant_int(obj.page_size);
+    }
+    if name == "stdout" {
+        return asp.runtime.variant_string(obj.text_value);
+    }
+    if name == "stderr" {
+        return asp.runtime.variant_string(obj.auxiliary_text);
+    }
+    if name == "timedout" {
+        return asp.runtime.variant_bool(obj.secondary_text == "timedout");
+    }
+    evaluator.raise_runtime_error(ctx, 438, "Process member not found or has invalid arguments: " + member, obj.prog_id);
+    return asp.runtime.variant_empty();
+}

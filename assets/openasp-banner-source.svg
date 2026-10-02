@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="600" viewBox="0 0 1600 600">
+  <rect width="1600" height="600" fill="#f8fafc"/>
+  <rect x="0" y="0" width="1600" height="8" fill="#f26f5b"/>
+  <rect x="0" y="592" width="1600" height="8" fill="#19a7ae"/>
+
+  <g fill="#e8edf2">
+    <rect x="44" y="58" width="14" height="14"/>
+    <rect x="72" y="58" width="14" height="14"/>
+    <rect x="100" y="58" width="14" height="14"/>
+    <rect x="44" y="86" width="14" height="14"/>
+    <rect x="100" y="86" width="14" height="14"/>
+    <rect x="128" y="86" width="14" height="14"/>
+    <rect x="1458" y="472" width="14" height="14"/>
+    <rect x="1486" y="472" width="14" height="14"/>
+    <rect x="1514" y="472" width="14" height="14"/>
+    <rect x="1430" y="500" width="14" height="14"/>
+    <rect x="1486" y="500" width="14" height="14"/>
+    <rect x="1514" y="528" width="14" height="14"/>
+  </g>
+
+  <g transform="translate(138 135)">
+    <path d="M84 70 H154 C184 70 204 90 204 120 V214"
+          fill="none" stroke="#bd3d17" stroke-width="12" stroke-linecap="round"/>
+    <path d="M204 120 H274 C304 120 324 100 324 70 V34"
+          fill="none" stroke="#19a7ae" stroke-width="12" stroke-linecap="round"/>
+    <circle cx="58" cy="70" r="34" fill="#ffd7c8" stroke="#bd3d17" stroke-width="12"/>
+    <circle cx="324" cy="24" r="34" fill="#d8f3f4" stroke="#137f86" stroke-width="12"/>
+    <rect x="148" y="202" width="112" height="76" rx="10"
+          fill="#ffffff" stroke="#bd3d17" stroke-width="12"/>
+    <path d="M188 225 L169 240 L188 255 M220 225 L239 240 L220 255 M211 220 L197 260"
+          fill="none" stroke="#bd3d17" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="204" cy="120" r="12" fill="#f26f5b"/>
+  </g>
+
+  <g font-family="Arial, Helvetica, sans-serif">
+    <text x="515" y="328" font-size="190" font-weight="900" fill="#f2b9aa">OpenASP</text>
+    <text x="503" y="316" font-size="190" font-weight="900" fill="#20242a">Open</text>
+    <text x="968" y="316" font-size="190" font-weight="900" fill="#d84f1b">ASP</text>
+    <rect x="507" y="355" width="716" height="5" fill="#d8dee5"/>
+    <text x="510" y="414" font-size="38" font-weight="700" fill="#3f4852">NATIVE CLASSIC ASP RUNTIME</text>
+    <text x="510" y="466" font-size="27" fill="#65717d">VBScript · FastCGI · AOT · Native C</text>
+  </g>
+
+  <g transform="translate(1290 170)" fill="none" stroke-linecap="round">
+    <path d="M0 30 H120 V104 H206" stroke="#19a7ae" stroke-width="8"/>
+    <path d="M40 0 V68 H164 V164" stroke="#bd3d17" stroke-width="8"/>
+    <path d="M0 210 H80 V152 H206" stroke="#65717d" stroke-width="8"/>
+    <circle cx="0" cy="30" r="13" fill="#d8f3f4" stroke="#137f86" stroke-width="7"/>
+    <circle cx="40" cy="0" r="13" fill="#ffd7c8" stroke="#bd3d17" stroke-width="7"/>
+    <circle cx="0" cy="210" r="13" fill="#eef1f4" stroke="#65717d" stroke-width="7"/>
+    <circle cx="206" cy="104" r="13" fill="#d8f3f4" stroke="#137f86" stroke-width="7"/>
+    <circle cx="164" cy="164" r="13" fill="#ffd7c8" stroke="#bd3d17" stroke-width="7"/>
+    <circle cx="206" cy="152" r="13" fill="#eef1f4" stroke="#65717d" stroke-width="7"/>
+  </g>
+</svg>

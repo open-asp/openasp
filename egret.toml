@@ -1,0 +1,18 @@
+[package]
+name = "openasp"
+version = "0.1.0"
+
+[[bin]]
+name = "openasp-fpm"
+main = "cmd/openasp_fpm.eg"
+
+[[bin]]
+name = "openasp"
+main = "cmd/openasp.eg"
+
+[[bin]]
+name = "openasp-cli"
+main = "cmd/openasp_cli.eg"
+
+[lib]
+modules = ["asp"]

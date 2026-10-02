@@ -1,0 +1,355 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.compiler;
+
+use asp.runtime;
+
+use std;
+use strings;
+use strconv;
+use collections;
+
+// The lexer intentionally works on bytes rather than Unicode code points.
+// VBScript keywords and punctuation are ASCII, while bytes inside quoted
+// strings are copied verbatim by the native scanner. This keeps source
+// offsets compatible with the parser, diagnostics, and serialized programs.
+extern func eg_asp_vbs_string_end(text: String, start: Int) -> Int;
+extern func eg_asp_vbs_string_value(text: String, start: Int, end: Int) -> String;
+
+// Identifiers follow the legacy VBScript ASCII rules. A dot is accepted only
+// after the first character because the parser initially keeps a qualified
+// name such as "Response.Write" as one token.
+func vbs_is_ident_start(ch: Int) -> Bool {
+    return strings.is_ascii_alpha_byte(ch) || ch == '_';
+}
+
+func vbs_is_ident_part(ch: Int) -> Bool {
+    return strings.is_ascii_alnum_byte(ch) || ch == '_' || ch == '.';
+}
+
+// Converts one preprocessed script fragment into a flat token stream.
+//
+// Design constraints:
+// - `line` is the physical line in the preprocessed fragment and is captured
+//   on every token for later diagnostics.
+// - malformed literals are skipped or truncated here; the parser owns
+//   user-facing syntax errors and must remain able to consume the stream.
+// - CRLF is emitted as one newline, and a trailing underscore plus newline is
+//   consumed as continuation without emitting a separator.
+// - strings are delegated to C so escaped quotes can be scanned and decoded
+//   without allocating a temporary substring per input byte.
+class VbsLexer {
+    // The lexer has no mutable configuration; the constructor exists so it
+    // conforms to the object-shaped compiler API used by callers.
+    func init(self: VbsLexer) -> Void {
+    }
+
+    // Scans left to right in O(input bytes). `i` always points at the first
+    // unconsumed byte and each successful branch must advance it or `skip`.
+    // Keep that progress invariant when adding token forms to avoid a hot loop.
+    func lex(self: VbsLexer, text: String) -> collections.Vector<VbsToken> {
+        let tokens: collections.Vector<VbsToken> = new collections.Vector<VbsToken>();
+        let i: Int = 0;
+        let line: Int = 1;
+        loop i < std.len(text) {
+            let ch: Int = std.byte_at(text, i);
+            if ch == '\r' {
+                _ = tokens.push(new VbsToken(VbsTokenNewline, "\n", line));
+                line += 1;
+                i += 1;
+                if i < std.len(text) && std.byte_at(text, i) == '\n' {
+                    i += 1;
+                }
+                skip;
+            }
+            if ch == '_' {
+                // A continuation marker may contain horizontal whitespace
+                // before the newline. It removes the logical statement break.
+                let j: Int = i + 1;
+                loop j < std.len(text) && (std.byte_at(text, j) == ' ' || std.byte_at(text, j) == '\t') {
+                    j += 1;
+                }
+                if j >= std.len(text) || std.byte_at(text, j) == '\n' || std.byte_at(text, j) == '\r' {
+                    if j < std.len(text) && std.byte_at(text, j) == '\r' {
+                        line += 1;
+                        j += 1;
+                        if j < std.len(text) && std.byte_at(text, j) == '\n' {
+                            j += 1;
+                        }
+                    } else if j < std.len(text) && std.byte_at(text, j) == '\n' {
+                        line += 1;
+                        j += 1;
+                    }
+                    i = j;
+                    skip;
+                }
+            }
+            if ch == '\n' {
+                _ = tokens.push(new VbsToken(VbsTokenNewline, "\n", line));
+                line += 1;
+                i += 1;
+                skip;
+            }
+            if ch == ' ' || ch == '\t' {
+                i += 1;
+                skip;
+            }
+            if ch == '\'' {
+                loop i < std.len(text) && std.byte_at(text, i) != '\n' && std.byte_at(text, i) != '\r' {
+                    i += 1;
+                }
+                skip;
+            }
+            if ch == ':' {
+                _ = tokens.push(new VbsToken(VbsTokenColon, ":", line));
+                i += 1;
+                skip;
+            }
+            if ch == '(' {
+                _ = tokens.push(new VbsToken(VbsTokenLParen, "(", line));
+                i += 1;
+                skip;
+            }
+            if ch == ')' {
+                _ = tokens.push(new VbsToken(VbsTokenRParen, ")", line));
+                i += 1;
+                skip;
+            }
+            if ch == ',' {
+                _ = tokens.push(new VbsToken(VbsTokenComma, ",", line));
+                i += 1;
+                skip;
+            }
+            if ch == '=' {
+                if i + 1 < std.len(text) && std.byte_at(text, i + 1) == '<' {
+                    _ = tokens.push(new VbsToken(VbsTokenLe, "=<", line));
+                    i += 2;
+                    skip;
+                }
+                if i + 1 < std.len(text) && std.byte_at(text, i + 1) == '>' {
+                    _ = tokens.push(new VbsToken(VbsTokenGe, "=>", line));
+                    i += 2;
+                    skip;
+                }
+                _ = tokens.push(new VbsToken(VbsTokenEq, "=", line));
+                i += 1;
+                skip;
+            }
+            if ch == '[' {
+                // Bracketed identifiers permit spaces and reserved words. The
+                // brackets are syntax and therefore excluded from token text.
+                let start: Int = i + 1;
+                i += 1;
+                loop i < std.len(text) && std.byte_at(text, i) != ']' {
+                    i += 1;
+                }
+                if i < std.len(text) {
+                    _ = tokens.push(new VbsToken(VbsTokenIdentifier, std.substr(text, start, i - start), line));
+                    i += 1;
+                }
+                skip;
+            }
+            if ch == '#' {
+                // Date literals may not cross a physical line. Validation of
+                // the date payload is deferred to the parser/runtime helper.
+                let start: Int = i + 1;
+                i += 1;
+                loop i < std.len(text) && std.byte_at(text, i) != '#' {
+                    if std.byte_at(text, i) == '\n' || std.byte_at(text, i) == '\r' {
+                        break;
+                    }
+                    i += 1;
+                }
+                if i < std.len(text) && std.byte_at(text, i) == '#' {
+                    _ = tokens.push(new VbsToken(VbsTokenDate, std.substr(text, start, i - start), line));
+                    i += 1;
+                }
+                skip;
+            }
+            if ch == '&' && i + 2 < std.len(text)
+                && (std.byte_at(text, i + 1) == 'H' || std.byte_at(text, i + 1) == 'h')
+                && (strings.is_ascii_digit_byte(std.byte_at(text, i + 2))
+                    || (std.byte_at(text, i + 2) >= 'A' && std.byte_at(text, i + 2) <= 'F')
+                    || (std.byte_at(text, i + 2) >= 'a' && std.byte_at(text, i + 2) <= 'f')) {
+                // Preserve the original spelling, including optional trailing
+                // '&', because numeric conversion applies VBScript semantics.
+                let start: Int = i;
+                i += 2;
+                loop i < std.len(text) {
+                    let cur: Int = std.byte_at(text, i);
+                    let is_hex: Bool = strings.is_ascii_digit_byte(cur)
+                    || (cur >= 'A' && cur <= 'F')
+                    || (cur >= 'a' && cur <= 'f');
+                    if !is_hex {
+                        break;
+                    }
+                    i += 1;
+                }
+                if i < std.len(text) && std.byte_at(text, i) == '&' {
+                    i += 1;
+                }
+                _ = tokens.push(new VbsToken(VbsTokenInteger, std.substr(text, start, i - start), line));
+                skip;
+            }
+            if ch == '&' && i + 1 < std.len(text)
+                && std.byte_at(text, i + 1) >= '0' && std.byte_at(text, i + 1) <= '7' {
+                let start: Int = i;
+                i += 1;
+                loop i < std.len(text) && std.byte_at(text, i) >= '0' && std.byte_at(text, i) <= '7' {
+                    i += 1;
+                }
+                if i < std.len(text) && std.byte_at(text, i) == '&' {
+                    i += 1;
+                }
+                _ = tokens.push(new VbsToken(VbsTokenInteger, std.substr(text, start, i - start), line));
+                skip;
+            }
+            if ch == '&' {
+                _ = tokens.push(new VbsToken(VbsTokenAmp, "&", line));
+                i += 1;
+                skip;
+            }
+            if ch == '+' {
+                _ = tokens.push(new VbsToken(VbsTokenPlus, "+", line));
+                i += 1;
+                skip;
+            }
+            if ch == '-' {
+                _ = tokens.push(new VbsToken(VbsTokenMinus, "-", line));
+                i += 1;
+                skip;
+            }
+            if ch == '*' {
+                _ = tokens.push(new VbsToken(VbsTokenStar, "*", line));
+                i += 1;
+                skip;
+            }
+            if ch == '/' {
+                _ = tokens.push(new VbsToken(VbsTokenSlash, "/", line));
+                i += 1;
+                skip;
+            }
+            if ch == '\\' {
+                _ = tokens.push(new VbsToken(VbsTokenBackslash, "\\", line));
+                i += 1;
+                skip;
+            }
+            if ch == '^' {
+                _ = tokens.push(new VbsToken(VbsTokenCaret, "^", line));
+                i += 1;
+                skip;
+            }
+            if ch == '.' {
+                // A leading dot followed by a digit is a floating literal.
+                // Otherwise whitespace before the dot is retained as a token
+                // hint used to disambiguate `With` shorthand from member calls.
+                if i + 1 < std.len(text) && strings.is_ascii_digit_byte(std.byte_at(text, i + 1)) {
+                    let start: Int = i;
+                    i += 1;
+                    loop i < std.len(text) && strings.is_ascii_digit_byte(std.byte_at(text, i)) {
+                        i += 1;
+                    }
+                    if i < std.len(text) && (std.byte_at(text, i) == 'E' || std.byte_at(text, i) == 'e') {
+                        let exponent: Int = i;
+                        let cursor: Int = i + 1;
+                        if cursor < std.len(text) && (std.byte_at(text, cursor) == '+' || std.byte_at(text, cursor) == '-') {
+                            cursor += 1;
+                        }
+                        if cursor < std.len(text) && strings.is_ascii_digit_byte(std.byte_at(text, cursor)) {
+                            i = cursor + 1;
+                            loop i < std.len(text) && strings.is_ascii_digit_byte(std.byte_at(text, i)) {
+                                i += 1;
+                            }
+                        } else {
+                            i = exponent;
+                        }
+                    }
+                    _ = tokens.push(new VbsToken(VbsTokenFloat, std.substr(text, start, i - start), line));
+                    skip;
+                }
+                let separated_dot: Bool = i > 0 && (std.byte_at(text, i - 1) == ' ' || std.byte_at(text, i - 1) == '\t');
+                _ = tokens.push(new VbsToken(VbsTokenDot, separated_dot ? " ." : ".", line));
+                i += 1;
+                skip;
+            }
+            if ch == '<' {
+                if i + 1 < std.len(text) && std.byte_at(text, i + 1) == '=' {
+                    _ = tokens.push(new VbsToken(VbsTokenLe, "<=", line));
+                    i += 2;
+                    skip;
+                }
+                if i + 1 < std.len(text) && std.byte_at(text, i + 1) == '>' {
+                    _ = tokens.push(new VbsToken(VbsTokenNe, "<>", line));
+                    i += 2;
+                    skip;
+                }
+                _ = tokens.push(new VbsToken(VbsTokenLess, "<", line));
+                i += 1;
+                skip;
+            }
+            if ch == '>' {
+                if i + 1 < std.len(text) && std.byte_at(text, i + 1) == '=' {
+                    _ = tokens.push(new VbsToken(VbsTokenGe, ">=", line));
+                    i += 2;
+                    skip;
+                }
+                _ = tokens.push(new VbsToken(VbsTokenGreater, ">", line));
+                i += 1;
+                skip;
+            }
+            if ch == '"' {
+                let start: Int = i + 1;
+                i = eg_asp_vbs_string_end(text, start);
+                let s: String = eg_asp_vbs_string_value(text, start, i);
+                _ = tokens.push(new VbsToken(VbsTokenString, s, line));
+                skip;
+            }
+            if strings.is_ascii_digit_byte(ch) {
+                let start: Int = i;
+                i += 1;
+                loop i < std.len(text) && strings.is_ascii_digit_byte(std.byte_at(text, i)) {
+                    i += 1;
+                }
+                let kind: VbsTokenKind = VbsTokenInteger;
+                if i + 1 < std.len(text) && std.byte_at(text, i) == '.' && strings.is_ascii_digit_byte(std.byte_at(text, i + 1)) {
+                    kind = VbsTokenFloat;
+                    i += 1;
+                    loop i < std.len(text) && strings.is_ascii_digit_byte(std.byte_at(text, i)) {
+                        i += 1;
+                    }
+                }
+                if i < std.len(text) && (std.byte_at(text, i) == 'E' || std.byte_at(text, i) == 'e') {
+                    let exponent: Int = i;
+                    let cursor: Int = i + 1;
+                    if cursor < std.len(text) && (std.byte_at(text, cursor) == '+' || std.byte_at(text, cursor) == '-') {
+                        cursor += 1;
+                    }
+                    if cursor < std.len(text) && strings.is_ascii_digit_byte(std.byte_at(text, cursor)) {
+                        kind = VbsTokenFloat;
+                        i = cursor + 1;
+                        loop i < std.len(text) && strings.is_ascii_digit_byte(std.byte_at(text, i)) {
+                            i += 1;
+                        }
+                    } else {
+                        i = exponent;
+                    }
+                }
+                _ = tokens.push(new VbsToken(kind, std.substr(text, start, i - start), line));
+                skip;
+            }
+            if vbs_is_ident_start(ch) {
+                let start: Int = i;
+                i += 1;
+                loop i < std.len(text) && vbs_is_ident_part(std.byte_at(text, i)) {
+                    i += 1;
+                }
+                _ = tokens.push(new VbsToken(VbsTokenIdentifier, std.substr(text, start, i - start), line));
+                skip;
+            }
+            i += 1;
+        }
+        _ = tokens.push(new VbsToken(VbsTokenEof, "", line));
+        return tokens;
+    }
+}

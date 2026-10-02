@@ -1,0 +1,92 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.server;
+
+use asp.runtime;
+
+use std;
+use collections;
+
+// Fully assembled FastCGI request. Codec owns record reassembly; downstream
+// code therefore sees one params map and one contiguous stdin body.
+class FastcgiInboundRequest {
+    var request_id: Int;
+    var keep_conn: Bool;
+    var params: collections.Map<String, String>;
+    var stdin_data: String;
+
+    func init(self: FastcgiInboundRequest) -> Void {
+        self.request_id = 1;
+        self.keep_conn = false;
+        self.params = new collections.Map<String, String>();
+        self.stdin_data = "";
+    }
+}
+
+// Result of decoding FastCGI's one-byte/four-byte length prefix. `next_off`
+// always identifies where the following field begins.
+class FastcgiLenDecode {
+    var value: Int;
+    var next_off: Int;
+
+    func init(self: FastcgiLenDecode) -> Void {
+        self.value = 0;
+        self.next_off = 0;
+    }
+}
+
+// Content-Type metadata discovered in an HTML meta element. Empty fields mean
+// the HTTP response settings remain authoritative.
+class MetaContentTypeInfo {
+    var content_type: String;
+    var charset: String;
+
+    func init(self: MetaContentTypeInfo) -> Void {
+        self.content_type = "";
+        self.charset = "";
+    }
+}
+
+// Response transferred from rendering to the connection writer. When
+// `body_is_view` is true, `body_view` borrows storage from `response_owner`;
+// that owner must remain live until the asynchronous send completes.
+class FastcgiRenderedResponse {
+    var status_code: Int;
+    var status_text: String;
+    var content_type: String;
+    var charset: String;
+    var body: String;
+    var body_view: std.StringView;
+    var body_is_view: Bool;
+    var response_owner: asp.runtime.ResponseData;
+    var headers: collections.Map<String, String>;
+
+    func init(self: FastcgiRenderedResponse) -> Void {
+        self.status_code = 500;
+        self.status_text = "Internal Server Error";
+        self.content_type = "text/html";
+        self.charset = "utf-8";
+        self.body = "";
+        self.body_view = std.view("");
+        self.body_is_view = false;
+        self.response_owner = new asp.runtime.ResponseData();
+        self.headers = new collections.Map<String, String>();
+    }
+}
+
+// Tracks one spawned connection future without removing vector entries from a
+// completion callback. Workers compact inactive slots at controlled points.
+class FastcgiConnTaskSlot {
+    var fut: Future(Int);
+    var active: Bool;
+
+    func init(self: FastcgiConnTaskSlot, fut: Future(Int)) -> Void {
+        self.fut = fut;
+        self.active = true;
+    }
+
+    func deactivate(self: FastcgiConnTaskSlot) -> Void {
+        self.active = false;
+    }
+}

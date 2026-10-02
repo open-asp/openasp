@@ -1,0 +1,870 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.runtime;
+
+use asp.compiler;
+use asp.vm;
+
+use asp;
+use std;
+use bytes;
+use fmt;
+use fs;
+use os;
+use sync;
+use strings;
+use strconv;
+use collections;
+use path;
+use time;
+
+extern func __gc_keepalive(obj: Any) -> Void;
+extern func eg_asp_gc_pin_compiled_page(object: CompiledPage) -> Int;
+extern func eg_asp_gc_unpin_object(pin: Int) -> Void;
+extern func eg_asp_mmap_length(handle: Int) -> Int;
+extern func eg_asp_mmap_matches(handle: Int, offset: Int, expected: String) -> Int;
+extern func eg_asp_mmap_read_u32(handle: Int, offset: Int) -> Int;
+extern func eg_asp_mmap_read_i64(handle: Int, offset: Int) -> Int;
+extern func eg_asp_mmap_checksum(handle: Int, offset: Int, length: Int) -> Int;
+extern func eg_asp_mmap_copy_string(handle: Int, offset: Int, length: Int) -> String;
+
+// Stable textual node tags retained for compatibility with older cache data.
+func page_node_kind_text(kind: asp.compiler.PageNodeKind) -> String {
+    if kind == asp.compiler.PageNodeScript {
+        return "script";
+    }
+    if kind == asp.compiler.PageNodeExpr {
+        return "expr";
+    }
+    return "literal";
+}
+
+func page_node_kind_from_text(text: String) -> asp.compiler.PageNodeKind {
+    if strings.equal_fold_ascii(text, "script") {
+        return asp.compiler.PageNodeScript;
+    }
+    if strings.equal_fold_ascii(text, "expr") {
+        return asp.compiler.PageNodeExpr;
+    }
+    return asp.compiler.PageNodeLiteral;
+}
+
+// Immutable compiled representation of one ASP page and all include
+// dependencies. Programs may be hydrated managed objects or views into
+// `mapped_image_handle`; the mapping must outlive every such view.
+// `execution_mu` serializes lazy hydration and other one-time mutations.
+class CompiledPage {
+    var page_path: String;
+    var source_text: String;
+    var mtime_sec: Int;
+    var include_paths: collections.Vector<String>;
+    var include_mtimes: collections.Vector<Int>;
+    var nodes: collections.Vector<asp.compiler.PageNode>;
+    var program_blobs: collections.Vector<String>;
+    var program_blob_offsets: collections.Vector<Int>;
+    var program_blob_lengths: collections.Vector<Int>;
+    var mapped_image_handle: Int;
+    var programs: collections.Vector<asp.vm.VbsBytecodeProgram>;
+    var primary_program: asp.vm.VbsBytecodeProgram;
+    var execution_mu: sync.Mutex;
+    var cache_bytes: Int;
+
+    func init(self: CompiledPage) -> Void {
+        self.page_path = "";
+        self.source_text = "";
+        self.mtime_sec = 0;
+        self.include_paths = new collections.Vector<String>();
+        self.include_mtimes = new collections.Vector<Int>();
+        self.nodes = new collections.Vector<asp.compiler.PageNode>();
+        self.program_blobs = new collections.Vector<String>();
+        self.program_blob_offsets = new collections.Vector<Int>();
+        self.program_blob_lengths = new collections.Vector<Int>();
+        self.mapped_image_handle = 0;
+        self.programs = new collections.Vector<asp.vm.VbsBytecodeProgram>();
+        self.primary_program = new asp.vm.VbsBytecodeProgram();
+        self.execution_mu = new sync.Mutex();
+        self.cache_bytes = 0;
+    }
+
+    func is_fresh(self: CompiledPage) -> Bool {
+        let current_sec, current_err = fs.stat_mtime(self.page_path);
+        let current_nsec, current_nsec_err = fs.stat_mtime_nsec(self.page_path);
+        let current: Int = (current_sec * 1000000000) + current_nsec;
+        if current_err != OK || current_nsec_err != OK || current != self.mtime_sec {
+            return false;
+        }
+        let i: Int = 0;
+        loop i < self.include_paths.len() {
+            let inc: String = self.include_paths.get(i);
+            let mtime_sec, mtime_err = fs.stat_mtime(inc);
+            let mtime_nsec, mtime_nsec_err = fs.stat_mtime_nsec(inc);
+            let mtime: Int = (mtime_sec * 1000000000) + mtime_nsec;
+            if mtime_err != OK || mtime_nsec_err != OK || mtime != self.include_mtimes.get(i) {
+                return false;
+            }
+            i += 1;
+        }
+        return true;
+    }
+
+    // Explicit keepalive is used across native calls whose handles do not make
+    // the managed page graph visible to conservative liveness analysis.
+    func keep_alive(self: CompiledPage) -> Void {
+        __gc_keepalive(self);
+    }
+
+    func node_count(self: CompiledPage) -> Int {
+        return self.nodes.len();
+    }
+
+    func node_at(self: CompiledPage, index: Int) -> asp.compiler.PageNode {
+        return self.nodes.get(index);
+    }
+
+    func program_blob_count(self: CompiledPage) -> Int {
+        return self.program_blobs.len();
+    }
+
+    func program_blob_at(self: CompiledPage, index: Int) -> String {
+        return self.program_blobs.get(index);
+    }
+
+    func program_count(self: CompiledPage) -> Int {
+        return self.programs.len();
+    }
+
+    func program_at(self: CompiledPage, index: Int) -> asp.vm.VbsBytecodeProgram {
+        return self.programs.get(index);
+    }
+
+}
+
+// Keep this wrapper after CompiledPage so its GC descriptor sees the complete
+// pointee layout and traces the compiled graph during nested page execution.
+class CompiledPageRoot {
+    var page: CompiledPage;
+    var program: asp.vm.VbsBytecodeProgram;
+    var execution_mu: sync.Mutex;
+    var parent: CompiledPageRoot;
+    var has_parent: Bool;
+
+    func init(self: CompiledPageRoot) -> Void {
+        self.page = new CompiledPage();
+        self.program = new asp.vm.VbsBytecodeProgram();
+        self.execution_mu = new sync.Mutex();
+        self.parent = self;
+        self.has_parent = false;
+    }
+
+    func link(self: CompiledPageRoot, page: CompiledPage, parent: CompiledPageRoot) -> Void {
+        let execution_mu: sync.Mutex = page.execution_mu;
+        self.execution_mu = execution_mu;
+        self.parent = parent;
+        self.has_parent = true;
+        self.page = page;
+    }
+
+    func set_program(self: CompiledPageRoot, program: asp.vm.VbsBytecodeProgram) -> Void {
+        self.program = program;
+    }
+
+    func keep_alive(self: CompiledPageRoot) -> Void {
+        __gc_keepalive(self);
+    }
+}
+
+// Cache magic and version are disk ABI. Increment the version whenever field
+// order, integer width, checksum coverage, or bytecode encoding changes.
+func page_cache_magic() -> String {
+    return "EGBPC001";
+}
+
+func page_cache_format_version() -> Int {
+    // v13 records the optimizer mode so --optimize=off can never execute a
+    // previously cached optimized page (and vice versa).
+    return 13;
+}
+
+func page_cache_optimizer_mode() -> Int {
+    return asp.vm.vbs_compiler_optimizations_enabled() ? 1 : 0;
+}
+
+func page_cache_checksum(data: String) -> Int {
+    return eg_asp_text_checksum(data);
+}
+
+func page_cache_write_u32(out: bytes.Buffer, value: Int) -> Void {
+    out.write_u8(value & 255);
+    out.write_u8((value >> 8) & 255);
+    out.write_u8((value >> 16) & 255);
+    out.write_u8((value >> 24) & 255);
+}
+
+func page_cache_write_i64(out: bytes.Buffer, value: Int) -> Void {
+    let i: Int = 0;
+    loop i < 8 {
+        out.write_u8((value >> (i * 8)) & 255);
+        i += 1;
+    }
+}
+
+func page_cache_write_string(out: bytes.Buffer, value: String) -> Void {
+    page_cache_write_u32(out, std.len(value));
+    out.write_string(value);
+}
+
+func page_cache_read_u32(data: String, offset: Int) -> Int {
+    return std.byte_at(data, offset)
+        | (std.byte_at(data, offset + 1) << 8)
+        | (std.byte_at(data, offset + 2) << 16)
+        | (std.byte_at(data, offset + 3) << 24);
+}
+
+func page_cache_read_i64(data: String, offset: Int) -> Int {
+    let value: Int = 0;
+    let i: Int = 0;
+    loop i < 8 {
+        value = value | (std.byte_at(data, offset + i) << (i * 8));
+        i += 1;
+    }
+    return value;
+}
+
+// Managed and mapped readers implement the same checked primitive operations.
+// Their sticky `ok` flag prevents publishing a partially validated page.
+class PageCacheBinaryReader {
+    var data: String;
+    var offset: Int;
+    var end: Int;
+    var valid: Bool;
+
+    func init(self: PageCacheBinaryReader, data: String) -> Void {
+        self.data = data;
+        self.offset = 0;
+        self.end = std.len(data);
+        self.valid = true;
+    }
+
+    func can_read(self: PageCacheBinaryReader, length: Int) -> Bool {
+        return self.valid && length >= 0 && self.offset >= 0 && self.offset + length >= self.offset && self.offset + length <= self.end;
+    }
+
+    func read_u32(self: PageCacheBinaryReader) -> Int {
+        if !self.can_read(4) {
+            self.valid = false;
+            return 0;
+        }
+        let value: Int = page_cache_read_u32(self.data, self.offset);
+        self.offset += 4;
+        return value;
+    }
+
+    func read_i64(self: PageCacheBinaryReader) -> Int {
+        if !self.can_read(8) {
+            self.valid = false;
+            return 0;
+        }
+        let value: Int = page_cache_read_i64(self.data, self.offset);
+        self.offset += 8;
+        return value;
+    }
+
+    func read_string(self: PageCacheBinaryReader) -> String {
+        let length: Int = self.read_u32();
+        if !self.can_read(length) {
+            self.valid = false;
+            return "";
+        }
+        let value: String = std.substr(self.data, self.offset, length);
+        self.offset += length;
+        return value;
+    }
+}
+
+class MappedBinaryReader {
+    var handle: Int;
+    var offset: Int;
+    var end: Int;
+    var valid: Bool;
+    var last_span_length: Int;
+
+    func init(self: MappedBinaryReader, handle: Int, offset: Int, length: Int) -> Void {
+        self.handle = handle;
+        self.offset = offset;
+        self.end = offset + length;
+        self.valid = handle != 0 && offset >= 0 && length >= 0
+            && self.end >= offset && self.end <= eg_asp_mmap_length(handle);
+        self.last_span_length = 0;
+    }
+
+    func can_read(self: MappedBinaryReader, length: Int) -> Bool {
+        return self.valid && length >= 0 && self.offset >= 0
+            && self.offset + length >= self.offset
+            && self.offset + length <= self.end;
+    }
+
+    func read_u32(self: MappedBinaryReader) -> Int {
+        if !self.can_read(4) {
+            self.valid = false;
+            return 0;
+        }
+        let value: Int = eg_asp_mmap_read_u32(self.handle, self.offset);
+        self.offset += 4;
+        return value;
+    }
+
+    func read_i64(self: MappedBinaryReader) -> Int {
+        if !self.can_read(8) {
+            self.valid = false;
+            return 0;
+        }
+        let value: Int = eg_asp_mmap_read_i64(self.handle, self.offset);
+        self.offset += 8;
+        return value;
+    }
+
+    func read_span(self: MappedBinaryReader) -> Int {
+        let length: Int = self.read_u32();
+        self.last_span_length = length;
+        if !self.can_read(length) {
+            self.valid = false;
+            self.last_span_length = 0;
+            return 0;
+        }
+        let start: Int = self.offset;
+        self.offset += length;
+        return start;
+    }
+
+    func read_string(self: MappedBinaryReader) -> String {
+        let start: Int = self.read_span();
+        return self.valid
+            ? eg_asp_mmap_copy_string(self.handle, start, self.last_span_length)
+            : "";
+    }
+
+    func read_ints(self: MappedBinaryReader) -> collections.Vector<Int> {
+        let values: collections.Vector<Int> = new collections.Vector<Int>();
+        let count: Int = self.read_u32();
+        if count < 0 || count > 16777216 || !self.can_read(count * 8) {
+            self.valid = false;
+            return values;
+        }
+        values.reserve(count);
+        let i: Int = 0;
+        loop i < count {
+            _ = values.push(self.read_i64());
+            i += 1;
+        }
+        return values;
+    }
+
+    func read_strings(self: MappedBinaryReader) -> collections.Vector<String> {
+        let values: collections.Vector<String> = new collections.Vector<String>();
+        let count: Int = self.read_u32();
+        if count < 0 || count > 1048576 {
+            self.valid = false;
+            return values;
+        }
+        values.reserve(count);
+        let i: Int = 0;
+        loop i < count {
+            _ = values.push(self.read_string());
+            i += 1;
+        }
+        return values;
+    }
+}
+
+// Two-level page cache.
+//
+// The process/AOT set keeps mmap-backed compiled pages pinned for long-lived
+// workers. The worker set is bounded and pruned by recency/size. Disk entries
+// are accepted only after magic, version, bounds, checksum, and dependency
+// mtimes pass. The mutex protects publication and pin counts, not execution.
+class PageCache {
+    var paths: PersistencePaths;
+    var mu: sync.Mutex;
+    var worker_paths: collections.Vector<String>;
+    var worker_pages: collections.Vector<CompiledPage>;
+    var worker_sizes: collections.Vector<Int>;
+    var worker_touches: collections.Vector<Int>;
+    var worker_pins: collections.Vector<Int>;
+    var worker_root_handles: collections.Vector<Int>;
+    var worker_bytes: Int;
+    var worker_budget_bytes: Int;
+    var worker_clock: Int;
+    var aot_resident: Bool;
+
+    func init(self: PageCache, paths: PersistencePaths) -> Void {
+        self.paths = paths;
+        self.mu = new sync.Mutex();
+        self.worker_paths = new collections.Vector<String>();
+        self.worker_pages = new collections.Vector<CompiledPage>();
+        self.worker_sizes = new collections.Vector<Int>();
+        self.worker_touches = new collections.Vector<Int>();
+        self.worker_pins = new collections.Vector<Int>();
+        self.worker_root_handles = new collections.Vector<Int>();
+        self.worker_bytes = 0;
+        let cache_mb: Int = 0;
+        let cache_mb_text, cache_mb_err = os.getenv("EGRET_ASP_WORKER_CACHE_MB");
+        if cache_mb_err == OK && std.len(cache_mb_text) != 0 {
+            cache_mb = strconv.atoi(cache_mb_text);
+        }
+        if cache_mb < 0 {
+            cache_mb = 0;
+        }
+        if cache_mb > 512 {
+            cache_mb = 512;
+        }
+        self.worker_budget_bytes = cache_mb * 1024 * 1024;
+        self.worker_clock = 0;
+        self.aot_resident = false;
+    }
+
+    func parse_data(self: PageCache, data: String) -> CompiledPage, ErrCode {
+        if std.len(data) < 20
+        || std.substr(data, 0, 8) != page_cache_magic()
+        || page_cache_read_u32(data, 8) != page_cache_format_version() {
+            return new CompiledPage(), ERR_INVALID;
+        }
+        let payload_length: Int = page_cache_read_u32(data, 12);
+        let expected_checksum: Int = page_cache_read_u32(data, 16);
+        if payload_length < 0 || payload_length != std.len(data) - 20 {
+            return new CompiledPage(), ERR_INVALID;
+        }
+        let payload: String = std.substr(data, 20, payload_length);
+        if page_cache_checksum(payload) != expected_checksum {
+            return new CompiledPage(), ERR_INVALID;
+        }
+        let page: CompiledPage = new CompiledPage();
+        let reader: PageCacheBinaryReader = new PageCacheBinaryReader(payload);
+        if reader.read_u32() != page_cache_optimizer_mode() {
+            return new CompiledPage(), ERR_INVALID;
+        }
+        page.page_path = reader.read_string();
+        page.mtime_sec = reader.read_i64();
+        let include_count: Int = reader.read_u32();
+        if include_count < 0 || include_count > 65536 {
+            return new CompiledPage(), ERR_INVALID;
+        }
+        let include_index: Int = 0;
+        loop include_index < include_count {
+            _ = page.include_paths.push(reader.read_string());
+            _ = page.include_mtimes.push(reader.read_i64());
+            include_index += 1;
+        }
+        page.source_text = reader.read_string();
+        let node_count: Int = reader.read_u32();
+        if node_count < 0 || node_count > 1048576 {
+            return new CompiledPage(), ERR_INVALID;
+        }
+        let node_index: Int = 0;
+        loop node_index < node_count {
+            let kind_value: Int = reader.read_u32();
+            let line: Int = reader.read_u32();
+            let node_text: String = reader.read_string();
+            let source_file: String = reader.read_string();
+            if !reader.valid || kind_value < 0 || kind_value > 2 {
+                return new CompiledPage(), ERR_INVALID;
+            }
+            let kind: asp.compiler.PageNodeKind = asp.compiler.PageNodeLiteral;
+            if kind_value == (asp.compiler.PageNodeScript => Int) {
+                kind = asp.compiler.PageNodeScript;
+            } else if kind_value == (asp.compiler.PageNodeExpr => Int) {
+                kind = asp.compiler.PageNodeExpr;
+            }
+            _ = page.nodes.push(new asp.compiler.PageNode(kind, node_text, source_file, line));
+            node_index += 1;
+        }
+        let program_count: Int = reader.read_u32();
+        if program_count < 0 || program_count > 1048576 {
+            return new CompiledPage(), ERR_INVALID;
+        }
+        let program_index: Int = 0;
+        loop program_index < program_count {
+            let blob: String = reader.read_string();
+            if !reader.valid {
+                return new CompiledPage(), ERR_INVALID;
+            }
+            _ = page.program_blobs.push(blob);
+            program_index += 1;
+        }
+        if !reader.valid || reader.offset != payload_length || page.nodes.len() != page.program_blobs.len() {
+            return new CompiledPage(), ERR_INVALID;
+        }
+        // The deserialized graph is substantially larger than its compact file.
+        // Charge an empirical expansion factor so the LRU budget tracks retained
+        // heap instead of only on-disk bytes.
+        page.cache_bytes = std.len(data) * 12;
+        let fresh: Bool = page.is_fresh();
+        return page, fresh ? OK : ERR_NOT_FOUND;
+    }
+
+    // Mapped parsing records spans into the image and avoids copying bytecode
+    // and runtime metadata. On any failure, ownership remains with the caller.
+    func parse_mapped_data(self: PageCache, handle: Int, start: Int, length: Int) -> CompiledPage, ErrCode {
+        if handle == 0 || length < 20
+        || eg_asp_mmap_matches(handle, start, page_cache_magic()) == 0
+        || eg_asp_mmap_read_u32(handle, start + 8) != page_cache_format_version() {
+            return new CompiledPage(), ERR_INVALID;
+        }
+        let payload_length: Int = eg_asp_mmap_read_u32(handle, start + 12);
+        let expected_checksum: Int = eg_asp_mmap_read_u32(handle, start + 16);
+        if payload_length < 0 || payload_length != length - 20
+        || eg_asp_mmap_checksum(handle, start + 20, payload_length) != expected_checksum {
+            return new CompiledPage(), ERR_INVALID;
+        }
+        let page: CompiledPage = new CompiledPage();
+        let reader: MappedBinaryReader = new MappedBinaryReader(handle, start + 20, payload_length);
+        if reader.read_u32() != page_cache_optimizer_mode() {
+            return new CompiledPage(), ERR_INVALID;
+        }
+        page.mapped_image_handle = handle;
+        page.page_path = reader.read_string();
+        page.mtime_sec = reader.read_i64();
+        let include_count: Int = reader.read_u32();
+        if include_count < 0 || include_count > 65536 {
+            return new CompiledPage(), ERR_INVALID;
+        }
+        let include_index: Int = 0;
+        loop include_index < include_count {
+            _ = page.include_paths.push(reader.read_string());
+            _ = page.include_mtimes.push(reader.read_i64());
+            include_index += 1;
+        }
+        page.source_text = reader.read_string();
+        let node_count: Int = reader.read_u32();
+        if node_count < 0 || node_count > 1048576 {
+            return new CompiledPage(), ERR_INVALID;
+        }
+        let node_index: Int = 0;
+        loop node_index < node_count {
+            let kind_value: Int = reader.read_u32();
+            let line: Int = reader.read_u32();
+            let node_text: String = reader.read_string();
+            let source_file: String = reader.read_string();
+            if !reader.valid || kind_value < 0 || kind_value > 2 {
+                return new CompiledPage(), ERR_INVALID;
+            }
+            let kind: asp.compiler.PageNodeKind = asp.compiler.PageNodeLiteral;
+            if kind_value == (asp.compiler.PageNodeScript => Int) {
+                kind = asp.compiler.PageNodeScript;
+            } else if kind_value == (asp.compiler.PageNodeExpr => Int) {
+                kind = asp.compiler.PageNodeExpr;
+            }
+            _ = page.nodes.push(new asp.compiler.PageNode(kind, node_text, source_file, line));
+            node_index += 1;
+        }
+        let program_count: Int = reader.read_u32();
+        if program_count < 0 || program_count > 1048576 {
+            return new CompiledPage(), ERR_INVALID;
+        }
+        let program_index: Int = 0;
+        loop program_index < program_count {
+            let blob_start: Int = reader.read_span();
+            if !reader.valid {
+                return new CompiledPage(), ERR_INVALID;
+            }
+            _ = page.program_blob_offsets.push(blob_start);
+            _ = page.program_blob_lengths.push(reader.last_span_length);
+            program_index += 1;
+        }
+        if !reader.valid || reader.offset != start + length
+        || page.nodes.len() != page.program_blob_offsets.len() {
+            return new CompiledPage(), ERR_INVALID;
+        }
+        page.cache_bytes = length * 12;
+        let fresh: Bool = page.is_fresh();
+        return page, fresh ? OK : ERR_NOT_FOUND;
+    }
+
+    func parse_file(self: PageCache, cache_file: String) -> CompiledPage, ErrCode {
+        let data, read_err = fs.read_bytes(cache_file, -1);
+        if read_err != OK {
+            return new CompiledPage(), read_err;
+        }
+        return self.parse_data(data);
+    }
+
+    func enable_aot_residency(self: PageCache) -> Void {
+        self.aot_resident = true;
+    }
+
+    func remember_aot(self: PageCache, page: CompiledPage) -> CompiledPage {
+        _ = self.mu.lock();
+        let resident: CompiledPage = self.worker_remember(page.page_path, page);
+        _ = self.mu.unlock();
+        return resident;
+    }
+
+    // Hydration is idempotent and builds VbsBytecodeProgram objects from stored
+    // blobs/ranges before the page becomes executable.
+    func hydrate_programs(self: PageCache, page: CompiledPage) -> Bool {
+        _ = self;
+        page.programs = new collections.Vector<asp.vm.VbsBytecodeProgram>();
+        let i: Int = 0;
+        loop i < page.nodes.len() {
+            let node: asp.compiler.PageNode = page.nodes.get(i);
+            let program: asp.vm.VbsBytecodeProgram = new asp.vm.VbsBytecodeProgram();
+            if node.kind == asp.compiler.PageNodeScript || node.kind == asp.compiler.PageNodeExpr {
+                program = page.mapped_image_handle != 0
+                    ? asp.vm.deserialize_vbs_bytecode_program_mapped(
+                        page.mapped_image_handle,
+                        page.program_blob_offsets.get(i),
+                        page.program_blob_lengths.get(i)
+                    )
+                    : asp.vm.deserialize_vbs_bytecode_program(page.program_blobs.get(i));
+                if !program.ok() {
+                    page.programs = new collections.Vector<asp.vm.VbsBytecodeProgram>();
+                    return false;
+                }
+                // Runtime execution uses the hydrated bytecode. Retain source
+                // location metadata but release the duplicate script text.
+                node.text = "";
+            }
+            _ = page.programs.push(program);
+            if i == 0 {
+                // Keep a concrete direct edge without moving the value before it
+                // has been inserted into the generic program vector.
+                page.primary_program = page.programs.get(i);
+            }
+            i += 1;
+        }
+        if page.programs.len() != page.nodes.len() {
+            return false;
+        }
+        // Hydration makes the compact blobs redundant for both bounded dynamic
+        // caches and permanently resident AOT pages. Keeping them used to
+        // retain a second complete copy of every compiled program in workers
+        // whose cache budget was unlimited.
+        i = 0;
+        loop i < page.programs.len() {
+            let program: asp.vm.VbsBytecodeProgram = page.programs.get(i);
+            if program.ok() {
+                program.program.freeze_decoded();
+                program.serialized_program = "";
+                program.prepare_immutable();
+            }
+            i += 1;
+        }
+        page.program_blobs = new collections.Vector<String>();
+        page.program_blob_offsets = new collections.Vector<Int>();
+        page.program_blob_lengths = new collections.Vector<Int>();
+        page.source_text = "";
+        return true;
+    }
+
+    func worker_remove_at(self: PageCache, index: Int) -> Void {
+        self.worker_bytes -= self.worker_sizes.get(index);
+        let root_handle: Int = self.worker_root_handles.get(index);
+        if root_handle != 0 {
+            eg_asp_gc_unpin_object(root_handle);
+        }
+        _ = self.worker_paths.remove_at(index);
+        _ = self.worker_pages.remove(index, new CompiledPage());
+        _ = self.worker_sizes.remove_at(index);
+        _ = self.worker_touches.remove_at(index);
+        _ = self.worker_pins.remove_at(index);
+        _ = self.worker_root_handles.remove_at(index);
+    }
+
+    // Worker eviction skips pinned pages and maintains byte accounting in the
+    // same critical section as vector removal.
+    func worker_prune(self: PageCache) -> Void {
+        if self.aot_resident {
+            return;
+        }
+        loop self.worker_bytes > self.worker_budget_bytes && self.worker_paths.len() > 0 {
+            let oldest: Int = -1;
+            let i: Int = 0;
+            loop i < self.worker_touches.len() {
+                if self.worker_pins.get(i) == 0 && (oldest < 0 || self.worker_touches.get(i) < self.worker_touches.get(oldest)) {
+                    oldest = i;
+                }
+                i += 1;
+            }
+            if oldest < 0 {
+                return;
+            }
+            self.worker_remove_at(oldest);
+        }
+    }
+
+    func worker_remember(self: PageCache, page_path: String, page: CompiledPage) -> CompiledPage {
+        if page.cache_bytes <= 0 || (!self.aot_resident && page.cache_bytes > self.worker_budget_bytes) {
+            return page;
+        }
+        let page_bytes: Int = page.cache_bytes;
+        let existing: Int = 0;
+        loop existing < self.worker_paths.len() {
+            if self.worker_paths.get(existing) == page_path {
+                self.worker_remove_at(existing);
+                break;
+            }
+            existing += 1;
+        }
+        loop !self.aot_resident && self.worker_bytes + page.cache_bytes > self.worker_budget_bytes && self.worker_paths.len() > 0 {
+            let oldest: Int = -1;
+            let i: Int = 0;
+            loop i < self.worker_touches.len() {
+                if self.worker_pins.get(i) == 0 && (oldest < 0 || self.worker_touches.get(i) < self.worker_touches.get(oldest)) {
+                    oldest = i;
+                }
+                i += 1;
+            }
+            if oldest < 0 {
+                break;
+            }
+            self.worker_remove_at(oldest);
+        }
+        self.worker_clock += 1;
+        let root_handle: Int = eg_asp_gc_pin_compiled_page(page);
+        _ = self.worker_paths.push(page_path);
+        _ = self.worker_pages.push(page);
+        _ = self.worker_sizes.push(page_bytes);
+        _ = self.worker_touches.push(self.worker_clock);
+        _ = self.worker_pins.push(0);
+        _ = self.worker_root_handles.push(root_handle);
+        self.worker_bytes += page_bytes;
+        return self.worker_pages.get(self.worker_pages.len() - 1);
+    }
+
+    func pin(self: PageCache, page_path: String) -> Void {
+        _ = self.mu.lock();
+        let i: Int = 0;
+        loop i < self.worker_paths.len() {
+            if self.worker_paths.get(i) == page_path {
+                _ = self.worker_pins.set(i, self.worker_pins.get(i) + 1);
+                break;
+            }
+            i += 1;
+        }
+        _ = self.mu.unlock();
+    }
+
+    func unpin(self: PageCache, page_path: String) -> Void {
+        _ = self.mu.lock();
+        let i: Int = 0;
+        loop i < self.worker_paths.len() {
+            if self.worker_paths.get(i) == page_path {
+                let pins: Int = self.worker_pins.get(i);
+                if pins > 0 {
+                    _ = self.worker_pins.set(i, pins - 1);
+                }
+                break;
+            }
+            i += 1;
+        }
+        self.worker_prune();
+        _ = self.mu.unlock();
+    }
+
+    // Reads a page only if both cache integrity and source dependency freshness
+    // hold. A stale entry is a miss, never a partially reusable program.
+    func get_fresh(self: PageCache, page_path: String) -> CompiledPage, ErrCode {
+        _ = self.mu.lock();
+        let i: Int = 0;
+        loop i < self.worker_paths.len() {
+            if self.worker_paths.get(i) == page_path {
+                let resident: CompiledPage = self.worker_pages.get(i);
+                if resident.is_fresh() {
+                    _ = self.mu.unlock();
+                    return resident, OK;
+                }
+                self.worker_remove_at(i);
+                break;
+            }
+            i += 1;
+        }
+        let cache_file: String = self.paths.cache_file(page_path);
+        _ = self.mu.unlock();
+        let exists, _ = fs.exists(cache_file);
+        if !exists {
+            return new CompiledPage(), ERR_NOT_FOUND;
+        }
+        let page, parse_err = self.parse_file(cache_file);
+        // A resident AOT page can become stale when an included configuration
+        // file changes (for example c_option.asp after switching themes).
+        // Never reinsert the same stale disk image after evicting it.
+        if parse_err != OK || !page.is_fresh() || !self.hydrate_programs(page) {
+            return new CompiledPage(), ERR_NOT_FOUND;
+        }
+        _ = self.mu.lock();
+        let resident: CompiledPage = self.worker_remember(page_path, page);
+        _ = self.mu.unlock();
+        return resident, OK;
+    }
+
+    func put(self: PageCache, page_path: String, page: CompiledPage) -> CompiledPage {
+        if std.len(page.source_text) > 262144 {
+            return page;
+        }
+        _ = self.mu.lock();
+        let cache_file: String = self.paths.cache_file(page_path);
+        _ = self.mu.unlock();
+        self.paths.ensure_dirs();
+        let payload_buffer: bytes.Buffer = new bytes.Buffer();
+        page_cache_write_u32(payload_buffer, page_cache_optimizer_mode());
+        page_cache_write_string(payload_buffer, page.page_path);
+        page_cache_write_i64(payload_buffer, page.mtime_sec);
+        page_cache_write_u32(payload_buffer, page.include_paths.len());
+        let i: Int = 0;
+        loop i < page.include_paths.len() {
+            page_cache_write_string(payload_buffer, page.include_paths.get(i));
+            page_cache_write_i64(payload_buffer, page.include_mtimes.get(i));
+            i += 1;
+        }
+        page_cache_write_string(payload_buffer, page.source_text);
+        page_cache_write_u32(payload_buffer, page.nodes.len());
+        i = 0;
+        loop i < page.nodes.len() {
+            let node: asp.compiler.PageNode = page.nodes.get(i);
+            page_cache_write_u32(payload_buffer, node.kind => Int);
+            page_cache_write_u32(payload_buffer, node.line);
+            page_cache_write_string(payload_buffer, node.text);
+            page_cache_write_string(payload_buffer, node.source_file);
+            i += 1;
+        }
+        page_cache_write_u32(payload_buffer, page.program_blobs.len());
+        i = 0;
+        loop i < page.program_blobs.len() {
+            page_cache_write_string(payload_buffer, page.program_blobs.get(i));
+            i += 1;
+        }
+        let payload: String = payload_buffer.str();
+        payload_buffer.dispose();
+        let file_buffer: bytes.Buffer = new bytes.Buffer();
+        file_buffer.write_string(page_cache_magic());
+        page_cache_write_u32(file_buffer, page_cache_format_version());
+        page_cache_write_u32(file_buffer, std.len(payload));
+        page_cache_write_u32(file_buffer, page_cache_checksum(payload));
+        file_buffer.write_string(payload);
+        let body: String = file_buffer.str();
+        file_buffer.dispose();
+        let _, write_err = fs.write_bytes(cache_file, bytes.from_string(body));
+        if write_err == OK {
+            page.cache_bytes = std.len(body) * 12;
+            if self.worker_budget_bytes > 0 && page.programs.len() == page.nodes.len() {
+                i = 0;
+                loop i < page.programs.len() {
+                    let program: asp.vm.VbsBytecodeProgram = page.programs.get(i);
+                    if program.ok() {
+                        program.program.freeze_decoded();
+                        program.serialized_program = "";
+                    }
+                    i += 1;
+                }
+                page.program_blobs = new collections.Vector<String>();
+            }
+            if page.programs.len() == page.nodes.len() || self.hydrate_programs(page) {
+                _ = self.mu.lock();
+                let resident: CompiledPage = self.worker_remember(page_path, page);
+                _ = self.mu.unlock();
+                return resident;
+            }
+        }
+        return page;
+    }
+}

@@ -1,0 +1,388 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.compiler;
+
+use std;
+use strings;
+use strconv;
+use collections;
+
+// Scoped SSA facts. Mutable VBScript variables are deliberately not treated as
+// constants: Execute, ByRef calls, default properties, and application globals
+// can invalidate values in ways that a conventional static language cannot.
+// Const declarations are immutable definitions and therefore form safe SSA
+// values across the complete routine CFG.
+class VbsSsaDataFlow {
+    var constant_exprs: collections.Map<String, Int>;
+    var definition_versions: collections.Map<String, Int>;
+    var use_counts: collections.Map<String, Int>;
+    var visited_blocks: collections.Map<String, Int>;
+
+    func init(self: VbsSsaDataFlow) -> Void {
+        self.constant_exprs = new collections.Map<String, Int>();
+        self.definition_versions = new collections.Map<String, Int>();
+        self.use_counts = new collections.Map<String, Int>();
+        self.visited_blocks = new collections.Map<String, Int>();
+    }
+
+    func scoped_name(self: VbsSsaDataFlow, scope_id: Int, name: String) -> String {
+        _ = self;
+        return strconv.itoa(scope_id) + "|" + strings.to_lower_ascii(name);
+    }
+
+    func record_definition(self: VbsSsaDataFlow, scope_id: Int, name: String) -> Void {
+        let key: String = self.scoped_name(scope_id, name);
+        _ = self.definition_versions.set(key, self.definition_versions.get_or(key, 0) + 1);
+    }
+
+    func record_expr_uses(self: VbsSsaDataFlow, program: VbsProgram, scope_id: Int, expr_id: Int) -> Void {
+        if expr_id < 0 || expr_id >= program.exprs.len() {
+            return;
+        }
+        let expr: VbsExprNode = program.snapshot_expr(expr_id);
+        if expr.kind == VbsExprIdentifier {
+            let key: String = self.scoped_name(scope_id, expr.text);
+            _ = self.use_counts.set(key, self.use_counts.get_or(key, 0) + 1);
+        }
+        self.record_expr_uses(program, scope_id, expr.left_id);
+        self.record_expr_uses(program, scope_id, expr.right_id);
+        let i: Int = 0;
+        loop i < expr.arg_ids.len() {
+            self.record_expr_uses(program, scope_id, expr.arg_ids.get(i));
+            i += 1;
+        }
+    }
+
+    func analyze_block(self: VbsSsaDataFlow, program: VbsProgram, scope_id: Int, block_id: Int) -> Void {
+        if block_id < 0 || block_id >= program.blocks.len() {
+            return;
+        }
+        let visit_key: String = strconv.itoa(scope_id) + ":" + strconv.itoa(block_id);
+        if self.visited_blocks.has(visit_key) {
+            return;
+        }
+        _ = self.visited_blocks.set(visit_key, 1);
+        let stmt_ids: collections.Vector<Int> = program.blocks.get(block_id).stmt_ids;
+        let i: Int = 0;
+        loop i < stmt_ids.len() {
+            let stmt: VbsStmtNode = program.get_stmt(stmt_ids.get(i));
+            if stmt.kind == VbsStmtConst {
+                let j: Int = 0;
+                loop j < stmt.names.len() && j < stmt.expr_ids.len() {
+                    let key: String = self.scoped_name(scope_id, stmt.names.get(j));
+                    self.record_definition(scope_id, stmt.names.get(j));
+                    _ = self.constant_exprs.set(key, stmt.expr_ids.get(j));
+                    self.record_expr_uses(program, scope_id, stmt.expr_ids.get(j));
+                    j += 1;
+                }
+            } else {
+                if stmt.kind == VbsStmtAssign || stmt.kind == VbsStmtSetAssign {
+                    self.record_definition(scope_id, stmt.target_name);
+                }
+                self.record_expr_uses(program, scope_id, stmt.target_expr_id);
+                self.record_expr_uses(program, scope_id, stmt.value_expr_id);
+                self.record_expr_uses(program, scope_id, stmt.extra_expr_id);
+                self.record_expr_uses(program, scope_id, stmt.extra_expr_id2);
+                self.record_expr_uses(program, scope_id, stmt.cond_expr_id);
+                let j: Int = 0;
+                loop j < stmt.expr_ids.len() {
+                    self.record_expr_uses(program, scope_id, stmt.expr_ids.get(j));
+                    j += 1;
+                }
+                j = 0;
+                loop j < stmt.target_arg_ids.len() {
+                    self.record_expr_uses(program, scope_id, stmt.target_arg_ids.get(j));
+                    j += 1;
+                }
+                j = 0;
+                loop j < stmt.call_arg_ids.len() {
+                    self.record_expr_uses(program, scope_id, stmt.call_arg_ids.get(j));
+                    j += 1;
+                }
+            }
+            self.analyze_block(program, scope_id, stmt.then_block_id);
+            self.analyze_block(program, scope_id, stmt.else_block_id);
+            self.analyze_block(program, scope_id, stmt.body_block_id);
+            let case_index: Int = 0;
+            loop case_index < stmt.case_clause_ids.len() {
+                let clause_id: Int = stmt.case_clause_ids.get(case_index);
+                if clause_id >= 0 && clause_id < program.case_clauses.len() {
+                    self.analyze_block(program, scope_id, program.case_clauses.get(clause_id).block_id);
+                }
+                case_index += 1;
+            }
+            i += 1;
+        }
+    }
+
+    func analyze(self: VbsSsaDataFlow, program: VbsProgram) -> Void {
+        self.analyze_block(program, -1, program.root_block_id);
+        let routine_id: Int = 0;
+        loop routine_id < program.routine_block_ids.len() {
+            self.analyze_block(program, routine_id, program.routine_block_ids.get(routine_id));
+            routine_id += 1;
+        }
+    }
+
+    func constant_expr(self: VbsSsaDataFlow, scope_id: Int, name: String) -> Int {
+        return self.constant_exprs.get_or(self.scoped_name(scope_id, name), -1);
+    }
+}
+
+// Pure expression optimizer. It performs sparse constant propagation from the
+// SSA facts, constant folding, algebraic canonicalization, and invariant
+// folding before bytecode emission. Folding is intentionally type-directed so
+// dynamic Variant coercions and runtime errors remain observable.
+class VbsOptimizer {
+    var program: VbsProgram;
+    var data_flow: VbsSsaDataFlow;
+    var fold_cache: collections.Vector<Int>;
+    var active: collections.Vector<Int>;
+    var folded_count: Int;
+    var propagated_count: Int;
+
+    func init(self: VbsOptimizer, program: VbsProgram) -> Void {
+        self.program = program;
+        self.data_flow = new VbsSsaDataFlow();
+        self.fold_cache = new collections.Vector<Int>();
+        self.active = new collections.Vector<Int>();
+        self.folded_count = 0;
+        self.propagated_count = 0;
+        self.data_flow.analyze(program);
+    }
+
+    func ensure_cache(self: VbsOptimizer, expr_id: Int) -> Void {
+        loop self.fold_cache.len() <= expr_id {
+            _ = self.fold_cache.push(-2);
+            _ = self.active.push(0);
+        }
+    }
+
+    func is_numeric_literal(self: VbsOptimizer, expr: VbsExprNode) -> Bool {
+        _ = self;
+        return expr.kind == VbsExprInteger || expr.kind == VbsExprFloat || expr.kind == VbsExprBool;
+    }
+
+    func numeric_int(self: VbsOptimizer, expr: VbsExprNode) -> Int {
+        _ = self;
+        if expr.kind == VbsExprBool {
+            return expr.bool_value ? -1 : 0;
+        }
+        if expr.kind == VbsExprFloat {
+            return strconv.parse_float64(expr.text) => Int;
+        }
+        return expr.int_value;
+    }
+
+    func numeric_float(self: VbsOptimizer, expr: VbsExprNode) -> Float64 {
+        _ = self;
+        if expr.kind == VbsExprFloat {
+            return strconv.parse_float64(expr.text);
+        }
+        if expr.kind == VbsExprBool {
+            return expr.bool_value ? -1.0 : 0.0;
+        }
+        return expr.int_value => Float64;
+    }
+
+    func literal_output(self: VbsOptimizer, expr: VbsExprNode) -> String {
+        _ = self;
+        if expr.kind == VbsExprString {
+            return expr.text;
+        }
+        if expr.kind == VbsExprInteger {
+            return strconv.itoa(expr.int_value);
+        }
+        if expr.kind == VbsExprFloat {
+            return expr.text;
+        }
+        if expr.kind == VbsExprBool {
+            return expr.bool_value ? "True" : "False";
+        }
+        if expr.kind == VbsExprNothing {
+            return "";
+        }
+        return "";
+    }
+
+    func add_int(self: VbsOptimizer, value: Int) -> Int {
+        let out: VbsExprNode = new VbsExprNode();
+        out.kind = VbsExprInteger;
+        out.int_value = value;
+        return self.program.add_expr(out);
+    }
+
+    func add_float(self: VbsOptimizer, value: Float64) -> Int {
+        let out: VbsExprNode = new VbsExprNode();
+        out.kind = VbsExprFloat;
+        out.text = strconv.format_float64(value);
+        return self.program.add_expr(out);
+    }
+
+    func add_bool(self: VbsOptimizer, value: Bool) -> Int {
+        let out: VbsExprNode = new VbsExprNode();
+        out.kind = VbsExprBool;
+        out.bool_value = value;
+        return self.program.add_expr(out);
+    }
+
+    func add_string(self: VbsOptimizer, value: String) -> Int {
+        let out: VbsExprNode = new VbsExprNode();
+        out.kind = VbsExprString;
+        out.text = value;
+        return self.program.add_expr(out);
+    }
+
+    func fold_unary(self: VbsOptimizer, kind: VbsExprKind, operand: VbsExprNode) -> Int {
+        if kind == VbsExprNeg && self.is_numeric_literal(operand) {
+            return operand.kind == VbsExprFloat
+                ? self.add_float(0.0 - self.numeric_float(operand))
+                : self.add_int(0 - self.numeric_int(operand));
+        }
+        if kind == VbsExprNot && self.is_numeric_literal(operand) {
+            return operand.kind == VbsExprBool
+                ? self.add_bool(!operand.bool_value)
+                : self.add_int(~self.numeric_int(operand));
+        }
+        return -1;
+    }
+
+    func fold_comparison(self: VbsOptimizer, kind: VbsExprKind, left: VbsExprNode, right: VbsExprNode) -> Int {
+        if !self.is_numeric_literal(left) || !self.is_numeric_literal(right) {
+            return -1;
+        }
+        let a: Float64 = self.numeric_float(left);
+        let b: Float64 = self.numeric_float(right);
+        if kind == VbsExprEq { return self.add_bool(a == b); }
+        if kind == VbsExprNe { return self.add_bool(a != b); }
+        if kind == VbsExprLt { return self.add_bool(a < b); }
+        if kind == VbsExprLe { return self.add_bool(a <= b); }
+        if kind == VbsExprGt { return self.add_bool(a > b); }
+        if kind == VbsExprGe { return self.add_bool(a >= b); }
+        return -1;
+    }
+
+    func fold_binary(self: VbsOptimizer, kind: VbsExprKind, left: VbsExprNode, right: VbsExprNode) -> Int {
+        if kind == VbsExprConcat
+        && (left.kind == VbsExprString || self.is_numeric_literal(left) || left.kind == VbsExprNothing)
+        && (right.kind == VbsExprString || self.is_numeric_literal(right) || right.kind == VbsExprNothing) {
+            return self.add_string(self.literal_output(left) + self.literal_output(right));
+        }
+        let comparison: Int = self.fold_comparison(kind, left, right);
+        if comparison >= 0 {
+            return comparison;
+        }
+        if !self.is_numeric_literal(left) || !self.is_numeric_literal(right) {
+            if kind == VbsExprAdd && left.kind == VbsExprString && right.kind == VbsExprString {
+                return self.add_string(left.text + right.text);
+            }
+            return -1;
+        }
+        let integer_only: Bool = left.kind != VbsExprFloat && right.kind != VbsExprFloat;
+        let a: Int = self.numeric_int(left);
+        let b: Int = self.numeric_int(right);
+        if kind == VbsExprAdd {
+            return integer_only ? self.add_int(a + b) : self.add_float(self.numeric_float(left) + self.numeric_float(right));
+        }
+        if kind == VbsExprSub {
+            return integer_only ? self.add_int(a - b) : self.add_float(self.numeric_float(left) - self.numeric_float(right));
+        }
+        if kind == VbsExprMul {
+            return integer_only ? self.add_int(a * b) : self.add_float(self.numeric_float(left) * self.numeric_float(right));
+        }
+        if kind == VbsExprDiv && self.numeric_float(right) != 0.0 {
+            return self.add_float(self.numeric_float(left) / self.numeric_float(right));
+        }
+        if kind == VbsExprIntDiv && b != 0 {
+            return self.add_int(a / b);
+        }
+        if kind == VbsExprMod && b != 0 {
+            return self.add_int(a % b);
+        }
+        if kind == VbsExprAnd { return self.add_int(a & b); }
+        if kind == VbsExprOr { return self.add_int(a | b); }
+        if kind == VbsExprXor { return self.add_int(a ^ b); }
+        // Keep exponentiation in the Variant runtime. The host math.pow
+        // implementation can round exact VBScript results (for example 2 ^ 3)
+        // differently enough to change Response.Write output.
+        if kind == VbsExprPow { return -1; }
+        return -1;
+    }
+
+    func optimize_expr(self: VbsOptimizer, expr_id: Int) -> Int {
+        if expr_id < 0 || expr_id >= self.program.exprs.len() {
+            return expr_id;
+        }
+        self.ensure_cache(expr_id);
+        let cached: Int = self.fold_cache.get(expr_id);
+        if cached != -2 {
+            return cached;
+        }
+        if self.active.get(expr_id) != 0 {
+            return expr_id;
+        }
+        _ = self.active.set(expr_id, 1);
+        let expr: VbsExprNode = self.program.snapshot_expr(expr_id);
+        let left_id: Int = self.optimize_expr(expr.left_id);
+        let right_id: Int = self.optimize_expr(expr.right_id);
+        let folded: Int = -1;
+        if expr.kind == VbsExprNeg || expr.kind == VbsExprNot {
+            folded = self.fold_unary(expr.kind, self.program.snapshot_expr(left_id));
+        } else if expr.right_id >= 0 {
+            folded = self.fold_binary(
+                expr.kind,
+                self.program.snapshot_expr(left_id),
+                self.program.snapshot_expr(right_id)
+            );
+        }
+        let result: Int = expr_id;
+        if folded >= 0 {
+            result = folded;
+            self.folded_count += 1;
+        } else if left_id != expr.left_id || right_id != expr.right_id {
+            expr.left_id = left_id;
+            expr.right_id = right_id;
+            result = self.program.add_expr(expr);
+        }
+        _ = self.active.set(expr_id, 0);
+        _ = self.fold_cache.set(expr_id, result);
+        self.ensure_cache(result);
+        _ = self.fold_cache.set(result, result);
+        return result;
+    }
+
+    func propagated_expr(self: VbsOptimizer, scope_id: Int, name: String) -> Int {
+        let expr_id: Int = self.data_flow.constant_expr(scope_id, name);
+        if expr_id < 0 {
+            return -1;
+        }
+        self.propagated_count += 1;
+        return self.optimize_expr(expr_id);
+    }
+
+    // Returns -1 when truth is not statically known, otherwise 0/1.
+    func constant_truth(self: VbsOptimizer, expr_id: Int) -> Int {
+        let optimized_id: Int = self.optimize_expr(expr_id);
+        if optimized_id < 0 || optimized_id >= self.program.exprs.len() {
+            return -1;
+        }
+        let expr: VbsExprNode = self.program.snapshot_expr(optimized_id);
+        if expr.kind == VbsExprBool {
+            return expr.bool_value ? 1 : 0;
+        }
+        if expr.kind == VbsExprInteger {
+            return expr.int_value != 0 ? 1 : 0;
+        }
+        if expr.kind == VbsExprFloat {
+            return strconv.parse_float64(expr.text) != 0.0 ? 1 : 0;
+        }
+        if expr.kind == VbsExprString {
+            return std.len(expr.text) != 0 ? 1 : 0;
+        }
+        if expr.kind == VbsExprNothing {
+            return 0;
+        }
+        return -1;
+    }
+}

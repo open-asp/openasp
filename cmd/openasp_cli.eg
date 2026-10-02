@@ -1,0 +1,11 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+use asp;
+
+// Delegate the complete interactive lifetime to OpenAspRepl, including
+// temporary fragment cleanup and persistent request state.
+func main(argc: Int, argv: Int) -> Int {
+    print_openasp_startup_information();
+    return (new asp.OpenAspRepl()).run(argc, argv);
+}

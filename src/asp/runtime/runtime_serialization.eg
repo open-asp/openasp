@@ -1,0 +1,352 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.runtime;
+
+use asp.compiler;
+use asp.vm;
+
+use asp;
+use std;
+use fmt;
+use fs;
+use os;
+use sync;
+use strings;
+use strconv;
+use collections;
+use path;
+
+// Persistence supports only reconstructible RuntimeObject kinds. External
+// connections and process resources are intentionally absent from this mapping.
+func runtime_object_kind_name(kind: asp.vm.RuntimeObjectKind) -> String {
+    if kind == asp.vm.RuntimeObjectDictionary {
+        return "dictionary";
+    }
+    if kind == asp.vm.RuntimeObjectAdoConnection {
+        return "adodb.connection";
+    }
+    if kind == asp.vm.RuntimeObjectAdoRecordset {
+        return "adodb.recordset";
+    }
+    if kind == asp.vm.RuntimeObjectUserClass {
+        return "class";
+    }
+    return "unknown";
+}
+
+func runtime_object_kind_from_name(name: String) -> asp.vm.RuntimeObjectKind {
+    if strings.equal_fold_ascii(name, "dictionary") {
+        return asp.vm.RuntimeObjectDictionary;
+    }
+    if strings.equal_fold_ascii(name, "adodb.connection") {
+        return asp.vm.RuntimeObjectAdoConnection;
+    }
+    if strings.equal_fold_ascii(name, "adodb.recordset") {
+        return asp.vm.RuntimeObjectAdoRecordset;
+    }
+    if strings.equal_fold_ascii(name, "class") {
+        return asp.vm.RuntimeObjectUserClass;
+    }
+    return asp.vm.RuntimeObjectUnknown;
+}
+
+// Store/vector helpers recursively serialize Variants using length-prefixed
+// fields. Store keys are hex encoded so arbitrary bytes cannot corrupt framing.
+func serialize_object_store_entries(store: KeyValueStore, objects: asp.vm.ObjectSpace) -> String {
+    let parts: collections.Vector<String> = new collections.Vector<String>();
+    let i: Int = 0;
+    loop i < store.entries.len() {
+        let value: Variant = store.entries.get(i);
+        _ = parts.push(asp.runtime.hex_encode(value.store_key));
+        _ = parts.push(asp.runtime.variant_serialize(value, objects));
+        i += 1;
+    }
+    return asp.runtime.pack_string_parts(parts);
+}
+
+func serialize_variant_vector(items: collections.Vector<Variant>, objects: asp.vm.ObjectSpace) -> String {
+    let parts: collections.Vector<String> = new collections.Vector<String>();
+    let i: Int = 0;
+    loop i < items.len() {
+        _ = parts.push(asp.runtime.variant_serialize(items.get(i), objects));
+        i += 1;
+    }
+    return asp.runtime.pack_string_parts(parts);
+}
+
+func deserialize_variant_vector(text: String, objects: asp.vm.ObjectSpace) -> collections.Vector<Variant> {
+    let items: collections.Vector<Variant> = new collections.Vector<Variant>();
+    let parts: collections.Vector<String> = asp.runtime.unpack_string_parts(text);
+    let i: Int = 0;
+    loop i < parts.len() {
+        _ = items.push(asp.runtime.variant_deserialize(parts.get(i), objects));
+        i += 1;
+    }
+    return items;
+}
+
+func serialize_row_vector(rows: collections.Vector<KeyValueStore>, objects: asp.vm.ObjectSpace) -> String {
+    let parts: collections.Vector<String> = new collections.Vector<String>();
+    let i: Int = 0;
+    loop i < rows.len() {
+        _ = parts.push(asp.runtime.serialize_object_store_entries(rows.get(i), objects));
+        i += 1;
+    }
+    return asp.runtime.pack_string_parts(parts);
+}
+
+func deserialize_row_vector(text: String, objects: asp.vm.ObjectSpace) -> collections.Vector<KeyValueStore> {
+    let rows: collections.Vector<KeyValueStore> = new collections.Vector<KeyValueStore>();
+    let parts: collections.Vector<String> = asp.runtime.unpack_string_parts(text);
+    let i: Int = 0;
+    loop i < parts.len() {
+        _ = rows.push(asp.runtime.deserialize_object_store_entries(parts.get(i), objects));
+        i += 1;
+    }
+    return rows;
+}
+
+func deserialize_object_store_entries(text: String, objects: asp.vm.ObjectSpace) -> KeyValueStore {
+    let store: KeyValueStore = new KeyValueStore();
+    let parts: collections.Vector<String> = asp.runtime.unpack_string_parts(text);
+    let i: Int = 0;
+    loop i + 1 < parts.len() {
+        _ = store.set_owned(asp.runtime.hex_decode_string(parts.get(i)), asp.runtime.variant_deserialize(parts.get(i + 1), objects));
+        i += 2;
+    }
+    return store;
+}
+
+// Serializes a language-visible object graph by ObjectSpace ID. Arena-backed
+// recordsets are promoted first because persistence is a lifetime escape.
+func serialize_runtime_object(id: Int, objects: asp.vm.ObjectSpace) -> String {
+    let obj: asp.vm.RuntimeObject = objects.get(id);
+    if obj.kind == asp.vm.RuntimeObjectAdoRecordset && obj.has_native_rows() {
+        // Persistence is an explicit escape boundary. Materialize an owned
+        // managed snapshot before the request arena can be released.
+        if !obj.promote_native_rows() {
+            return "";
+        }
+    }
+    let parts: collections.Vector<String> = new collections.Vector<String>();
+    _ = parts.push(asp.runtime.runtime_object_kind_name(obj.kind));
+    _ = parts.push(obj.prog_id);
+    _ = parts.push(obj.class_name);
+    _ = parts.push(obj.default_member);
+    _ = parts.push(obj.opened ? "1" : "0");
+    _ = parts.push(strconv.itoa(obj.cursor));
+    _ = parts.push(asp.runtime.hex_encode(obj.text_value));
+    _ = parts.push(strconv.itoa(obj.int_value));
+    _ = parts.push(asp.runtime.serialize_object_store_entries(obj.store, objects));
+    _ = parts.push(asp.runtime.serialize_variant_vector(obj.items, objects));
+    _ = parts.push(asp.runtime.serialize_row_vector(obj.rows, objects));
+    _ = parts.push(asp.runtime.serialize_row_vector(obj.original_rows, objects));
+    _ = parts.push(strconv.itoa(obj.page_size));
+    _ = parts.push(strconv.itoa(obj.cursor_type));
+    _ = parts.push(strconv.itoa(obj.lock_type));
+    _ = parts.push(strconv.itoa(obj.active_connection_id));
+    return asp.runtime.pack_string_parts(parts);
+}
+
+// Reconstructs object state into the destination ObjectSpace and returns its
+// new ID; serialized IDs are never reused as process-local identity.
+func deserialize_runtime_object(text: String, objects: asp.vm.ObjectSpace) -> Int {
+    let parts: collections.Vector<String> = asp.runtime.unpack_string_parts(text);
+    let obj: asp.vm.RuntimeObject = new asp.vm.RuntimeObject();
+    if parts.len() >= 1 {
+        obj.kind = asp.runtime.runtime_object_kind_from_name(parts.get(0));
+    }
+    if parts.len() >= 2 {
+        obj.prog_id = parts.get(1);
+    }
+    if parts.len() >= 3 {
+        obj.class_name = parts.get(2);
+    }
+    if parts.len() >= 4 {
+        obj.default_member = parts.get(3);
+    }
+    if parts.len() >= 5 {
+        obj.opened = parts.get(4) == "1";
+    }
+    if parts.len() >= 6 {
+        obj.cursor = strconv.atoi(parts.get(5));
+    }
+    if parts.len() >= 7 {
+        obj.text_value = asp.runtime.hex_decode_string(parts.get(6));
+    }
+    if parts.len() >= 8 {
+        obj.int_value = strconv.atoi(parts.get(7));
+    }
+    if parts.len() >= 9 {
+        obj.store = asp.runtime.deserialize_object_store_entries(parts.get(8), objects);
+    }
+    if parts.len() >= 10 {
+        obj.items = asp.runtime.deserialize_variant_vector(parts.get(9), objects);
+    }
+    if parts.len() >= 11 {
+        obj.rows = asp.runtime.deserialize_row_vector(parts.get(10), objects);
+    }
+    if parts.len() >= 12 {
+        obj.original_rows = asp.runtime.deserialize_row_vector(parts.get(11), objects);
+    }
+    if parts.len() >= 13 {
+        obj.page_size = strconv.atoi(parts.get(12));
+    }
+    if parts.len() >= 14 {
+        obj.cursor_type = strconv.atoi(parts.get(13));
+    }
+    if parts.len() >= 15 {
+        obj.lock_type = strconv.atoi(parts.get(14));
+    }
+    if parts.len() >= 16 {
+        obj.active_connection_id = strconv.atoi(parts.get(15));
+    }
+    return objects.add(obj);
+}
+
+// Variant serialization is tag-first and recursive. Object serialization may
+// fail closed for unsupported/resource-owning objects rather than persisting an
+// invalid native handle.
+func variant_serialize(v: Variant, objects: asp.vm.ObjectSpace) -> String {
+    if v.kind == VariantEmpty {
+        return "E";
+    }
+    if v.kind == VariantNull {
+        return "N";
+    }
+    if v.kind == VariantBool {
+        return "B:" + (v.bool_value ? "1" : "0");
+    }
+    if v.kind == VariantInt {
+        return "I:" + strconv.itoa(v.int_value);
+    }
+    if v.kind == VariantFloat {
+        return "F:" + strconv.format_float64(v.float_value);
+    }
+    if v.kind == VariantDate {
+        return "D:" + strconv.itoa(v.date_value) + ":" + strconv.itoa(v.date_mode);
+    }
+    if v.kind == VariantString {
+        return "S:" + asp.runtime.hex_encode(v.string_value);
+    }
+    if v.kind == VariantNothing {
+        return "X";
+    }
+    if v.kind == VariantArray {
+        let parts: collections.Vector<String> = new collections.Vector<String>();
+        let i: Int = 0;
+        loop i < v.array_data.items.len() {
+            _ = parts.push(asp.runtime.variant_serialize(v.array_data.items.get(i), objects));
+            i += 1;
+        }
+        return "A:" + asp.runtime.pack_string_parts(parts);
+    }
+    if v.kind == VariantObject {
+        let parts: collections.Vector<String> = new collections.Vector<String>();
+        _ = parts.push(asp.runtime.serialize_runtime_object(v.object_value, objects));
+        return "O:" + asp.runtime.pack_string_parts(parts);
+    }
+    return "S:" + asp.runtime.hex_encode(v.to_output_string());
+}
+
+func variant_deserialize(text: String, objects: asp.vm.ObjectSpace) -> Variant {
+    if text == "E" {
+        return asp.runtime.variant_empty();
+    }
+    if text == "N" {
+        return asp.runtime.variant_null();
+    }
+    if strings.starts_with(text, "B:") {
+        return asp.runtime.variant_bool(std.len(text) > 2 && std.substr(text, 2, std.len(text) - 2) == "1");
+    }
+    if strings.starts_with(text, "I:") {
+        return asp.runtime.variant_int(strconv.atoi(std.substr(text, 2, std.len(text) - 2)));
+    }
+    if strings.starts_with(text, "F:") {
+        return asp.runtime.variant_float(strconv.parse_float64(std.substr(text, 2, std.len(text) - 2)));
+    }
+    if strings.starts_with(text, "D:") {
+        let parts: collections.Vector<String> = strings.split(text, ":");
+        return asp.runtime.variant_date(parts.len() >= 2 ? strconv.atoi(parts.get(1)) : 0, parts.len() >= 3 ? strconv.atoi(parts.get(2)) : 0);
+    }
+    if strings.starts_with(text, "S:") {
+        return asp.runtime.variant_string(asp.runtime.hex_decode_string(std.substr(text, 2, std.len(text) - 2)));
+    }
+    if text == "X" {
+        return asp.runtime.variant_nothing();
+    }
+    if strings.starts_with(text, "A:") {
+        let parts: collections.Vector<String> = asp.runtime.unpack_string_parts(std.substr(text, 2, std.len(text) - 2));
+        let items: collections.Vector<Variant> = new collections.Vector<Variant>();
+        let i: Int = 0;
+        loop i < parts.len() {
+            _ = items.push(asp.runtime.variant_deserialize(parts.get(i), objects));
+            i += 1;
+        }
+        return asp.runtime.variant_array_owned(items);
+    }
+    if strings.starts_with(text, "O:") {
+        let parts: collections.Vector<String> = asp.runtime.unpack_string_parts(std.substr(text, 2, std.len(text) - 2));
+        if parts.len() >= 1 {
+            return asp.runtime.variant_object(asp.runtime.deserialize_runtime_object(parts.get(0), objects));
+        }
+        return asp.runtime.variant_nothing();
+    }
+    return asp.runtime.variant_empty();
+}
+
+// Store files are replaced through a temporary file so readers observe either
+// the previous complete snapshot or the new one, never a partially written body.
+func save_store_file(file_path: String, store: KeyValueStore, objects: asp.vm.ObjectSpace) -> ErrCode {
+    let dir_path: String = path.dir(file_path);
+    let _, mkdir_err = fs.mkdir_all(dir_path);
+    if mkdir_err != OK {
+        return mkdir_err;
+    }
+    let builder: std.StringBuilder = new std.StringBuilder(1024);
+    _ = builder.append("kv1\n");
+    let i: Int = 0;
+    loop i < store.entries.len() {
+        let value: Variant = store.entries.get(i);
+        _ = builder.append(asp.runtime.hex_encode(value.store_key));
+        _ = builder.append("\t");
+        _ = builder.append(asp.runtime.variant_serialize(value, objects));
+        _ = builder.append("\n");
+        i += 1;
+    }
+    let body: String = builder.to_string();
+    _ = builder.free();
+    let _, write_err = asp.compiler.write_text_chunked(file_path, body);
+    return write_err;
+}
+
+// Missing or malformed state produces an empty store; callers treat persisted
+// sessions/application data as a cache, not a reason to crash the server.
+func load_store_file(file_path: String, objects: asp.vm.ObjectSpace) -> KeyValueStore {
+    let store: KeyValueStore = new KeyValueStore();
+    let exists, _ = fs.exists(file_path);
+    if !exists {
+        return store;
+    }
+    let text, read_err = asp.compiler.read_text_chunked(file_path);
+    if read_err != OK {
+        return store;
+    }
+    let lines: collections.Vector<String> = strings.split(text, "\n");
+    let i: Int = 0;
+    loop i < lines.len() {
+        let line: String = lines.get(i);
+        if std.len(line) != 0 && line != "kv1" {
+            let tab: Int = strings.find_substr(line, "\t");
+            if tab > 0 {
+                _ = store.set_owned(
+                asp.runtime.hex_decode_string(std.substr(line, 0, tab)),
+                asp.runtime.variant_deserialize(std.substr(line, tab + 1, std.len(line) - tab - 1), objects)
+                );
+            }
+        }
+        i += 1;
+    }
+    return store;
+}

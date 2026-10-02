@@ -1,0 +1,31 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.server;
+
+use asp;
+
+use std;
+use os;
+use strings;
+
+// Shared state created before worker fork. Each child receives an independent
+// copy of engine/cache state and the inherited logger descriptor. Configuration
+// is read once so request handling does not consult the environment.
+class FastcgiServerRuntime {
+    var root_dir: String;
+    var engine: asp.AspEngine;
+    var logger: asp.OpenAspLogger;
+    var response_cache: FastcgiResponseCache;
+    var request_end_gc: Bool;
+
+    func init(self: FastcgiServerRuntime, root_dir: String, logger: asp.OpenAspLogger) -> Void {
+        self.root_dir = root_dir;
+        self.engine = new asp.AspEngine(root_dir);
+        self.logger = logger;
+        self.response_cache = new FastcgiResponseCache();
+        let request_end_gc_value, request_end_gc_err = os.getenv("EGRET_ASP_REQUEST_END_GC");
+        self.request_end_gc = request_end_gc_err == OK
+            && (request_end_gc_value == "1" || strings.equal_fold_ascii(request_end_gc_value, "on"));
+    }
+}

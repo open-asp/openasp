@@ -1,0 +1,676 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.object.database;
+
+use asp;
+use asp.object;
+use asp.runtime;
+use asp.vm;
+
+use std;
+use strings;
+use collections;
+use strconv;
+
+extern func eg_vbs_parse_date(text: String) -> Int;
+extern func eg_asp_hex_encode(input: String) -> String;
+
+enum DatabaseDriverKind {
+    DatabaseDriverUnknown,
+    DatabaseDriverSqlite,
+    DatabaseDriverMdbtools,
+    DatabaseDriverMysql,
+}
+
+// Map canonical OpenASP provider names and standard ADO aliases to in-process
+// implementations. The retired Egret namespace fails closed instead of
+// silently reaching the historical MySQL fallback.
+func db_driver_kind_from_provider(provider_value: String) -> DatabaseDriverKind {
+    let provider: String = strings.to_lower_ascii(strings.trim_space(provider_value));
+    if strings.starts_with(provider, "egret.") {
+        return DatabaseDriverUnknown;
+    }
+    if provider == "openasp.mysql" || provider == "mysql" || strings.contains(provider, "mysql") {
+        return DatabaseDriverMysql;
+    }
+    if provider == "openasp.sqlite" || provider == "sqlite" || strings.contains(provider, "sqlite") {
+        return DatabaseDriverSqlite;
+    }
+    if provider == "openasp.mdb" || provider == "mdbtools" || strings.contains(provider, "jet.oledb") || strings.contains(provider, "ace.oledb") || strings.contains(provider, "access") {
+        return DatabaseDriverMdbtools;
+    }
+    return DatabaseDriverMysql;
+}
+
+func db_driver_name(kind: DatabaseDriverKind) -> String {
+    if kind == DatabaseDriverMysql {
+        return "mysql";
+    }
+    if kind == DatabaseDriverMdbtools {
+        return "mdbtools";
+    }
+    if kind == DatabaseDriverSqlite {
+        return "sqlite";
+    }
+    return "unknown";
+}
+
+// Snapshot connection properties into the Recordset. This avoids retaining a
+// mutable Connection object while preserving enough configuration for Update.
+func db_driver_bind_recordset(rs: asp.vm.RuntimeObject, connection: asp.vm.RuntimeObject, kind: DatabaseDriverKind) -> Void {
+    rs.database_driver_kind = kind => Int;
+    rs.store = connection.store.clone();
+}
+
+// Normalized single-row UPDATE plan accepted by the native MDB mutation API.
+// Values remain encoded strings until the C layer applies column types.
+class DatabaseDriverUpdatePlan {
+    var ok: Bool;
+    var table_name: String;
+    var where_column: String;
+    var where_value: String;
+    var columns: collections.Vector<String>;
+    var values: collections.Vector<String>;
+
+    func init(self: DatabaseDriverUpdatePlan) -> Void {
+        self.ok = false;
+        self.table_name = "";
+        self.where_column = "";
+        self.where_value = "";
+        self.columns = new collections.Vector<String>();
+        self.values = new collections.Vector<String>();
+    }
+}
+
+func db_driver_update_plan(statement: SqlStatement) -> DatabaseDriverUpdatePlan {
+    let plan: DatabaseDriverUpdatePlan = db_driver_equality_where(statement);
+    if statement.kind != SqlStatementUpdate || !plan.ok {
+        plan.ok = false;
+        return plan;
+    }
+    let i: Int = 0;
+    loop i < statement.columns.len() && i < statement.values.len() {
+        _ = plan.columns.push(mdb_engine_parse_ident(statement.columns.get(i)));
+        let value: String = db_driver_native_literal(statement.values.get(i));
+        if std.len(value) == 0 {
+            plan.ok = false;
+            return plan;
+        }
+        _ = plan.values.push(value);
+        i += 1;
+    }
+    plan.ok = std.len(plan.table_name) > 0 && std.len(plan.where_column) > 0 && plan.columns.len() > 0;
+    return plan;
+}
+
+func db_driver_join_values(values: collections.Vector<String>) -> String {
+    let out: String = "";
+    let i: Int = 0;
+    loop i < values.len() {
+        if i > 0 {
+            out += std.char_from_code(31);
+        }
+        out += values.get(i);
+        i += 1;
+    }
+    return out;
+}
+
+func db_driver_join_encoded_values(values: collections.Vector<String>) -> String {
+    let encoded: collections.Vector<String> = new collections.Vector<String>();
+    let i: Int = 0;
+    loop i < values.len() {
+        _ = encoded.push(eg_asp_hex_encode(values.get(i)));
+        i += 1;
+    }
+    return db_driver_join_values(encoded);
+}
+
+func db_driver_native_literal(raw_value: String) -> String {
+    let value: String = strings.trim_space(raw_value);
+    let tokens: collections.Vector<SqlToken> = sql_lex(value);
+    if tokens.len() == 2 && tokens.get(1).kind == SqlTokenEof {
+        if tokens.get(0).kind == SqlTokenString {
+            return "s" + tokens.get(0).text;
+        }
+        if tokens.get(0).kind == SqlTokenDate {
+            return "d" + tokens.get(0).text;
+        }
+        if tokens.get(0).kind == SqlTokenNumber {
+            return "v" + tokens.get(0).text;
+        }
+        if strings.equal_fold_ascii(tokens.get(0).text, "null") {
+            return "n";
+        }
+        if strings.equal_fold_ascii(tokens.get(0).text, "true") || strings.equal_fold_ascii(tokens.get(0).text, "false") {
+            return "v" + strings.to_lower_ascii(tokens.get(0).text);
+        }
+    }
+    if tokens.len() == 3 && tokens.get(0).kind == SqlTokenOperator && tokens.get(0).text == "-" && tokens.get(1).kind == SqlTokenNumber {
+        return "v-" + tokens.get(1).text;
+    }
+    let lower: String = strings.to_lower_ascii(strings.replace_all(value, " ", ""));
+    if lower == "date()" || lower == "now()" || lower == "getdate()" {
+        return "d" + lower;
+    }
+    return "";
+}
+
+func db_driver_equality_where(statement: SqlStatement) -> DatabaseDriverUpdatePlan {
+    let plan: DatabaseDriverUpdatePlan = new DatabaseDriverUpdatePlan();
+    plan.table_name = mdb_engine_parse_ident(statement.table_name);
+    let tokens: collections.Vector<SqlToken> = sql_lex(statement.where_sql);
+    let eq_at: Int = -1;
+    let i: Int = 0;
+    loop i < tokens.len() && tokens.get(i).kind != SqlTokenEof {
+        if tokens.get(i).kind == SqlTokenOperator && tokens.get(i).text == "=" {
+            if eq_at >= 0 {
+                return plan;
+            }
+            eq_at = i;
+        }
+        i += 1;
+    }
+    if eq_at <= 0 {
+        return plan;
+    }
+    let left: String = sql_join_tokens(tokens, 0, eq_at);
+    let raw_value: String = sql_join_tokens(tokens, eq_at + 1, tokens.len() - 1);
+    let value: String = db_driver_native_literal(raw_value);
+    if std.len(left) == 0 || std.len(value) == 0 || value == "n" {
+        return plan;
+    }
+    let left_tokens: collections.Vector<SqlToken> = sql_lex(left);
+    let valid_left: Bool = (left_tokens.len() == 2 && left_tokens.get(0).kind == SqlTokenIdentifier)
+        || (left_tokens.len() == 4 && left_tokens.get(0).kind == SqlTokenIdentifier
+            && left_tokens.get(1).kind == SqlTokenDot && left_tokens.get(2).kind == SqlTokenIdentifier);
+    if !valid_left {
+        return plan;
+    }
+    plan.where_column = mdb_engine_parse_ident(left);
+    plan.where_value = value;
+    plan.ok = std.len(plan.table_name) > 0 && std.len(plan.where_column) > 0;
+    return plan;
+}
+
+func db_driver_select_columns(statement: SqlStatement) -> String {
+    let out: collections.Vector<String> = new collections.Vector<String>();
+    let aggregate_kind: Int = db_driver_select_aggregate_kind(statement);
+    if aggregate_kind > 1 {
+        let aggregate_column: String = db_driver_select_aggregate_column(statement);
+        if std.len(aggregate_column) > 0 {
+            _ = out.push(aggregate_column);
+        }
+        return db_driver_join_values(out);
+    }
+    if aggregate_kind == 1 {
+        return "";
+    }
+    let i: Int = 0;
+    loop i < statement.select_columns.len() {
+        let column: String = strings.trim_space(statement.select_columns.get(i));
+        if column != "*" && !strings.starts_with(strings.to_lower_ascii(column), "count") {
+            _ = out.push(mdb_engine_parse_ident(column));
+        }
+        i += 1;
+    }
+    return db_driver_join_values(out);
+}
+
+func db_driver_select_aggregate_kind(statement: SqlStatement) -> Int {
+    if statement.select_columns.len() != 1 {
+        return 0;
+    }
+    let column: String = strings.to_lower_ascii(strings.trim_space(statement.select_columns.get(0)));
+    if strings.starts_with(column, "count") {
+        return 1;
+    }
+    if strings.starts_with(column, "max") {
+        return 2;
+    }
+    if strings.starts_with(column, "min") {
+        return 3;
+    }
+    if strings.starts_with(column, "sum") {
+        return 4;
+    }
+    if strings.starts_with(column, "avg") {
+        return 5;
+    }
+    return 0;
+}
+
+func db_driver_select_aggregate_column(statement: SqlStatement) -> String {
+    if statement.select_columns.len() != 1 {
+        return "";
+    }
+    let expression: String = strings.trim_space(statement.select_columns.get(0));
+    let open_at: Int = strings.find_substr(expression, "(");
+    let close_at: Int = strings.find_substr(expression, ")");
+    if open_at < 0 || close_at <= open_at + 1 {
+        return "";
+    }
+    return mdb_engine_parse_ident(strings.trim_space(std.substr(expression, open_at + 1, close_at - open_at - 1)));
+}
+
+func db_driver_join_select_columns(statement: SqlStatement) -> String {
+    let out: collections.Vector<String> = new collections.Vector<String>();
+    let i: Int = 0;
+    loop i < statement.select_columns.len() {
+        let column: String = strings.trim_space(statement.select_columns.get(i));
+        if column != "*" && !strings.starts_with(strings.to_lower_ascii(column), "count") {
+            _ = out.push(column);
+        }
+        i += 1;
+    }
+    return db_driver_join_values(out);
+}
+
+func db_driver_select_count_only(statement: SqlStatement) -> Bool {
+    return db_driver_select_aggregate_kind(statement) == 1;
+}
+
+// Lower the common SELECT subset into fixed native arguments. Keeping this
+// translation explicit prevents SQL text from becoming a shell command.
+func db_driver_query_from_statement(statement: SqlStatement) -> MdbQuery {
+    let query: MdbQuery = new MdbQuery();
+    query.table_name = mdb_engine_parse_ident(statement.table_name);
+    query.top_count = statement.top_count;
+    query.order_column = mdb_engine_parse_ident(statement.order_column);
+    query.order_desc = statement.order_desc;
+    let where_text: String = strings.trim_space(statement.where_sql);
+    if std.len(where_text) == 0 {
+        query.ok = std.len(query.table_name) > 0;
+        return query;
+    }
+    let lower: String = strings.to_lower_ascii(where_text);
+    let like_at: Int = strings.find_substr(lower, " like ");
+    let op_at: Int = like_at >= 0 ? like_at : strings.find_substr(where_text, "=");
+    if op_at < 0 {
+        op_at = strings.find_substr(where_text, ">");
+    }
+    if op_at < 0 {
+        op_at = strings.find_substr(where_text, "<");
+    }
+    if op_at < 0 {
+        query.error_text = "unsupported WHERE expression";
+        return query;
+    }
+    let op_len: Int = like_at >= 0 ? 6 : 1;
+    query.where_column = mdb_engine_parse_ident(std.substr(where_text, 0, op_at));
+    let raw_value: String = strings.trim_space(std.substr(where_text, op_at + op_len, std.len(where_text) - op_at - op_len));
+    query.where_value = mdb_engine_parse_string_literal(raw_value);
+    query.where_kind = like_at >= 0 ? MdbWhereLikeContains : (std.byte_at(where_text, op_at) == '=' ? MdbWhereEq : (std.byte_at(where_text, op_at) == '>' ? MdbWhereGt : MdbWhereLt));
+    if query.where_kind == MdbWhereLikeContains && std.len(query.where_value) >= 2 && std.byte_at(query.where_value, 0) == '%' && std.byte_at(query.where_value, std.len(query.where_value) - 1) == '%' {
+        query.where_value = std.substr(query.where_value, 1, std.len(query.where_value) - 2);
+    }
+    query.ok = std.len(query.table_name) > 0 && std.len(query.where_column) > 0;
+    return query;
+}
+
+func db_driver_mdbsql_where(statement: SqlStatement) -> String {
+    let tokens: collections.Vector<SqlToken> = sql_lex(statement.where_sql);
+    let out: String = "";
+    let i: Int = 0;
+    loop i < tokens.len() && tokens.get(i).kind != SqlTokenEof {
+        let token: SqlToken = tokens.get(i);
+        if token.kind == SqlTokenIdentifier && i + 2 < tokens.len() && tokens.get(i + 1).kind == SqlTokenDot {
+            i += 2;
+            token = tokens.get(i);
+        }
+        let value: String = sql_token_value(token);
+        if token.kind == SqlTokenKeyword {
+            value = strings.to_upper_ascii(value);
+        } else if token.kind == SqlTokenDate {
+            value = "'" + strings.replace_all(token.text, "'", "''") + "'";
+        } else if token.kind == SqlTokenIdentifier && strings.equal_fold_ascii(value, "true") {
+            value = "1";
+        } else if token.kind == SqlTokenIdentifier && strings.equal_fold_ascii(value, "false") {
+            value = "0";
+        } else if token.kind == SqlTokenIdentifier {
+            value = mdb_engine_parse_ident(value);
+        }
+        if std.len(out) > 0 {
+            out += " ";
+        }
+        out += value;
+        i += 1;
+    }
+    return strings.trim_space(out);
+}
+
+func db_driver_is_unsigned_integer(text: String) -> Bool {
+    if std.len(text) == 0 {
+        return false;
+    }
+    let i: Int = 0;
+    loop i < std.len(text) {
+        let ch: Int = std.byte_at(text, i);
+        if ch < '0' || ch > '9' {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+// Expand the one legacy IN(SELECT ...) shape unsupported by libmdb. Limits and
+// encoding are retained in the generated literal list; other subqueries pass
+// through unchanged for normal rejection.
+func db_driver_expand_first_in_subquery(db_path: String, where_sql: String) -> String {
+    let lower: String = strings.to_lower_ascii(where_sql);
+    let in_at: Int = strings.find_substr(lower, " in ( select ");
+    if in_at < 0 {
+        return where_sql;
+    }
+    let open_at: Int = in_at + 4;
+    let depth: Int = 1;
+    let close_at: Int = open_at + 1;
+    loop close_at < std.len(where_sql) && depth > 0 {
+        let ch: Int = std.byte_at(where_sql, close_at);
+        if ch == '(' {
+            depth += 1;
+        } else if ch == ')' {
+            depth -= 1;
+        }
+        if depth > 0 {
+            close_at += 1;
+        }
+    }
+    if depth != 0 {
+        return where_sql;
+    }
+    let subquery: String = strings.trim_space(std.substr(where_sql, open_at + 1, close_at - open_at - 1));
+    let subquery_output: String = db_driver_execute_mdb_native(db_path, subquery);
+    if strings.starts_with(subquery_output, "Error:") {
+        return where_sql;
+    }
+    let column_end: Int = in_at - 1;
+    loop column_end >= 0 && std.byte_at(where_sql, column_end) == ' ' {
+        column_end -= 1;
+    }
+    let column_start: Int = column_end;
+    loop column_start >= 0 {
+        let ch: Int = std.byte_at(where_sql, column_start);
+        if !((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_' || ch == '.' || ch == '[' || ch == ']') {
+            break;
+        }
+        column_start -= 1;
+    }
+    column_start += 1;
+    if column_start > column_end {
+        return where_sql;
+    }
+    let column: String = std.substr(where_sql, column_start, column_end - column_start + 1);
+    let lines: collections.Vector<String> = strings.split(subquery_output, "\n");
+    let replacement: String = "( 1 = 0 )";
+    let added: Int = 0;
+    let i: Int = 1;
+    loop i < lines.len() {
+        let value: String = strings.trim_space(lines.get(i));
+        if std.len(value) != 0 {
+            if !db_driver_is_unsigned_integer(value) {
+                return where_sql;
+            }
+            if added == 0 {
+                replacement = "( " + column + " = " + value;
+            } else {
+                replacement += " OR " + column + " = " + value;
+            }
+            added += 1;
+        }
+        i += 1;
+    }
+    if added > 0 {
+        replacement += " )";
+    }
+    let prefix: String = column_start > 0 ? std.substr(where_sql, 0, column_start) : "";
+    let suffix_start: Int = close_at + 1;
+    let suffix: String = suffix_start < std.len(where_sql) ? std.substr(where_sql, suffix_start, std.len(where_sql) - suffix_start) : "";
+    return strings.trim_space(prefix + replacement + suffix);
+}
+
+func db_driver_expand_first_in_list(where_sql: String) -> String {
+    let lower: String = strings.to_lower_ascii(where_sql);
+    let in_at: Int = strings.find_substr(lower, " in (");
+    if in_at < 0 {
+        return where_sql;
+    }
+    let open_at: Int = in_at + 4;
+    let depth: Int = 1;
+    let close_at: Int = open_at + 1;
+    loop close_at < std.len(where_sql) && depth > 0 {
+        let ch: Int = std.byte_at(where_sql, close_at);
+        if ch == '(' {
+            depth += 1;
+        } else if ch == ')' {
+            depth -= 1;
+        }
+        if depth > 0 {
+            close_at += 1;
+        }
+    }
+    if depth != 0 {
+        return where_sql;
+    }
+    let list_text: String = strings.trim_space(std.substr(where_sql, open_at + 1, close_at - open_at - 1));
+    if strings.starts_with(strings.to_lower_ascii(list_text), "select ") {
+        return where_sql;
+    }
+    let column_end: Int = in_at - 1;
+    loop column_end >= 0 && std.byte_at(where_sql, column_end) == ' ' {
+        column_end -= 1;
+    }
+    let column_start: Int = column_end;
+    loop column_start >= 0 {
+        let ch: Int = std.byte_at(where_sql, column_start);
+        if !((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_' || ch == '.' || ch == '[' || ch == ']') {
+            break;
+        }
+        column_start -= 1;
+    }
+    column_start += 1;
+    if column_start > column_end {
+        return where_sql;
+    }
+    let column: String = std.substr(where_sql, column_start, column_end - column_start + 1);
+    let values: collections.Vector<String> = strings.split(list_text, ",");
+    if values.len() == 0 {
+        return where_sql;
+    }
+    let replacement: String = "( ";
+    let i: Int = 0;
+    loop i < values.len() {
+        if i > 0 {
+            replacement += " OR ";
+        }
+        replacement += column + " = " + strings.trim_space(values.get(i));
+        i += 1;
+    }
+    replacement += " )";
+    let prefix: String = column_start > 0 ? std.substr(where_sql, 0, column_start) : "";
+    let suffix_start: Int = close_at + 1;
+    let suffix: String = suffix_start < std.len(where_sql) ? std.substr(where_sql, suffix_start, std.len(where_sql) - suffix_start) : "";
+    return strings.trim_space(prefix + replacement + suffix);
+}
+
+// Parse and dispatch MDB statements to typed native entry points. DDL support
+// is intentionally restricted to CREATE TABLE; unsupported syntax returns an
+// error string consumed by the ADO layer.
+func db_driver_execute_mdb_native(db_path: String, sql: String) -> String {
+    let statement: SqlStatement = sql_parse_statement(sql);
+    if !statement.ok {
+        return "Error: " + statement.error_text;
+    }
+    if statement.kind == SqlStatementUpdate {
+        let update_plan: DatabaseDriverUpdatePlan = db_driver_update_plan(statement);
+        if update_plan.ok {
+            return eg_mdb_update(db_path, update_plan.table_name, eg_asp_hex_encode(update_plan.where_column), eg_asp_hex_encode(update_plan.where_value), db_driver_join_encoded_values(update_plan.columns), db_driver_join_encoded_values(update_plan.values));
+        }
+        return "Error: MDB UPDATE requires literal assignments and one equality WHERE condition";
+    }
+    if statement.kind == SqlStatementInsert {
+        if statement.columns.len() == 0 || statement.columns.len() != statement.values.len() {
+            return "Error: invalid MDB INSERT column/value list";
+        }
+        let insert_columns: collections.Vector<String> = new collections.Vector<String>();
+        let insert_values: collections.Vector<String> = new collections.Vector<String>();
+        let i: Int = 0;
+        loop i < statement.columns.len() {
+            let column: String = mdb_engine_parse_ident(statement.columns.get(i));
+            let value: String = db_driver_native_literal(statement.values.get(i));
+            if std.len(column) == 0 || std.len(value) == 0 {
+                return "Error: MDB INSERT only supports literal values";
+            }
+            _ = insert_columns.push(column);
+            _ = insert_values.push(value);
+            i += 1;
+        }
+        return eg_mdb_insert_row(db_path, mdb_engine_parse_ident(statement.table_name), db_driver_join_encoded_values(insert_columns), db_driver_join_encoded_values(insert_values));
+    }
+    if statement.kind == SqlStatementDelete {
+        if std.len(strings.trim_space(statement.where_sql)) == 0 {
+            return eg_mdb_delete(db_path, mdb_engine_parse_ident(statement.table_name), "", "");
+        }
+        let delete_plan: DatabaseDriverUpdatePlan = db_driver_equality_where(statement);
+        if !delete_plan.ok {
+            return "Error: MDB DELETE supports one equality WHERE condition";
+        }
+        return eg_mdb_delete(db_path, delete_plan.table_name, eg_asp_hex_encode(delete_plan.where_column), eg_asp_hex_encode(delete_plan.where_value));
+    }
+    if statement.kind == SqlStatementCreate {
+        return eg_mdb_create_table(db_path, statement.raw_sql);
+    }
+    if statement.kind != SqlStatementSelect {
+        return "Error: unsupported MDB statement";
+    }
+    let query: MdbQuery = db_driver_query_from_statement(statement);
+    let selected_columns: String = db_driver_select_columns(statement);
+    let aggregate_kind: Int = db_driver_select_aggregate_kind(statement);
+    if std.len(statement.join_table_name) > 0 {
+        if !query.ok {
+            return "Error: " + query.error_text;
+        }
+        if std.len(query.order_column) > 0 {
+            return "Error: ORDER BY is not yet supported for MDB JOIN queries";
+        }
+        let native_join_text: String = eg_mdb_join_query(db_path, query.table_name, statement.join_table_name, db_driver_join_select_columns(statement), query.where_kind => Int, query.where_column, query.where_value, statement.join_left_column, statement.join_right_column, query.top_count, statement.distinct ? 1 : 0);
+        return native_join_text;
+    }
+    let normalized_where: String = db_driver_expand_first_in_subquery(db_path, db_driver_mdbsql_where(statement));
+    let expanded_where: String = db_driver_expand_first_in_list(normalized_where);
+    if std.len(normalized_where) == 0 && !query.ok {
+        return "Error: " + query.error_text;
+    }
+    let native_text: String = std.len(expanded_where) > 0
+        ? eg_mdb_sql_query(db_path, query.table_name, selected_columns, expanded_where, mdb_engine_parse_ident(query.order_column), query.order_desc ? 1 : 0, query.top_count, statement.distinct ? 1 : 0, aggregate_kind)
+        : eg_mdb_query(db_path, query.table_name, selected_columns, MdbWhereNone => Int, "", "", mdb_engine_parse_ident(query.order_column), query.order_desc ? 1 : 0, query.top_count, statement.distinct ? 1 : 0, aggregate_kind);
+    return native_text;
+}
+
+func access_execute_native(db_path: String, sql: String) -> String {
+    return db_driver_execute_mdb_native(db_path, sql);
+}
+
+func db_driver_typed_cell(value: String, type_code: String) -> asp.runtime.Variant {
+    if type_code == "b" {
+        return asp.runtime.variant_bool(value != "0" && !strings.equal_fold_ascii(value, "false"));
+    }
+    if type_code == "i" {
+        return asp.runtime.variant_int(strconv.atoi(value));
+    }
+    if type_code == "f" {
+        return asp.runtime.variant_float(strconv.parse_float64(value));
+    }
+    if type_code == "d" {
+        return asp.runtime.variant_date(eg_vbs_parse_date(value));
+    }
+    return asp.runtime.variant_string(value);
+}
+
+// Decode the driver's tabular wire format into a Recordset. When an arena is
+// present, cells use native row storage for request lifetime; otherwise owned
+// Variant rows provide the safe fallback.
+func db_driver_tabular_recordset(output: String, sql: String, request_arena_handle: Int = 0) -> asp.vm.RuntimeObject {
+    let rs: asp.vm.RuntimeObject = new asp.vm.RuntimeObject();
+    rs.kind = asp.vm.RuntimeObjectAdoRecordset;
+    rs.component_kind = asp.object.ComponentAdoRecordset;
+    rs.prog_id = "ADODB.Recordset";
+    rs.opened = true;
+    rs.text_value = sql;
+    let lines: collections.Vector<String> = strings.split(output, "\n");
+    let header_index: Int = -1;
+    let i: Int = 0;
+    loop i < lines.len() {
+        if std.len(strings.trim_space(lines.get(i))) != 0 {
+            header_index = i;
+            break;
+        }
+        i += 1;
+    }
+    if header_index < 0 {
+        return rs;
+    }
+    let headers: collections.Vector<String> = strings.split(lines.get(header_index), "\t");
+    let type_codes: collections.Vector<String> = new collections.Vector<String>();
+    let data_index: Int = header_index + 1;
+    if data_index < lines.len() && strings.starts_with(lines.get(data_index), "#@egret-types:") {
+        let encoded_types: collections.Vector<String> = strings.split(lines.get(data_index), "\t");
+        let type_index: Int = 0;
+        loop type_index < encoded_types.len() {
+            let type_code: String = type_index == 0
+                ? std.substr(encoded_types.get(type_index), std.len("#@egret-types:"), std.len(encoded_types.get(type_index)) - std.len("#@egret-types:"))
+                : encoded_types.get(type_index);
+            _ = type_codes.push(type_code);
+            type_index += 1;
+        }
+        data_index += 1;
+    }
+    i = 0;
+    loop i < headers.len() {
+        _ = rs.items.push(asp.runtime.variant_string(headers.get(i)));
+        i += 1;
+    }
+    let row_count: Int = 0;
+    i = data_index;
+    loop i < lines.len() {
+        if std.len(strings.trim_space(lines.get(i))) != 0 {
+            row_count += 1;
+        }
+        i += 1;
+    }
+    let native_rows: Bool = request_arena_handle != 0
+        && rs.create_native_rows(request_arena_handle, row_count, headers.len());
+    let row_index: Int = 0;
+    i = data_index;
+    loop i < lines.len() {
+        let line: String = lines.get(i);
+        if std.len(strings.trim_space(line)) == 0 {
+            i += 1;
+            skip;
+        }
+        let cols: collections.Vector<String> = strings.split(line, "\t");
+        if native_rows {
+            let j: Int = 0;
+            loop j < headers.len() {
+                let value: String = j < cols.len() ? cols.get(j) : "";
+                _ = rs.set_native_cell(row_index, j, db_driver_typed_cell(value, j < type_codes.len() ? type_codes.get(j) : "s"));
+                j += 1;
+            }
+        } else {
+            let row: asp.runtime.KeyValueStore = new asp.runtime.KeyValueStore();
+            let j: Int = 0;
+            loop j < headers.len() {
+                let value: String = j < cols.len() ? cols.get(j) : "";
+                _ = row.set(headers.get(j), db_driver_typed_cell(value, j < type_codes.len() ? type_codes.get(j) : "s"));
+                j += 1;
+            }
+            _ = rs.rows.push(row);
+            _ = rs.original_rows.push(row.clone());
+        }
+        row_index += 1;
+        i += 1;
+    }
+    return rs;
+}

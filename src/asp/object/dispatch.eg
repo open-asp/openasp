@@ -1,0 +1,114 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.object;
+
+use asp;
+use asp.runtime;
+use asp.vm;
+
+use collections;
+
+// Prefer the kind captured at object creation. ProgID resolution is a backward
+// compatibility fallback for objects restored from older persisted stores.
+func kind_of(obj: asp.vm.RuntimeObject) -> ComponentKind {
+    if obj.component_kind != ComponentUnknown {
+        return obj.component_kind;
+    }
+    return resolve(obj.prog_id).kind;
+}
+
+// Central component switch kept free of component-specific state. Individual
+// handlers own validation and must write modified RuntimeObjects back through
+// the evaluator because ObjectSpace values are not implicitly reference cells.
+func invoke(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, kind: ComponentKind, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    if kind == ComponentAdoCommand {
+        return invoke_ado_command(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentAdoStream {
+        return invoke_ado_stream(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentAdoParameters {
+        return invoke_ado_parameters(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentAdoParameter {
+        return invoke_ado_parameter(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentFileSystemObject {
+        return invoke_file_system_object(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentTextStream {
+        return invoke_text_stream(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentFile {
+        return invoke_file_object(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentFolder {
+        return invoke_folder_object(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentFileCollection || kind == ComponentFolderCollection {
+        return invoke_path_collection(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentRegExp {
+        return invoke_regexp(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentMatchCollection {
+        return invoke_match_collection(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentMatch {
+        return invoke_match(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentSubMatches {
+        return invoke_submatches(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentDomDocument {
+        return invoke_dom_document(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentXmlNode {
+        return invoke_xml_node(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentXmlNodeList {
+        return invoke_xml_node_list(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentParseError {
+        return invoke_parse_error(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentServerXmlHttp || kind == ComponentXmlHttp {
+        return invoke_xml_http(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentRedis {
+        return invoke_redis(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentSocket {
+        return invoke_socket(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentShellApplication {
+        return invoke_shell_application(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentProcess {
+        return invoke_process(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentJson {
+        return invoke_json(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentHttpClient {
+        return invoke_http_client(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentCrypto {
+        return invoke_crypto(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentOpenAI {
+        return invoke_openai(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentWebSocket {
+        return invoke_websocket(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentMemcache {
+        return invoke_memcache(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    if kind == ComponentJsonObject {
+        return invoke_json_object(evaluator, ctx, obj_id, member, values, is_set);
+    }
+    evaluator.raise_runtime_error(ctx, 438, "component member not found: " + member, "Server.CreateObject");
+    return asp.runtime.variant_empty();
+}

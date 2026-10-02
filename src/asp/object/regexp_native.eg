@@ -1,0 +1,55 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.object;
+
+use collections;
+use strconv;
+use std;
+use strings;
+
+extern func eg_vbregexp_test(pattern: String, input: String, flags: Int) -> Int;
+extern func eg_vbregexp_find(pattern: String, input: String, start_offset: Int, flags: Int) -> String;
+extern func eg_vbregexp_replace(pattern: String, input: String, replacement: String, flags: Int) -> String;
+
+// Byte offsets returned by the native regex engine. `end_at` is exclusive,
+// matching substring APIs and allowing zero-width matches.
+class NativeRegexpMatch {
+    var start: Int;
+    var end_at: Int;
+    var captures: collections.Vector<String>;
+
+    func init(self: NativeRegexpMatch, start: Int, end_at: Int) -> Void {
+        self.start = start;
+        self.end_at = end_at;
+        self.captures = new collections.Vector<String>();
+    }
+}
+
+// Decode the compact native result and return an invalid range on malformed or
+// no-match responses. Captures are retrieved separately by scripting.eg.
+func regexp_find_native(pattern: String, input: String, start_offset: Int, flags: Int) -> NativeRegexpMatch {
+    let encoded: String = eg_vbregexp_find(pattern, input, start_offset, flags);
+    let spans: collections.Vector<String> = strings.split(encoded, ",");
+    if spans.len() == 0 {
+        return new NativeRegexpMatch(-1, -1);
+    }
+    let full_span: collections.Vector<String> = strings.split(spans.get(0), ":");
+    if full_span.len() != 2 {
+        return new NativeRegexpMatch(-1, -1);
+    }
+    let found: NativeRegexpMatch = new NativeRegexpMatch(strconv.atoi(full_span.get(0)), strconv.atoi(full_span.get(1)));
+    let i: Int = 1;
+    loop i < spans.len() {
+        let capture_span: collections.Vector<String> = strings.split(spans.get(i), ":");
+        if capture_span.len() == 2 {
+            let capture_start: Int = strconv.atoi(capture_span.get(0));
+            let capture_end: Int = strconv.atoi(capture_span.get(1));
+            _ = found.captures.push(capture_start >= 0 && capture_end >= capture_start ? std.substr(input, capture_start, capture_end - capture_start) : "");
+        } else {
+            _ = found.captures.push("");
+        }
+        i += 1;
+    }
+    return found;
+}

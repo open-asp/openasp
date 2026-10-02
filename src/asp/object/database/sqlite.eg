@@ -1,0 +1,41 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.object.database;
+
+use asp;
+use asp.runtime;
+use asp.vm;
+
+use std;
+use strings;
+
+extern func eg_sqlite_execute(db_path: String, sql: String) -> String;
+
+// The native wrapper returns either the shared tabular wire format or one of
+// SQLite's stable error prefixes.
+func sqlite_output_is_error(output: String) -> Bool {
+    return strings.starts_with(output, "Error:")
+        || strings.starts_with(output, "Parse error")
+        || strings.starts_with(output, "Runtime error");
+}
+
+// Execute entirely in process, translate native failure into ADO Err, and bind
+// the resulting Recordset to a snapshot of the originating connection.
+func sqlite_execute(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj: asp.vm.RuntimeObject, sql: String) -> asp.runtime.Variant {
+    let db_path: String = asp.asp_host_path(obj.store.get_or_empty("data source").to_output_string());
+    if std.len(db_path) == 0 {
+        evaluator.raise_runtime_error(ctx, 3709, "ADO connection has no Data Source", "ADODB.Connection");
+        return asp.runtime.variant_empty();
+    }
+    let output: String = eg_sqlite_execute(db_path, sql);
+    if sqlite_output_is_error(output) {
+        evaluator.raise_runtime_error(ctx, 3000, strings.trim_space(output), "ADODB.Connection");
+        return asp.runtime.variant_empty();
+    }
+    let rs_id: Int = ctx.objects.create_ado_recordset();
+    let rs: asp.vm.RuntimeObject = db_driver_tabular_recordset(output, sql, ctx.request_arena_handle);
+    db_driver_bind_recordset(rs, obj, DatabaseDriverSqlite);
+    _ = ctx.objects.set(rs_id, rs);
+    return asp.runtime.variant_object(rs_id);
+}

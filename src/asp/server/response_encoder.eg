@@ -1,0 +1,172 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.server;
+
+use asp.runtime;
+
+use std;
+use collections;
+use strings;
+
+// These helpers perform a deliberately bounded, ASCII-only inspection of the
+// initial HTML bytes. They are not a general HTML parser; their sole purpose is
+// classic ASP compatibility for doctype and meta Content-Type handling.
+func html_space(ch: Int) -> Bool {
+    return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r';
+}
+
+func html_attr_value(tag: String, attr_name: String) -> String {
+    let lower: String = strings.to_lower_ascii(tag);
+    let needle: String = strings.to_lower_ascii(attr_name);
+    let pos: Int = strings.find_substr(lower, needle);
+    if pos < 0 {
+        return "";
+    }
+    let cursor: Int = pos + std.len(needle);
+    loop cursor < std.len(tag) && html_space(std.byte_at(tag, cursor)) {
+        cursor += 1;
+    }
+    if cursor >= std.len(tag) || std.byte_at(tag, cursor) != '=' {
+        return "";
+    }
+    cursor += 1;
+    loop cursor < std.len(tag) && html_space(std.byte_at(tag, cursor)) {
+        cursor += 1;
+    }
+    if cursor >= std.len(tag) {
+        return "";
+    }
+    let quote: Int = std.byte_at(tag, cursor);
+    if quote == '"' || quote == '\'' {
+        let end: Int = cursor + 1;
+        loop end < std.len(tag) && std.byte_at(tag, end) != quote {
+            end += 1;
+        }
+        return end > cursor + 1 ? std.substr(tag, cursor + 1, end - cursor - 1) : "";
+    }
+    let end: Int = cursor;
+    loop end < std.len(tag) {
+        let ch: Int = std.byte_at(tag, end);
+        if html_space(ch) || ch == '>' {
+            break;
+        }
+        end += 1;
+    }
+    return end > cursor ? std.substr(tag, cursor, end - cursor) : "";
+}
+
+func ascii_byte_lower(ch: Int) -> Int {
+    return ch >= 'A' && ch <= 'Z' ? ch + ('a' - 'A') : ch;
+}
+
+// Omit ignorable template whitespace before syntax that must begin at byte 0.
+// HTML doctypes are normalized for legacy ASP templates; XML declarations are
+// normalized only for XML media types so ordinary text output is untouched.
+func response_body_prefix_offset(body: std.StringView, content_type: String) -> Int {
+    let lower_content_type: String = strings.to_lower_ascii(strings.trim_space(content_type));
+    let is_html: Bool = strings.starts_with(lower_content_type, "text/html");
+    let is_xml: Bool = strings.contains(lower_content_type, "xml");
+    if !is_html && !is_xml {
+        return 0;
+    }
+    let cursor: Int = 0;
+    loop cursor < body.len() {
+        let ch: Int = body.byte_at(cursor);
+        if html_space(ch) {
+            cursor += 1;
+            skip;
+        }
+        if cursor + 2 < body.len() && ch == '\xEF' && body.byte_at(cursor + 1) == '\xBB' && body.byte_at(cursor + 2) == '\xBF' {
+            cursor += 3;
+            skip;
+        }
+        break;
+    }
+    let marker: String = is_xml ? "<?xml" : "<!doctype";
+    if cursor == 0 || cursor + std.len(marker) > body.len() {
+        return 0;
+    }
+    let i: Int = 0;
+    loop i < std.len(marker) {
+        if ascii_byte_lower(body.byte_at(cursor + i)) != std.byte_at(marker, i) {
+            return 0;
+        }
+        i += 1;
+    }
+    return cursor;
+}
+
+// Scans at most 4 KiB for a legacy meta Content-Type declaration. Bounding the
+// scan prevents response size from affecting header-generation cost.
+func meta_content_type_parts(body: String) -> MetaContentTypeInfo {
+    let out: MetaContentTypeInfo = new MetaContentTypeInfo();
+    let scan_len: Int = std.len(body) < 4096 ? std.len(body) : 4096;
+    let head: String = scan_len > 0 ? std.substr(body, 0, scan_len) : "";
+    let lower: String = strings.to_lower_ascii(head);
+    let off: Int = 0;
+    loop off < std.len(lower) {
+        let rel: Int = strings.find_substr(std.substr(lower, off, std.len(lower) - off), "<meta");
+        if rel < 0 {
+            break;
+        }
+        let start: Int = off + rel;
+        let end: Int = start;
+        loop end < std.len(head) && std.byte_at(head, end) != '>' {
+            end += 1;
+        }
+        if end >= std.len(head) {
+            break;
+        }
+        let tag: String = std.substr(head, start, end - start + 1);
+        let lower_tag: String = strings.to_lower_ascii(tag);
+        if strings.find_substr(lower_tag, "http-equiv") >= 0 && strings.find_substr(lower_tag, "content-type") >= 0 {
+            let raw_content: String = strings.trim_space(html_attr_value(tag, "content"));
+            if std.len(raw_content) != 0 {
+                let parts: collections.Vector<String> = strings.split(raw_content, ";");
+                let i: Int = 0;
+                loop i < parts.len() {
+                    let part: String = strings.trim_space(parts.get(i));
+                    let lower_part: String = strings.to_lower_ascii(part);
+                    if i == 0 && std.len(part) != 0 {
+                        out.content_type = part;
+                    }
+                    if strings.starts_with(lower_part, "charset=") {
+                        out.charset = strings.to_lower_ascii(strings.trim_space(std.substr(part, 8, std.len(part) - 8)));
+                    }
+                    i += 1;
+                }
+                return out;
+            }
+        }
+        off = end + 1;
+    }
+    return out;
+}
+
+func transcode_http_body(body: String, charset: String) -> String {
+    let target: String = strings.to_lower_ascii(strings.trim_space(charset));
+    if std.len(body) == 0 || std.len(target) == 0 || strings.equal_fold_ascii(target, "utf-8") {
+        return body;
+    }
+    let converted: String = asp.runtime.transcode_text(body, "UTF-8", target);
+    return std.len(converted) != 0 ? converted : body;
+}
+
+class FastcgiResponseEncoder {
+    func init(self: FastcgiResponseEncoder) -> Void {
+    }
+
+    func header_name(self: FastcgiResponseEncoder, key: String) -> String {
+        if strings.equal_fold_ascii(key, "set-cookie") {
+            return "Set-Cookie";
+        }
+        if strings.equal_fold_ascii(key, "location") {
+            return "Location";
+        }
+        if strings.equal_fold_ascii(key, "content-type") {
+            return "Content-Type";
+        }
+        return key;
+    }
+}

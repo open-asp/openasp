@@ -1,0 +1,95 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.server;
+
+use asp;
+use asp.runtime;
+
+use std;
+use collections;
+use strings;
+
+extern func eg_asp_request_string_arena_enter(handle: Int) -> Int;
+
+// Converts an inbound protocol request into one rendered response. This class
+// owns the boundary where RequestContext is cleared but ResponseData ownership
+// moves to FastcgiRenderedResponse for asynchronous transmission.
+class FastcgiRequestLifecycle {
+    var runtime_state: FastcgiServerRuntime;
+    var mapper: FastcgiRequestMapper;
+
+    func init(self: FastcgiRequestLifecycle, runtime_state: FastcgiServerRuntime) -> Void {
+        self.runtime_state = runtime_state;
+        self.mapper = new FastcgiRequestMapper();
+    }
+
+    func memory_prediction(self: FastcgiRequestLifecycle, req: FastcgiInboundRequest) -> Int {
+        let body_bytes: Int = std.len(req.stdin_data);
+        let content_type: String = strings.to_lower_ascii(req.params.get_or("CONTENT_TYPE", ""));
+        if body_bytes < 1048576 && !strings.starts_with(content_type, "multipart/form-data") {
+            return 0;
+        }
+        return 33554432 + body_bytes * 2;
+    }
+
+    // Rendering order is deliberate: build context, execute and commit engine
+    // state, enter the response arena, derive metadata, then transfer response
+    // ownership. A cached body must be promoted before request teardown.
+    func render(self: FastcgiRequestLifecycle, req: FastcgiInboundRequest) -> FastcgiRenderedResponse {
+        let cache: FastcgiResponseCache = self.runtime_state.response_cache;
+        let cacheable: Bool = cache.enabled(req);
+        let cache_key: String = cacheable ? cache.key(req) : "";
+        if cacheable && cache.has(cache_key) {
+            return cache.lookup(cache_key);
+        }
+        let engine: asp.AspEngine = self.runtime_state.engine;
+        let ctx: asp.runtime.RequestContext = self.mapper.build_context(engine, req);
+        _ = engine.render_page_into_context(ctx, ctx.page_path);
+        engine.commit_context(ctx);
+        _ = eg_asp_request_string_arena_enter(ctx.request_arena_handle);
+        let raw_body_view: std.StringView = ctx.response.body_view();
+        let body_start: Int = response_body_prefix_offset(raw_body_view, ctx.response.content_type);
+        let response_body_view: std.StringView = raw_body_view.slice(body_start, raw_body_view.len() - body_start);
+        let meta_scan_len: Int = response_body_view.len() < 4096 ? response_body_view.len() : 4096;
+        let meta_head: String = response_body_view.slice(0, meta_scan_len).to_string();
+        let meta_info: MetaContentTypeInfo = meta_content_type_parts(meta_head);
+        if std.len(meta_info.content_type) != 0 {
+            ctx.response.content_type = meta_info.content_type;
+        }
+        if std.len(meta_info.charset) != 0 {
+            ctx.response.charset = meta_info.charset;
+        }
+        let out: FastcgiRenderedResponse = new FastcgiRenderedResponse();
+        out.status_code = ctx.response.status_code;
+        out.status_text = ctx.response.status_text;
+        out.content_type = ctx.response.content_type;
+        out.charset = ctx.response.charset;
+        out.response_owner.clear_request();
+        out.response_owner = ctx.response;
+        if strings.equal_fold_ascii(strings.trim_space(ctx.response.charset), "utf-8") || std.len(strings.trim_space(ctx.response.charset)) == 0 {
+            out.body_view = response_body_view;
+            out.body_is_view = true;
+        } else {
+            out.body = transcode_http_body(response_body_view.to_string(), ctx.response.charset);
+        }
+        let response_keys: collections.Vector<String> = ctx.response.headers.keys();
+        let key_index: Int = 0;
+        loop key_index < response_keys.len() {
+            let key: String = response_keys.get(key_index);
+            _ = out.headers.set(key, ctx.response.headers.get(key));
+            key_index += 1;
+        }
+        _ = response_keys.free();
+        if cacheable && cache.response_allowed(out) {
+            if out.body_is_view {
+                out.body = out.body_view.to_string();
+                out.body_is_view = false;
+            }
+            cache.store(cache_key, out);
+        }
+        ctx.clear_request_except_response();
+        engine.clear_request();
+        return out;
+    }
+}

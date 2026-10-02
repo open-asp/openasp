@@ -1,0 +1,141 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.server;
+
+use asp;
+use asp.runtime;
+
+use std;
+use collections;
+use os;
+use strings;
+use time;
+
+extern func eg_asp_request_string_arena_enter(handle: Int) -> Int;
+extern func eg_asp_request_string_arena_leave(handle: Int) -> Void;
+
+// Small opt-in, per-worker HTML response cache. Parallel vectors form one
+// fixed-capacity table and must remain index-aligned. Entries expire after ten
+// seconds; writes reuse expired slots or evict the oldest of 256 entries.
+// Shell/process capability disables caching because external side effects make
+// apparently identical GET requests unsafe to replay.
+class FastcgiResponseCache {
+    var keys: collections.Vector<String>;
+    var bodies: collections.Vector<String>;
+    var content_types: collections.Vector<String>;
+    var charsets: collections.Vector<String>;
+    var times: collections.Vector<Int>;
+    var active: Bool;
+
+    func init(self: FastcgiResponseCache) -> Void {
+        self.keys = new collections.Vector<String>();
+        self.bodies = new collections.Vector<String>();
+        self.content_types = new collections.Vector<String>();
+        self.charsets = new collections.Vector<String>();
+        self.times = new collections.Vector<Int>();
+        let value, env_err = os.getenv("EGRET_ASP_HTML_CACHE");
+        self.active = env_err == OK && value == "1";
+    }
+
+    func key(self: FastcgiResponseCache, req: FastcgiInboundRequest) -> String {
+        return req.params.get_or("SCRIPT_NAME", "") + "?" + req.params.get_or("QUERY_STRING", "")
+            + "\nCookie:" + req.params.get_or("HTTP_COOKIE", "");
+    }
+
+    func enabled(self: FastcgiResponseCache, req: FastcgiInboundRequest) -> Bool {
+        return self.active
+            && !asp.shell_application_enabled()
+            && !asp.process_component_enabled()
+            && strings.equal_fold_ascii(req.params.get_or("REQUEST_METHOD", "GET"), "GET")
+            && std.len(req.stdin_data) == 0
+            && std.len(req.params.get_or("SCRIPT_NAME", "")) != 0;
+    }
+
+    func response_allowed(self: FastcgiResponseCache, response: FastcgiRenderedResponse) -> Bool {
+        return response.status_code == 200
+            && (std.len(response.body) != 0 || (response.body_is_view && response.body_view.len() != 0))
+            && strings.starts_with(strings.to_lower_ascii(strings.trim_space(response.content_type)), "text/html");
+    }
+
+    func lookup(self: FastcgiResponseCache, key: String) -> FastcgiRenderedResponse {
+        let now_ms: Int = time.now_ms();
+        let i: Int = 0;
+        loop i < self.keys.len() {
+            if self.keys.get(i) == key {
+                if now_ms - self.times.get(i) <= 10000 {
+                    let out: FastcgiRenderedResponse = new FastcgiRenderedResponse();
+                    out.status_code = 200;
+                    out.status_text = "OK";
+                    out.content_type = self.content_types.get(i);
+                    out.charset = self.charsets.get(i);
+                    out.body = self.bodies.get(i);
+                    return out;
+                }
+                return new FastcgiRenderedResponse();
+            }
+            i += 1;
+        }
+        return new FastcgiRenderedResponse();
+    }
+
+    func has(self: FastcgiResponseCache, key: String) -> Bool {
+        let now_ms: Int = time.now_ms();
+        let i: Int = 0;
+        loop i < self.keys.len() {
+            if self.keys.get(i) == key {
+                return now_ms - self.times.get(i) <= 10000;
+            }
+            i += 1;
+        }
+        return false;
+    }
+
+    // Copies request-arena strings into managed storage before retaining them.
+    // Enter/leave brackets the promotion API and must use the response owner.
+    func store(self: FastcgiResponseCache, key: String, response: FastcgiRenderedResponse) -> Void {
+        _ = eg_asp_request_string_arena_enter(response.response_owner.request_arena_handle);
+        let stable_key: String = asp.runtime.promote_runtime_string(key);
+        let stable_body: String = asp.runtime.promote_runtime_string(response.body);
+        let stable_content_type: String = asp.runtime.promote_runtime_string(response.content_type);
+        let stable_charset: String = asp.runtime.promote_runtime_string(response.charset);
+        eg_asp_request_string_arena_leave(response.response_owner.request_arena_handle);
+        let now_ms: Int = time.now_ms();
+        let reusable_index: Int = -1;
+        let oldest_index: Int = -1;
+        let oldest_time: Int = now_ms;
+        let i: Int = 0;
+        loop i < self.keys.len() {
+            if self.keys.get(i) == key {
+                _ = self.bodies.set(i, stable_body);
+                _ = self.content_types.set(i, stable_content_type);
+                _ = self.charsets.set(i, stable_charset);
+                _ = self.times.set(i, now_ms);
+                return;
+            }
+            let entry_time: Int = self.times.get(i);
+            if reusable_index < 0 && now_ms - entry_time > 10000 {
+                reusable_index = i;
+            }
+            if oldest_index < 0 || entry_time < oldest_time {
+                oldest_index = i;
+                oldest_time = entry_time;
+            }
+            i += 1;
+        }
+        let replace_index: Int = reusable_index >= 0 ? reusable_index : (self.keys.len() >= 256 ? oldest_index : -1);
+        if replace_index >= 0 {
+            _ = self.keys.set(replace_index, stable_key);
+            _ = self.bodies.set(replace_index, stable_body);
+            _ = self.content_types.set(replace_index, stable_content_type);
+            _ = self.charsets.set(replace_index, stable_charset);
+            _ = self.times.set(replace_index, now_ms);
+            return;
+        }
+        _ = self.keys.push(stable_key);
+        _ = self.bodies.push(stable_body);
+        _ = self.content_types.push(stable_content_type);
+        _ = self.charsets.push(stable_charset);
+        _ = self.times.push(now_ms);
+    }
+}

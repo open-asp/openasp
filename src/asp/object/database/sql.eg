@@ -1,0 +1,799 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.object.database;
+
+use std;
+use strings;
+use collections;
+use strconv;
+
+enum SqlTokenKind {
+    SqlTokenEof,
+    SqlTokenIdentifier,
+    SqlTokenString,
+    SqlTokenNumber,
+    SqlTokenOperator,
+    SqlTokenComma,
+    SqlTokenLeftParen,
+    SqlTokenRightParen,
+    SqlTokenDot,
+    SqlTokenKeyword,
+    SqlTokenDate,
+}
+
+enum SqlStatementKind {
+    SqlStatementUnknown,
+    SqlStatementSelect,
+    SqlStatementUpdate,
+    SqlStatementInsert,
+    SqlStatementDelete,
+    SqlStatementCreate,
+}
+
+// Tokens retain their original text and byte offset so rewrites can preserve
+// literals and report locations without reconstructing the whole statement.
+class SqlToken {
+    var kind: SqlTokenKind;
+    var text: String;
+    var offset: Int;
+
+    func init(self: SqlToken) -> Void {
+        self.kind = SqlTokenEof;
+        self.text = "";
+        self.offset = 0;
+    }
+}
+
+// Parsed subset shared by MDB planning and MySQL compatibility rewriting.
+// `ok` means the recognized shape is safe to execute natively; unsupported SQL
+// remains available in raw_sql and must not be approximated.
+class SqlStatement {
+    var ok: Bool;
+    var error_text: String;
+    var kind: SqlStatementKind;
+    var raw_sql: String;
+    var table_name: String;
+    var join_table_name: String;
+    var join_left_column: String;
+    var join_right_column: String;
+    var columns: collections.Vector<String>;
+    var values: collections.Vector<String>;
+    var where_sql: String;
+    var select_columns: collections.Vector<String>;
+    var top_count: Int;
+    var distinct: Bool;
+    var order_column: String;
+    var order_desc: Bool;
+
+    func init(self: SqlStatement) -> Void {
+        self.ok = false;
+        self.error_text = "";
+        self.kind = SqlStatementUnknown;
+        self.raw_sql = "";
+        self.table_name = "";
+        self.join_table_name = "";
+        self.join_left_column = "";
+        self.join_right_column = "";
+        self.columns = new collections.Vector<String>();
+        self.values = new collections.Vector<String>();
+        self.where_sql = "";
+        self.select_columns = new collections.Vector<String>();
+        self.top_count = 0;
+        self.distinct = false;
+        self.order_column = "";
+        self.order_desc = false;
+    }
+}
+
+func sql_is_space(ch: Int) -> Bool {
+    return ch == '\t' || ch == '\n' || ch == '\r' || ch == ' ';
+}
+
+func sql_is_digit(ch: Int) -> Bool {
+    return ch >= '0' && ch <= '9';
+}
+
+func sql_is_ident_start(ch: Int) -> Bool {
+    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_' || ch == '[';
+}
+
+func sql_is_ident_part(ch: Int) -> Bool {
+    return sql_is_ident_start(ch) || sql_is_digit(ch) || ch == ']' || ch == '$';
+}
+
+func sql_keyword(text: String) -> Bool {
+    let word: String = strings.to_lower_ascii(text);
+    return word == "select" || word == "from" || word == "where" || word == "and" || word == "or"
+        || word == "not" || word == "like" || word == "in" || word == "is" || word == "null"
+        || word == "order" || word == "by" || word == "asc" || word == "desc" || word == "top"
+        || word == "distinct" || word == "group" || word == "having" || word == "join"
+        || word == "on" || word == "as" || word == "update" || word == "set"
+        || word == "insert" || word == "into" || word == "values" || word == "delete"
+        || word == "union" || word == "all" || word == "between";
+}
+
+// Lex SQL without normalizing quoted strings, bracketed identifiers, or Jet
+// date literals. Comments and nested expressions are handled as tokens so
+// clause searches can respect parenthesis depth.
+func sql_lex(sql: String) -> collections.Vector<SqlToken> {
+    let out: collections.Vector<SqlToken> = new collections.Vector<SqlToken>();
+    let i: Int = 0;
+    loop i < std.len(sql) {
+        let ch: Int = std.byte_at(sql, i);
+        if sql_is_space(ch) {
+            i += 1;
+            skip;
+        }
+        if ch == '\'' {
+            let start: Int = i;
+            let closed: Bool = false;
+            i += 1;
+            loop i < std.len(sql) {
+                let cur: Int = std.byte_at(sql, i);
+                if cur == '\'' {
+                    if i + 1 < std.len(sql) && std.byte_at(sql, i + 1) == '\'' {
+                        i += 2;
+                        skip;
+                    }
+                    closed = true;
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            let value_end: Int = closed ? i - 1 : i;
+            let token: SqlToken = new SqlToken();
+            token.kind = SqlTokenString;
+            token.text = strings.replace_all(std.substr(sql, start + 1, value_end - start - 1), "''", "'");
+            token.offset = start;
+            _ = out.push(token);
+            skip;
+        }
+        if ch == '#' {
+            let start: Int = i;
+            i += 1;
+            loop i < std.len(sql) && std.byte_at(sql, i) != '#' {
+                i += 1;
+            }
+            let token: SqlToken = new SqlToken();
+            token.kind = SqlTokenDate;
+            token.text = strings.trim_space(std.substr(sql, start + 1, i - start - 1));
+            token.offset = start;
+            _ = out.push(token);
+            if i < std.len(sql) {
+                i += 1;
+            }
+            skip;
+        }
+        if ch == '[' {
+            let start: Int = i;
+            let end: Int = i + 1;
+            loop end < std.len(sql) && std.byte_at(sql, end) != ']' {
+                end += 1;
+            }
+            let token: SqlToken = new SqlToken();
+            token.kind = SqlTokenIdentifier;
+            token.text = end < std.len(sql) ? std.substr(sql, i + 1, end - i - 1) : std.substr(sql, i + 1, std.len(sql) - i - 1);
+            token.offset = start;
+            _ = out.push(token);
+            i = end < std.len(sql) ? end + 1 : end;
+            skip;
+        }
+        if sql_is_ident_start(ch) {
+            let start: Int = i;
+            i += 1;
+            loop i < std.len(sql) && sql_is_ident_part(std.byte_at(sql, i)) {
+                i += 1;
+            }
+            let text: String = std.substr(sql, start, i - start);
+            let token: SqlToken = new SqlToken();
+            token.kind = sql_keyword(text) ? SqlTokenKeyword : SqlTokenIdentifier;
+            token.text = text;
+            token.offset = start;
+            _ = out.push(token);
+            skip;
+        }
+        if sql_is_digit(ch) {
+            let start: Int = i;
+            i += 1;
+            loop i < std.len(sql) && (sql_is_digit(std.byte_at(sql, i)) || std.byte_at(sql, i) == '.') {
+                i += 1;
+            }
+            let token: SqlToken = new SqlToken();
+            token.kind = SqlTokenNumber;
+            token.text = std.substr(sql, start, i - start);
+            token.offset = start;
+            _ = out.push(token);
+            skip;
+        }
+        let token: SqlToken = new SqlToken();
+        token.offset = i;
+        if ch == ',' {
+            token.kind = SqlTokenComma;
+        } else if ch == '(' {
+            token.kind = SqlTokenLeftParen;
+        } else if ch == ')' {
+            token.kind = SqlTokenRightParen;
+        } else if ch == '.' {
+            token.kind = SqlTokenDot;
+        } else {
+            token.kind = SqlTokenOperator;
+        }
+        let operator_len: Int = token.kind == SqlTokenOperator && i + 1 < std.len(sql)
+            && ((ch == '<' && (std.byte_at(sql, i + 1) == '=' || std.byte_at(sql, i + 1) == '>'))
+                || (ch == '>' && std.byte_at(sql, i + 1) == '=')
+                || (ch == '!' && std.byte_at(sql, i + 1) == '=')) ? 2 : 1;
+        token.text = std.substr(sql, i, operator_len);
+        _ = out.push(token);
+        i += operator_len;
+    }
+    let eof: SqlToken = new SqlToken();
+    eof.kind = SqlTokenEof;
+    eof.offset = std.len(sql);
+    _ = out.push(eof);
+    return out;
+}
+
+func sql_token_is(tokens: collections.Vector<SqlToken>, index: Int, text: String) -> Bool {
+    return index >= 0 && index < tokens.len() && strings.equal_fold_ascii(tokens.get(index).text, text);
+}
+
+func sql_token_is_any(tokens: collections.Vector<SqlToken>, index: Int, a: String, b: String, c: String) -> Bool {
+    return sql_token_is(tokens, index, a) || sql_token_is(tokens, index, b) || sql_token_is(tokens, index, c);
+}
+
+func sql_token_value(token: SqlToken) -> String {
+    if token.kind == SqlTokenString {
+        return "'" + strings.replace_all(token.text, "'", "''") + "'";
+    }
+    if token.kind == SqlTokenDate {
+        return "#" + token.text + "#";
+    }
+    return token.text;
+}
+
+func sql_join_tokens(tokens: collections.Vector<SqlToken>, start: Int, end: Int) -> String {
+    let out: String = "";
+    let i: Int = start;
+    loop i < end && i < tokens.len() {
+        let token: SqlToken = tokens.get(i);
+        let previous_is_dot: Bool = i > start && tokens.get(i - 1).kind == SqlTokenDot;
+        if std.len(out) > 0 && token.kind != SqlTokenDot && !previous_is_dot {
+            out += " ";
+        }
+        out += sql_token_value(token);
+        i += 1;
+    }
+    return strings.trim_space(out);
+}
+
+func sql_mysql_find_right_paren(tokens: collections.Vector<SqlToken>, left: Int, end: Int) -> Int {
+    let depth: Int = 0;
+    let i: Int = left;
+    loop i < end {
+        if tokens.get(i).kind == SqlTokenLeftParen {
+            depth += 1;
+        } else if tokens.get(i).kind == SqlTokenRightParen {
+            depth -= 1;
+            if depth == 0 {
+                return i;
+            }
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+func sql_mysql_parse_decimal(text: String, start: Int, end: Int, min_value: Int, max_value: Int) -> Int {
+    if start < 0 || end <= start || end - start > 4 {
+        return -1;
+    }
+    let value: Int = 0;
+    let i: Int = start;
+    loop i < end {
+        let ch: Int = std.byte_at(text, i);
+        if !sql_is_digit(ch) {
+            return -1;
+        }
+        value = value * 10 + ch - '0';
+        i += 1;
+    }
+    return value >= min_value && value <= max_value ? value : -1;
+}
+
+func sql_mysql_days_in_month(year: Int, month: Int) -> Int {
+    if month == 2 {
+        let leap: Bool = year % 400 == 0 || (year % 4 == 0 && year % 100 != 0);
+        return leap ? 29 : 28;
+    }
+    if month == 4 || month == 6 || month == 9 || month == 11 {
+        return 30;
+    }
+    return 31;
+}
+
+func sql_mysql_two_digits(value: Int) -> String {
+    return value < 10 ? "0" + strconv.itoa(value) : strconv.itoa(value);
+}
+
+func sql_mysql_normalize_datetime_literal(text: String) -> String {
+    let length: Int = std.len(text);
+    let slash1: Int = -1;
+    let slash2: Int = -1;
+    let space: Int = -1;
+    let colon1: Int = -1;
+    let colon2: Int = -1;
+    let i: Int = 0;
+    loop i < length {
+        let ch: Int = std.byte_at(text, i);
+        if ch == '/' {
+            if slash1 < 0 {
+                slash1 = i;
+            } else if slash2 < 0 {
+                slash2 = i;
+            } else {
+                return text;
+            }
+        } else if ch == ' ' {
+            if space >= 0 {
+                return text;
+            }
+            space = i;
+        } else if ch == ':' {
+            if colon1 < 0 {
+                colon1 = i;
+            } else if colon2 < 0 {
+                colon2 = i;
+            } else {
+                return text;
+            }
+        } else if !sql_is_digit(ch) {
+            return text;
+        }
+        i += 1;
+    }
+    let date_end: Int = space >= 0 ? space : length;
+    if slash1 < 1 || slash1 > 2 || slash2 <= slash1 + 1 || slash2 - slash1 > 3 || date_end - slash2 != 5 {
+        return text;
+    }
+    let month: Int = sql_mysql_parse_decimal(text, 0, slash1, 1, 12);
+    let day: Int = sql_mysql_parse_decimal(text, slash1 + 1, slash2, 1, 31);
+    let year: Int = sql_mysql_parse_decimal(text, slash2 + 1, date_end, 1000, 9999);
+    if month < 0 || day < 0 || year < 0 || day > sql_mysql_days_in_month(year, month) {
+        return text;
+    }
+    let normalized: String = strconv.itoa(year) + "-" + sql_mysql_two_digits(month) + "-" + sql_mysql_two_digits(day);
+    if space < 0 {
+        return normalized;
+    }
+    if colon1 <= space + 1 || colon1 - space > 3 || colon2 <= colon1 + 1 || colon2 - colon1 > 3 || length <= colon2 + 1 || length - colon2 > 3 {
+        return text;
+    }
+    let hour: Int = sql_mysql_parse_decimal(text, space + 1, colon1, 0, 23);
+    let minute: Int = sql_mysql_parse_decimal(text, colon1 + 1, colon2, 0, 59);
+    let second: Int = sql_mysql_parse_decimal(text, colon2 + 1, length, 0, 59);
+    if hour < 0 || minute < 0 || second < 0 {
+        return text;
+    }
+    return normalized + " " + sql_mysql_two_digits(hour) + ":" + sql_mysql_two_digits(minute) + ":" + sql_mysql_two_digits(second);
+}
+
+func sql_mysql_token_text(sql: String, token: SqlToken) -> String {
+    if token.kind == SqlTokenString {
+        let text: String = sql_mysql_normalize_datetime_literal(token.text);
+        return "'" + strings.replace_all(text, "'", "''") + "'";
+    }
+    if token.kind == SqlTokenDate {
+        let text: String = sql_mysql_normalize_datetime_literal(token.text);
+        return "'" + strings.replace_all(text, "'", "''") + "'";
+    }
+    if token.kind == SqlTokenIdentifier && token.offset < std.len(sql) && std.byte_at(sql, token.offset) == '[' {
+        return "`" + strings.replace_all(token.text, "`", "``") + "`";
+    }
+    return token.text;
+}
+
+func sql_mysql_append_token(out: String, text: String, kind: SqlTokenKind, previous_kind: SqlTokenKind) -> String {
+    if std.len(text) == 0 {
+        return out;
+    }
+    let compact_before: Bool = kind == SqlTokenComma
+        || kind == SqlTokenRightParen
+        || kind == SqlTokenDot
+        || (kind == SqlTokenLeftParen && previous_kind == SqlTokenIdentifier);
+    let compact_after_previous: Bool = previous_kind == SqlTokenLeftParen || previous_kind == SqlTokenDot;
+    if std.len(out) > 0 && !compact_before && !compact_after_previous {
+        out += " ";
+    }
+    out += text;
+    return out;
+}
+
+func sql_mysql_find_comma(tokens: collections.Vector<SqlToken>, start: Int, end: Int, ordinal: Int) -> Int {
+    let depth: Int = 0;
+    let found: Int = 0;
+    let i: Int = start;
+    loop i < end {
+        if tokens.get(i).kind == SqlTokenLeftParen {
+            depth += 1;
+        } else if tokens.get(i).kind == SqlTokenRightParen {
+            depth -= 1;
+        } else if depth == 0 && tokens.get(i).kind == SqlTokenComma {
+            found += 1;
+            if found == ordinal {
+                return i;
+            }
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+func sql_mysql_interval_name(token: SqlToken) -> String {
+    let interval: String = strings.to_lower_ascii(token.text);
+    if interval == "yyyy" || interval == "yy" || interval == "year" {
+        return "YEAR";
+    }
+    if interval == "m" || interval == "mm" || interval == "month" {
+        return "MONTH";
+    }
+    if interval == "h" || interval == "hh" || interval == "hour" {
+        return "HOUR";
+    }
+    if interval == "n" || interval == "mi" || interval == "minute" {
+        return "MINUTE";
+    }
+    if interval == "s" || interval == "ss" || interval == "second" {
+        return "SECOND";
+    }
+    return "DAY";
+}
+
+// Rewrite only known Access/VB expressions into MySQL syntax. Recursive ranges
+// preserve nesting; unknown functions and operators are emitted unchanged.
+func sql_mysql_rewrite_range(sql: String, tokens: collections.Vector<SqlToken>, start: Int, end: Int) -> String {
+    let top_at: Int = -1;
+    let top_count: String = "";
+    let select_at: Int = start;
+    if select_at < end && sql_token_is(tokens, select_at, "select") {
+        let candidate: Int = select_at + 1;
+        if candidate < end && sql_token_is(tokens, candidate, "distinct") {
+            candidate += 1;
+        }
+        if candidate + 1 < end && sql_token_is(tokens, candidate, "top") && tokens.get(candidate + 1).kind == SqlTokenNumber {
+            top_at = candidate;
+            top_count = tokens.get(candidate + 1).text;
+        }
+    }
+
+    let out: String = "";
+    let previous_kind: SqlTokenKind = SqlTokenEof;
+    let i: Int = start;
+    loop i < end {
+        if i == top_at {
+            i += 2;
+            skip;
+        }
+        let token: SqlToken = tokens.get(i);
+        if token.kind == SqlTokenIdentifier && i + 1 < end && tokens.get(i + 1).kind == SqlTokenLeftParen && strings.equal_fold_ascii(token.text, "instr") {
+            let right: Int = sql_mysql_find_right_paren(tokens, i + 1, end);
+            let comma1: Int = right > i ? sql_mysql_find_comma(tokens, i + 2, right, 1) : -1;
+            let comma2: Int = right > i ? sql_mysql_find_comma(tokens, i + 2, right, 2) : -1;
+            let comma3: Int = right > i ? sql_mysql_find_comma(tokens, i + 2, right, 3) : -1;
+            if right > i && comma1 > i && comma2 > comma1 && comma3 > comma2 {
+                out = sql_mysql_append_token(out, "LOCATE", SqlTokenIdentifier, previous_kind);
+                out += "(" + sql_mysql_rewrite_range(sql, tokens, comma2 + 1, comma3);
+                out += ", " + sql_mysql_rewrite_range(sql, tokens, comma1 + 1, comma2);
+                out += ", " + sql_mysql_rewrite_range(sql, tokens, i + 2, comma1) + ")";
+                previous_kind = SqlTokenRightParen;
+                i = right + 1;
+                skip;
+            }
+            if right > i && comma1 > i && comma2 < 0 {
+                out = sql_mysql_append_token(out, "LOCATE", SqlTokenIdentifier, previous_kind);
+                out += "(" + sql_mysql_rewrite_range(sql, tokens, comma1 + 1, right);
+                out += ", " + sql_mysql_rewrite_range(sql, tokens, i + 2, comma1) + ")";
+                previous_kind = SqlTokenRightParen;
+                i = right + 1;
+                skip;
+            }
+        }
+        if token.kind == SqlTokenIdentifier && i + 1 < end && tokens.get(i + 1).kind == SqlTokenLeftParen && strings.equal_fold_ascii(token.text, "datediff") {
+            let right: Int = sql_mysql_find_right_paren(tokens, i + 1, end);
+            let comma1: Int = right > i ? sql_mysql_find_comma(tokens, i + 2, right, 1) : -1;
+            let comma2: Int = right > i ? sql_mysql_find_comma(tokens, i + 2, right, 2) : -1;
+            if right > i && comma1 == i + 3 && comma2 > comma1 {
+                out = sql_mysql_append_token(out, "TIMESTAMPDIFF", SqlTokenIdentifier, previous_kind);
+                out += "(" + sql_mysql_interval_name(tokens.get(i + 2));
+                out += ", " + sql_mysql_rewrite_range(sql, tokens, comma1 + 1, comma2);
+                out += ", " + sql_mysql_rewrite_range(sql, tokens, comma2 + 1, right) + ")";
+                previous_kind = SqlTokenRightParen;
+                i = right + 1;
+                skip;
+            }
+        }
+        if token.kind == SqlTokenLeftParen {
+            let right: Int = sql_mysql_find_right_paren(tokens, i, end);
+            if right > i {
+                out = sql_mysql_append_token(out, "(", SqlTokenLeftParen, previous_kind);
+                out += sql_mysql_rewrite_range(sql, tokens, i + 1, right);
+                out += ")";
+                previous_kind = SqlTokenRightParen;
+                i = right + 1;
+                skip;
+            }
+        }
+        let text: String = sql_mysql_token_text(sql, token);
+        if token.kind == SqlTokenIdentifier && i + 1 < end && tokens.get(i + 1).kind == SqlTokenLeftParen {
+            if strings.equal_fold_ascii(text, "lcase") {
+                text = "LOWER";
+            } else if strings.equal_fold_ascii(text, "ucase") {
+                text = "UPPER";
+            } else if strings.equal_fold_ascii(text, "charindex") {
+                text = "LOCATE";
+            }
+        }
+        out = sql_mysql_append_token(out, text, token.kind, previous_kind);
+        previous_kind = token.kind;
+        i += 1;
+    }
+    if std.len(top_count) > 0 {
+        out += " LIMIT " + top_count;
+    }
+    return strings.trim_space(out);
+}
+
+func sql_mysql_rewrite(sql: String) -> String {
+    let tokens: collections.Vector<SqlToken> = sql_lex(sql);
+    if tokens.len() <= 1 {
+        return sql;
+    }
+    return sql_mysql_rewrite_range(sql, tokens, 0, tokens.len() - 1);
+}
+
+func sql_find_clause(tokens: collections.Vector<SqlToken>, start: Int, name: String) -> Int {
+    let depth: Int = 0;
+    let i: Int = start;
+    loop i < tokens.len() {
+        if tokens.get(i).kind == SqlTokenLeftParen {
+            depth += 1;
+        } else if tokens.get(i).kind == SqlTokenRightParen {
+            depth -= 1;
+        } else if depth == 0 && sql_token_is(tokens, i, name) {
+            return i;
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+func sql_find_next_clause(tokens: collections.Vector<SqlToken>, start: Int) -> Int {
+    let i: Int = start;
+    loop i < tokens.len() {
+        if sql_token_is_any(tokens, i, "where", "order", "group") || sql_token_is_any(tokens, i, "having", "union", "limit") {
+            return i;
+        }
+        i += 1;
+    }
+    return tokens.len() - 1;
+}
+
+func sql_parse_list(tokens: collections.Vector<SqlToken>, start: Int, end: Int) -> collections.Vector<String> {
+    let out: collections.Vector<String> = new collections.Vector<String>();
+    let item_start: Int = start;
+    let depth: Int = 0;
+    let i: Int = start;
+    loop i <= end && i < tokens.len() {
+        let split: Bool = i == end || (tokens.get(i).kind == SqlTokenComma && depth == 0);
+        if tokens.get(i).kind == SqlTokenLeftParen {
+            depth += 1;
+        } else if tokens.get(i).kind == SqlTokenRightParen {
+            depth -= 1;
+        }
+        if split {
+            let text_end: Int = i;
+            if text_end > item_start {
+                _ = out.push(sql_join_tokens(tokens, item_start, text_end));
+            }
+            item_start = i + 1;
+        }
+        i += 1;
+    }
+    return out;
+}
+
+func sql_parse_table(tokens: collections.Vector<SqlToken>, start: Int) -> String {
+    if start < 0 || start >= tokens.len() || tokens.get(start).kind == SqlTokenEof {
+        return "";
+    }
+    return tokens.get(start).text;
+}
+
+// Parse the deliberately constrained DML/SELECT grammar consumed by native MDB.
+// Failure is explicit and prevents a partially parsed statement from executing.
+func sql_parse_statement(sql: String) -> SqlStatement {
+    let statement: SqlStatement = new SqlStatement();
+    statement.raw_sql = sql;
+    let tokens: collections.Vector<SqlToken> = sql_lex(sql);
+    if tokens.len() == 0 {
+        statement.error_text = "empty SQL";
+        return statement;
+    }
+    let first: String = strings.to_lower_ascii(tokens.get(0).text);
+    if first == "select" {
+        statement.kind = SqlStatementSelect;
+    } else if first == "update" {
+        statement.kind = SqlStatementUpdate;
+    } else if first == "insert" {
+        statement.kind = SqlStatementInsert;
+    } else if first == "delete" {
+        statement.kind = SqlStatementDelete;
+    } else if first == "create" && sql_token_is(tokens, 1, "table") {
+        statement.kind = SqlStatementCreate;
+    } else {
+        statement.error_text = "unsupported SQL statement: " + first;
+        return statement;
+    }
+    let table_at: Int = -1;
+    let i: Int = 1;
+    if statement.kind == SqlStatementCreate {
+        table_at = 2;
+    } else if statement.kind == SqlStatementUpdate {
+        table_at = 1;
+    } else if statement.kind == SqlStatementInsert {
+        loop i < tokens.len() && !sql_token_is(tokens, i, "into") {
+            i += 1;
+        }
+        table_at = i + 1;
+    } else if statement.kind == SqlStatementDelete {
+        loop i < tokens.len() && !sql_token_is(tokens, i, "from") {
+            i += 1;
+        }
+        table_at = i + 1;
+    } else {
+        loop i < tokens.len() && !sql_token_is(tokens, i, "from") {
+            i += 1;
+        }
+        table_at = i + 1;
+    }
+    if table_at < 0 || table_at >= tokens.len() || tokens.get(table_at).kind == SqlTokenEof {
+        statement.error_text = "missing table name";
+        return statement;
+    }
+    statement.table_name = sql_parse_table(tokens, table_at);
+    if statement.kind == SqlStatementCreate {
+        if table_at + 1 >= tokens.len() || tokens.get(table_at + 1).kind != SqlTokenLeftParen {
+            statement.error_text = "CREATE TABLE requires a column list";
+            return statement;
+        }
+    } else if statement.kind == SqlStatementSelect {
+        let from_at: Int = sql_find_clause(tokens, 1, "from");
+        if from_at < 0 {
+            statement.error_text = "missing FROM";
+            return statement;
+        }
+        let select_start: Int = 1;
+        loop select_start < from_at {
+            if sql_token_is(tokens, select_start, "distinct") {
+                statement.distinct = true;
+                select_start += 1;
+                skip;
+            }
+            if sql_token_is(tokens, select_start, "top") {
+                if select_start + 1 >= from_at || tokens.get(select_start + 1).kind != SqlTokenNumber {
+                    statement.error_text = "TOP requires a numeric row count";
+                    return statement;
+                }
+                statement.top_count = strconv.atoi(tokens.get(select_start + 1).text);
+                if statement.top_count <= 0 {
+                    statement.error_text = "TOP row count must be positive";
+                    return statement;
+                }
+                select_start += 2;
+                skip;
+            }
+            break;
+        }
+        let select_end: Int = from_at;
+        let selected: collections.Vector<String> = sql_parse_list(tokens, select_start, select_end);
+        if selected.len() == 0 {
+            statement.error_text = "missing SELECT columns";
+            return statement;
+        }
+        let j: Int = 0;
+        loop j < selected.len() {
+            _ = statement.select_columns.push(selected.get(j));
+            j += 1;
+        }
+        let where_at: Int = sql_find_clause(tokens, from_at + 1, "where");
+        let order_at: Int = sql_find_clause(tokens, from_at + 1, "order");
+        let end_at: Int = where_at >= 0 ? where_at : (order_at >= 0 ? order_at : tokens.len() - 1);
+        let join_at: Int = sql_find_clause(tokens, from_at + 1, "join");
+        if join_at >= 0 {
+            let on_at: Int = sql_find_clause(tokens, join_at + 1, "on");
+            let join_end: Int = where_at >= 0 ? where_at : (order_at >= 0 ? order_at : tokens.len() - 1);
+            if join_at + 1 >= tokens.len() || on_at < 0 || on_at + 1 >= join_end {
+                statement.error_text = "invalid JOIN expression";
+                return statement;
+            }
+            let join_eq_at: Int = on_at + 1;
+            loop join_eq_at < join_end && (tokens.get(join_eq_at).kind != SqlTokenOperator || tokens.get(join_eq_at).text != "=") {
+                join_eq_at += 1;
+            }
+            if join_eq_at <= on_at + 1 || join_eq_at + 1 >= join_end {
+                statement.error_text = "JOIN requires an equality condition";
+                return statement;
+            }
+            statement.join_table_name = sql_parse_table(tokens, join_at + 1);
+            statement.join_left_column = sql_join_tokens(tokens, on_at + 1, join_eq_at);
+            statement.join_right_column = sql_join_tokens(tokens, join_eq_at + 1, join_end);
+            if std.len(statement.join_table_name) == 0 || std.len(statement.join_left_column) == 0 || std.len(statement.join_right_column) == 0 {
+                statement.error_text = "invalid JOIN expression";
+                return statement;
+            }
+        }
+        if where_at >= 0 {
+            let where_end: Int = order_at > where_at ? order_at : tokens.len() - 1;
+            statement.where_sql = sql_join_tokens(tokens, where_at + 1, where_end);
+        }
+        if order_at >= 0 && sql_token_is(tokens, order_at + 1, "by") {
+            let order_end: Int = tokens.len() - 1;
+            let order_items: collections.Vector<String> = sql_parse_list(tokens, order_at + 2, order_end);
+            if order_items.len() > 0 {
+                statement.order_column = order_items.get(0);
+                let lower_order_column: String = strings.to_lower_ascii(statement.order_column);
+                statement.order_desc = strings.ends_with(lower_order_column, " desc");
+                if statement.order_desc {
+                    statement.order_column = strings.trim_space(std.substr(statement.order_column, 0, std.len(statement.order_column) - 5));
+                } else if strings.ends_with(lower_order_column, " asc") {
+                    statement.order_column = strings.trim_space(std.substr(statement.order_column, 0, std.len(statement.order_column) - 4));
+                }
+            }
+        }
+        _ = end_at;
+    } else if statement.kind == SqlStatementUpdate {
+        let set_at: Int = sql_find_clause(tokens, table_at + 1, "set");
+        if set_at < 0 {
+            statement.error_text = "missing SET";
+            return statement;
+        }
+        let where_at: Int = sql_find_clause(tokens, set_at + 1, "where");
+        let set_end: Int = where_at >= 0 ? where_at : tokens.len() - 1;
+        let assignments: collections.Vector<String> = sql_parse_list(tokens, set_at + 1, set_end);
+        let j: Int = 0;
+        loop j < assignments.len() {
+            let eq: Int = strings.find_substr(assignments.get(j), "=");
+            if eq <= 0 {
+                statement.error_text = "invalid SET assignment";
+                return statement;
+            }
+            _ = statement.columns.push(strings.trim_space(std.substr(assignments.get(j), 0, eq)));
+            _ = statement.values.push(strings.trim_space(std.substr(assignments.get(j), eq + 1, std.len(assignments.get(j)) - eq - 1)));
+            j += 1;
+        }
+        if where_at >= 0 {
+            statement.where_sql = sql_join_tokens(tokens, where_at + 1, tokens.len() - 1);
+        }
+    } else if statement.kind == SqlStatementInsert {
+        let values_at: Int = sql_find_clause(tokens, table_at + 1, "values");
+        if values_at < 0 || tokens.get(table_at + 1).kind != SqlTokenLeftParen {
+            statement.error_text = "INSERT requires column list and VALUES";
+            return statement;
+        }
+        let close_at: Int = values_at - 1;
+        statement.columns = sql_parse_list(tokens, table_at + 2, close_at);
+        if tokens.get(values_at + 1).kind != SqlTokenLeftParen {
+            statement.error_text = "INSERT requires VALUES list";
+            return statement;
+        }
+        statement.values = sql_parse_list(tokens, values_at + 2, tokens.len() - 2);
+    } else if statement.kind == SqlStatementDelete {
+        let where_at: Int = sql_find_clause(tokens, table_at + 1, "where");
+        if where_at >= 0 {
+            statement.where_sql = sql_join_tokens(tokens, where_at + 1, tokens.len() - 1);
+        }
+    }
+    statement.ok = true;
+    return statement;
+}

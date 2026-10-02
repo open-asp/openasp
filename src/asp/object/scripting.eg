@@ -1,0 +1,688 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.object;
+
+use asp;
+use asp.runtime;
+use asp.vm;
+
+use bytes;
+use collections;
+use fs;
+use path;
+use std;
+use strconv;
+use strings;
+use time;
+
+extern func __gc_keepalive(obj: Any) -> Void;
+
+// Match captures are length-framed in one string so embedded delimiters remain
+// lossless without allocating one persistent object per capture.
+func pack_match_capture(payload: String, value: String) -> String {
+    return payload + strconv.itoa(std.len(value)) + ":" + value;
+}
+
+func match_capture_at(payload: String, wanted_index: Int) -> String {
+    if wanted_index < 0 {
+        return "";
+    }
+    let offset: Int = 0;
+    let index: Int = 0;
+    loop offset < std.len(payload) {
+        let colon: Int = strings.index_from(payload, ":", offset);
+        if colon < offset {
+            return "";
+        }
+        let length: Int = strconv.atoi(std.substr(payload, offset, colon - offset));
+        let value_start: Int = colon + 1;
+        if length < 0 || value_start + length > std.len(payload) {
+            return "";
+        }
+        if index == wanted_index {
+            return std.substr(payload, value_start, length);
+        }
+        offset = value_start + length;
+        index += 1;
+    }
+    return "";
+}
+
+func create_path_object(ctx: asp.runtime.RequestContext, kind: ComponentKind, prog_id: String, file_path: String) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = new asp.vm.RuntimeObject();
+    let host_path: String = asp.asp_host_path(file_path);
+    obj.component_kind = kind;
+    obj.prog_id = prog_id;
+    obj.text_value = host_path;
+    _ = obj.store.set("path", asp.runtime.variant_string(host_path));
+    let object_id: Int = ctx.objects.add(obj);
+    return asp.runtime.variant_object(object_id);
+}
+
+func fso_file_exists(file_path: String) -> Bool {
+    let kind, err = fs.stat_kind(asp.asp_host_path(file_path));
+    return err == std.OK && kind == fs.KIND_FILE;
+}
+
+func fso_folder_exists(file_path: String) -> Bool {
+    let kind, err = fs.stat_kind(asp.asp_host_path(file_path));
+    return err == std.OK && kind == fs.KIND_DIR;
+}
+
+func fso_base_name(file_path: String) -> String {
+    let name: String = path.base(file_path);
+    let extension: String = path.ext(name);
+    if std.len(extension) == 0 {
+        return name;
+    }
+    return std.substr(name, 0, std.len(name) - std.len(extension));
+}
+
+func fso_remove_tree(folder_path: String) -> ErrCode {
+    let entries, read_err = fs.read_dir(folder_path);
+    if read_err != std.OK {
+        return read_err;
+    }
+    let names: collections.Vector<String> = strings.split(entries, "\n");
+    let i: Int = 0;
+    loop i < names.len() {
+        let name: String = names.get(i);
+        if std.len(name) > 0 {
+            let child_path: String = path.join_path(folder_path, name);
+            let kind, kind_err = fs.stat_kind(child_path);
+            if kind_err != std.OK {
+                return kind_err;
+            }
+            if kind == fs.KIND_DIR {
+                let child_err: ErrCode = fso_remove_tree(child_path);
+                if child_err != std.OK {
+                    return child_err;
+                }
+            } else {
+                let _, remove_err = fs.remove(child_path);
+                if remove_err != std.OK {
+                    return remove_err;
+                }
+            }
+        }
+        i += 1;
+    }
+    let _, remove_err = fs.remove(folder_path);
+    return remove_err;
+}
+
+// TextStream loads file content into object-owned memory and tracks its cursor
+// independently. Writable modes flush through a single helper on mutation/close.
+func create_text_stream(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, file_path: String, mode: Int, create: Bool) -> asp.runtime.Variant {
+    file_path = asp.asp_host_path(file_path);
+    let exists: Bool = fso_file_exists(file_path);
+    if !exists && !create && mode == 1 {
+        evaluator.raise_runtime_error(ctx, 53, "file not found: " + file_path, "Scripting.FileSystemObject");
+        return asp.runtime.variant_nothing();
+    }
+    let data: String = "";
+    if exists && mode != 2 {
+        let raw, err = fs.read_bytes(file_path, -1);
+        if err == std.OK {
+            data = bytes.to_string(raw);
+        }
+    }
+    if mode == 2 {
+        let _, err = fs.write_text(file_path, "");
+        if err != std.OK {
+            evaluator.raise_runtime_error(ctx, 70, "cannot create file: " + file_path, "Scripting.FileSystemObject");
+            return asp.runtime.variant_nothing();
+        }
+    }
+    let obj: asp.vm.RuntimeObject = new asp.vm.RuntimeObject();
+    obj.component_kind = ComponentTextStream;
+    obj.prog_id = "Scripting.TextStream";
+    obj.opened = true;
+    obj.text_value = data;
+    obj.cursor = mode == 8 ? std.len(data) : 0;
+    _ = obj.store.set("path", asp.runtime.variant_string(file_path));
+    _ = obj.store.set("mode", asp.runtime.variant_int(mode));
+    return asp.runtime.variant_object(ctx.objects.add(obj));
+}
+
+// Implement the filesystem subset with host paths only at the I/O boundary.
+// Returned File/Folder/TextStream objects retain normalized paths, not handles.
+func invoke_file_system_object(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    _ = obj_id;
+    _ = is_set;
+    if strings.equal_fold_ascii(member, "FileExists") && values.len() > 0 {
+        return asp.runtime.variant_bool(fso_file_exists(values.get(0).to_output_string()));
+    }
+    if strings.equal_fold_ascii(member, "FolderExists") && values.len() > 0 {
+        return asp.runtime.variant_bool(fso_folder_exists(values.get(0).to_output_string()));
+    }
+    if strings.equal_fold_ascii(member, "BuildPath") && values.len() > 1 {
+        return asp.runtime.variant_string(path.join_path(asp.asp_host_path(values.get(0).to_output_string()), values.get(1).to_output_string()));
+    }
+    if strings.equal_fold_ascii(member, "GetFileName") && values.len() > 0 {
+        return asp.runtime.variant_string(path.base(values.get(0).to_output_string()));
+    }
+    if strings.equal_fold_ascii(member, "GetParentFolderName") && values.len() > 0 {
+        return asp.runtime.variant_string(path.dir(values.get(0).to_output_string()));
+    }
+    if strings.equal_fold_ascii(member, "GetExtensionName") && values.len() > 0 {
+        let extension: String = path.ext(values.get(0).to_output_string());
+        return asp.runtime.variant_string(std.len(extension) > 0 ? std.substr(extension, 1, std.len(extension) - 1) : "");
+    }
+    if strings.equal_fold_ascii(member, "GetBaseName") && values.len() > 0 {
+        return asp.runtime.variant_string(fso_base_name(values.get(0).to_output_string()));
+    }
+    if strings.equal_fold_ascii(member, "GetAbsolutePathName") && values.len() > 0 {
+        let resolved, err = fs.realpath(asp.asp_host_path(values.get(0).to_output_string()));
+        return asp.runtime.variant_string(err == std.OK ? asp.asp_windows_path(resolved) : asp.asp_windows_path(asp.asp_host_path(values.get(0).to_output_string())));
+    }
+    if strings.equal_fold_ascii(member, "GetTempName") {
+        return asp.runtime.variant_string("asp_" + asp.runtime.hex_encode(ctx.session_id + ctx.page_path) + ".tmp");
+    }
+    if strings.equal_fold_ascii(member, "CreateFolder") && values.len() > 0 {
+        let folder_path: String = asp.asp_host_path(values.get(0).to_output_string());
+        let _, err = fs.mkdir_all(folder_path);
+        if err != std.OK {
+            evaluator.raise_runtime_error(ctx, 70, "cannot create folder: " + folder_path, "Scripting.FileSystemObject");
+            return asp.runtime.variant_nothing();
+        }
+        return create_path_object(ctx, ComponentFolder, "Scripting.Folder", folder_path);
+    }
+    if strings.equal_fold_ascii(member, "DeleteFile") && values.len() > 0 {
+        let file_path: String = asp.asp_host_path(values.get(0).to_output_string());
+        let _, err = fs.remove(file_path);
+        if err != std.OK {
+            evaluator.raise_runtime_error(ctx, 53, "cannot delete file: " + file_path, "Scripting.FileSystemObject");
+        }
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "DeleteFolder") && values.len() > 0 {
+        let folder_path: String = asp.asp_host_path(values.get(0).to_output_string());
+        let err: ErrCode = fso_remove_tree(folder_path);
+        if err != std.OK {
+            evaluator.raise_runtime_error(ctx, 76, "cannot delete folder: " + folder_path, "Scripting.FileSystemObject");
+        }
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "CopyFile") && values.len() > 1 {
+        let source_path: String = asp.asp_host_path(values.get(0).to_output_string());
+        let target_path: String = asp.asp_host_path(values.get(1).to_output_string());
+        let _, err = fs.copy(source_path, target_path);
+        if err != std.OK {
+            evaluator.raise_runtime_error(ctx, 70, "cannot copy file: " + source_path + " -> " + target_path, "Scripting.FileSystemObject");
+        }
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "MoveFile") && values.len() > 1 {
+        let source_path: String = asp.asp_host_path(values.get(0).to_output_string());
+        let target_path: String = asp.asp_host_path(values.get(1).to_output_string());
+        let _, err = fs.rename(source_path, target_path);
+        if err != std.OK {
+            evaluator.raise_runtime_error(ctx, 70, "cannot move file: " + source_path + " -> " + target_path, "Scripting.FileSystemObject");
+        }
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "GetFile") && values.len() > 0 {
+        let file_path: String = asp.asp_host_path(values.get(0).to_output_string());
+        if !fso_file_exists(file_path) {
+            evaluator.raise_runtime_error(ctx, 53, "file not found: " + file_path, "Scripting.FileSystemObject");
+            return asp.runtime.variant_nothing();
+        }
+        return create_path_object(ctx, ComponentFile, "Scripting.File", file_path);
+    }
+    if strings.equal_fold_ascii(member, "GetFolder") && values.len() > 0 {
+        let folder_path: String = asp.asp_host_path(values.get(0).to_output_string());
+        if !fso_folder_exists(folder_path) {
+            evaluator.raise_runtime_error(ctx, 76, "folder not found: " + folder_path, "Scripting.FileSystemObject");
+            return asp.runtime.variant_nothing();
+        }
+        return create_path_object(ctx, ComponentFolder, "Scripting.Folder", folder_path);
+    }
+    if strings.equal_fold_ascii(member, "CreateTextFile") && values.len() > 0 {
+        return create_text_stream(evaluator, ctx, values.get(0).to_output_string(), 2, true);
+    }
+    if strings.equal_fold_ascii(member, "OpenTextFile") && values.len() > 0 {
+        let mode: Int = values.len() > 1 ? asp.variant_to_int(values.get(1)) : 1;
+        let create: Bool = values.len() > 2 && values.get(2).is_truthy();
+        return create_text_stream(evaluator, ctx, values.get(0).to_output_string(), mode, create);
+    }
+    evaluator.raise_runtime_error(ctx, 438, "filesystem member not found: " + member, "Scripting.FileSystemObject");
+    return asp.runtime.variant_empty();
+}
+
+func text_stream_flush(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, prog_id: String, file_path: String, data: String) -> Bool {
+    let _, err = fs.write_bytes(file_path, bytes.from_string(data));
+    if err != std.OK {
+        evaluator.raise_runtime_error(ctx, 70, "cannot write file: " + file_path, prog_id);
+        return false;
+    }
+    return true;
+}
+
+func text_stream_line_end(data: String, start: Int) -> Int {
+    let lf: Int = strings.index_from(data, "\n", start);
+    return lf < 0 ? std.len(data) : lf;
+}
+
+func invoke_text_stream(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let stored_obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    let obj: asp.vm.RuntimeObject = asp.vm.clone_runtime_object(stored_obj);
+    _ = is_set;
+    if strings.equal_fold_ascii(member, "AtEndOfStream") {
+        return asp.runtime.variant_bool(obj.cursor >= std.len(obj.text_value));
+    }
+    if strings.equal_fold_ascii(member, "ReadAll") {
+        let result: String = obj.cursor < std.len(obj.text_value) ? std.substr(obj.text_value, obj.cursor, std.len(obj.text_value) - obj.cursor) : "";
+        obj.cursor = std.len(obj.text_value);
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_string(result);
+    }
+    if strings.equal_fold_ascii(member, "Read") {
+        let count: Int = values.len() > 0 ? asp.variant_to_int(values.get(0)) : 0;
+        let remaining: Int = std.len(obj.text_value) - obj.cursor;
+        let take: Int = count > remaining ? remaining : (count < 0 ? 0 : count);
+        let result: String = take > 0 ? std.substr(obj.text_value, obj.cursor, take) : "";
+        obj.cursor += take;
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_string(result);
+    }
+    if strings.equal_fold_ascii(member, "ReadLine") {
+        let end_at: Int = text_stream_line_end(obj.text_value, obj.cursor);
+        let length: Int = end_at - obj.cursor;
+        let result: String = length > 0 ? std.substr(obj.text_value, obj.cursor, length) : "";
+        obj.cursor = end_at < std.len(obj.text_value) ? end_at + 1 : end_at;
+        if strings.ends_with(result, "\r") {
+            result = std.substr(result, 0, std.len(result) - 1);
+        }
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_string(result);
+    }
+    if strings.equal_fold_ascii(member, "Skip") && values.len() > 0 {
+        obj.cursor += asp.variant_to_int(values.get(0));
+        if obj.cursor > std.len(obj.text_value) {
+            obj.cursor = std.len(obj.text_value);
+        }
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "SkipLine") {
+        let end_at: Int = text_stream_line_end(obj.text_value, obj.cursor);
+        obj.cursor = end_at < std.len(obj.text_value) ? end_at + 1 : end_at;
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "Write") || strings.equal_fold_ascii(member, "WriteLine") || strings.equal_fold_ascii(member, "WriteBlankLines") {
+        let payload: String = "";
+        if strings.equal_fold_ascii(member, "WriteBlankLines") {
+            let count: Int = values.len() > 0 ? asp.variant_to_int(values.get(0)) : 1;
+            let i: Int = 0;
+            loop i < count {
+                payload += "\r\n";
+                i += 1;
+            }
+        } else {
+            payload = values.len() > 0 ? values.get(0).to_output_string() : "";
+            if strings.equal_fold_ascii(member, "WriteLine") {
+                payload += "\r\n";
+            }
+        }
+        obj.text_value = stream_replace_range(obj.text_value, obj.cursor, payload);
+        obj.cursor += std.len(payload);
+        _ = text_stream_flush(evaluator, ctx, obj.prog_id, obj.store.get_or_empty("path").to_output_string(), obj.text_value);
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "Close") {
+        if obj.store.get_or_empty("mode").int_value != 1 {
+            _ = text_stream_flush(evaluator, ctx, obj.prog_id, obj.store.get_or_empty("path").to_output_string(), obj.text_value);
+        }
+        obj.opened = false;
+        evaluator.set_object(ctx, obj_id, obj);
+        return asp.runtime.variant_empty();
+    }
+    evaluator.raise_runtime_error(ctx, 438, "text stream member not found: " + member, obj.prog_id);
+    return asp.runtime.variant_empty();
+}
+
+func invoke_file_object(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let file_obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    let file_store: asp.runtime.KeyValueStore = file_obj.store;
+    let file_path: String = std.len(file_obj.text_value) > 0 ? asp.runtime.clone_runtime_string(file_obj.text_value) : file_store.get_or_empty("path").to_output_string();
+    let prog_id: String = asp.runtime.clone_runtime_string(file_obj.prog_id);
+    _ = __gc_keepalive(file_store);
+    _ = __gc_keepalive(file_obj);
+    if strings.equal_fold_ascii(member, "Name") {
+        if is_set {
+            if values.len() == 0 {
+                evaluator.raise_runtime_error(ctx, 5, "file name is required", prog_id);
+                return asp.runtime.variant_empty();
+            }
+            let new_name: String = values.get(values.len() - 1).to_output_string();
+            if std.len(new_name) == 0 || strings.find_substr(new_name, "/") >= 0 || strings.find_substr(new_name, "\\") >= 0 {
+                evaluator.raise_runtime_error(ctx, 5, "invalid file name: " + new_name, prog_id);
+                return asp.runtime.variant_empty();
+            }
+            let target: String = path.join_path(path.dir(file_path), new_name);
+            let _, err = fs.rename(file_path, target);
+            if err != std.OK {
+                evaluator.raise_runtime_error(ctx, 70, "cannot rename file: " + file_path, prog_id);
+                return asp.runtime.variant_empty();
+            }
+            let obj: asp.vm.RuntimeObject = asp.vm.clone_runtime_object(evaluator.get_object(ctx, obj_id));
+            _ = obj.store.set("path", asp.runtime.variant_string(target));
+            evaluator.set_object(ctx, obj_id, obj);
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_string(path.base(file_path));
+    }
+    if strings.equal_fold_ascii(member, "Path") {
+        return asp.runtime.variant_string(file_path);
+    }
+    if strings.equal_fold_ascii(member, "ParentFolder") {
+        return asp.runtime.variant_string(path.dir(file_path));
+    }
+    if strings.equal_fold_ascii(member, "Size") {
+        let size, err = fs.stat_size(file_path);
+        return asp.runtime.variant_int(err == std.OK ? size : 0);
+    }
+    if strings.equal_fold_ascii(member, "DateLastModified") {
+        let timestamp, err = fs.stat_mtime(file_path);
+        return err == std.OK
+            ? asp.runtime.variant_date(timestamp * 1000)
+            : asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "Copy") && values.len() > 0 {
+        let target_path: String = asp.asp_host_path(values.get(0).to_output_string());
+        let _, err = fs.copy(file_path, target_path);
+        if err != std.OK {
+            evaluator.raise_runtime_error(ctx, 70, "cannot copy file: " + file_path + " -> " + target_path, prog_id);
+        }
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "Move") && values.len() > 0 {
+        let target: String = asp.asp_host_path(values.get(0).to_output_string());
+        let _, err = fs.rename(file_path, target);
+        if err == std.OK {
+            let obj: asp.vm.RuntimeObject = asp.vm.clone_runtime_object(evaluator.get_object(ctx, obj_id));
+            _ = obj.store.set("path", asp.runtime.variant_string(target));
+            evaluator.set_object(ctx, obj_id, obj);
+        } else {
+            evaluator.raise_runtime_error(ctx, 70, "cannot move file", prog_id);
+        }
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "Delete") {
+        let _, err = fs.remove(file_path);
+        if err != std.OK {
+            evaluator.raise_runtime_error(ctx, 70, "cannot delete file", prog_id);
+        }
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(member, "OpenAsTextStream") {
+        let mode: Int = values.len() > 0 ? asp.variant_to_int(values.get(0)) : 1;
+        return create_text_stream(evaluator, ctx, file_path, mode, false);
+    }
+    evaluator.raise_runtime_error(ctx, 438, "file member not found: " + member, prog_id);
+    return asp.runtime.variant_empty();
+}
+
+// Snapshot directory entries into child objects. Collections retain their ids,
+// while each child stores its own path so enumeration survives vector changes.
+func folder_children(ctx: asp.runtime.RequestContext, folder_path: String, want_directories: Bool) -> asp.runtime.Variant {
+    let collection: asp.vm.RuntimeObject = new asp.vm.RuntimeObject();
+    collection.component_kind = want_directories ? ComponentFolderCollection : ComponentFileCollection;
+    collection.prog_id = want_directories ? "Scripting.Folders" : "Scripting.Files";
+    collection.default_member = "Item";
+    let entries, err = fs.read_dir(folder_path);
+    if err != std.OK {
+        let empty_id: Int = ctx.objects.add(collection);
+        return asp.runtime.variant_object(empty_id);
+    }
+    let names: collections.Vector<String> = strings.split(entries, "\n");
+    let i: Int = 0;
+    loop i < names.len() {
+        if std.len(names.get(i)) > 0 {
+            let child_path: String = path.join_path(folder_path, names.get(i));
+            if want_directories && fso_folder_exists(child_path) {
+                let child: asp.runtime.Variant = create_path_object(ctx, ComponentFolder, "Scripting.Folder", child_path);
+                if collection.int_value > 0 {
+                    collection.text_value += ",";
+                }
+                collection.text_value += strconv.itoa(child.object_value);
+                collection.int_value += 1;
+            } else if !want_directories && fso_file_exists(child_path) {
+                let child: asp.runtime.Variant = create_path_object(ctx, ComponentFile, "Scripting.File", child_path);
+                if collection.int_value > 0 {
+                    collection.text_value += ",";
+                }
+                collection.text_value += strconv.itoa(child.object_value);
+                collection.int_value += 1;
+            }
+        }
+        i += 1;
+    }
+    let collection_id: Int = ctx.objects.add(collection);
+    return asp.runtime.variant_object(collection_id);
+}
+
+func invoke_path_collection(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    _ = is_set;
+    if strings.equal_fold_ascii(member, "Count") {
+        return asp.runtime.variant_int(obj.int_value);
+    }
+    if (strings.equal_fold_ascii(member, "Item") || std.len(member) == 0) && values.len() > 0 {
+        let index: Int = asp.variant_to_int(values.get(0));
+        let ids: collections.Vector<String> = strings.split(obj.text_value, ",");
+        if index >= 0 && index < obj.int_value && index < ids.len() {
+            return asp.runtime.variant_object(strconv.atoi(ids.get(index)));
+        }
+    }
+    evaluator.raise_runtime_error(ctx, 9, "filesystem collection index out of range", obj.prog_id);
+    return asp.runtime.variant_empty();
+}
+
+func invoke_folder_object(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let folder_obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    let folder_store: asp.runtime.KeyValueStore = folder_obj.store;
+    let folder_path: String = std.len(folder_obj.text_value) > 0 ? asp.runtime.clone_runtime_string(folder_obj.text_value) : folder_store.get_or_empty("path").to_output_string();
+    let prog_id: String = asp.runtime.clone_runtime_string(folder_obj.prog_id);
+    _ = __gc_keepalive(folder_store);
+    _ = __gc_keepalive(folder_obj);
+    _ = is_set;
+    if strings.equal_fold_ascii(member, "Name") {
+        return asp.runtime.variant_string(path.base(folder_path));
+    }
+    if strings.equal_fold_ascii(member, "Path") {
+        return asp.runtime.variant_string(folder_path);
+    }
+    if strings.equal_fold_ascii(member, "ParentFolder") {
+        return asp.runtime.variant_string(path.dir(folder_path));
+    }
+    if strings.equal_fold_ascii(member, "IsRootFolder") {
+        return asp.runtime.variant_bool(folder_path == "/");
+    }
+    if strings.equal_fold_ascii(member, "Files") {
+        return folder_children(ctx, folder_path, false);
+    }
+    if strings.equal_fold_ascii(member, "SubFolders") {
+        return folder_children(ctx, folder_path, true);
+    }
+    if strings.equal_fold_ascii(member, "CreateTextFile") && values.len() > 0 {
+        return create_text_stream(evaluator, ctx, path.join_path(folder_path, values.get(0).to_output_string()), 2, true);
+    }
+    evaluator.raise_runtime_error(ctx, 438, "folder member not found: " + member, prog_id);
+    return asp.runtime.variant_empty();
+}
+
+func create_match(ctx: asp.runtime.RequestContext, input: String, found: NativeRegexpMatch) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = new asp.vm.RuntimeObject();
+    obj.component_kind = ComponentMatch;
+    obj.prog_id = "VBScript.Match";
+    obj.text_value = std.substr(input, found.start, found.end_at - found.start);
+    obj.cursor = found.start;
+    obj.int_value = found.end_at - found.start;
+    let capture_payload: String = "";
+    let i: Int = 0;
+    loop i < found.captures.len() {
+        capture_payload = pack_match_capture(capture_payload, found.captures.get(i));
+        i += 1;
+    }
+    obj.auxiliary_text = capture_payload;
+    obj.auxiliary_int = found.captures.len();
+    _ = __gc_keepalive(found);
+    _ = __gc_keepalive(capture_payload);
+    let object_id: Int = ctx.objects.add(obj);
+    return asp.runtime.variant_object(object_id);
+}
+
+// Repeated native searches advance by at least one byte after zero-width
+// matches, preventing an infinite loop in Global mode.
+func regexp_execute(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, pattern: String, flags: Int, input: String) -> asp.runtime.Variant {
+    let collection: asp.vm.RuntimeObject = new asp.vm.RuntimeObject();
+    collection.component_kind = ComponentMatchCollection;
+    collection.prog_id = "VBScript.MatchCollection";
+    collection.default_member = "Item";
+    let offset: Int = 0;
+    loop offset <= std.len(input) {
+        let found: NativeRegexpMatch = regexp_find_native(pattern, input, offset, flags);
+        if found.start < 0 || found.end_at < found.start {
+            break;
+        }
+        let length: Int = found.end_at - found.start;
+        let next_offset: Int = found.start + (length > 0 ? length : 1);
+        let match_value: asp.runtime.Variant = create_match(ctx, input, found);
+        if collection.int_value > 0 {
+            collection.text_value += ",";
+        }
+        collection.text_value += strconv.itoa(match_value.object_value);
+        collection.int_value += 1;
+        if (flags & 1) == 0 {
+            break;
+        }
+        offset = next_offset;
+    }
+    let collection_id: Int = ctx.objects.add(collection);
+    return asp.runtime.variant_object(collection_id);
+}
+
+func regexp_replace(pattern: String, flags: Int, input: String, replacement: String) -> String {
+    return eg_vbregexp_replace(pattern, input, replacement, flags);
+}
+
+func invoke_regexp(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    if strings.equal_fold_ascii(member, "Pattern") || strings.equal_fold_ascii(member, "Global") || strings.equal_fold_ascii(member, "IgnoreCase") || strings.equal_fold_ascii(member, "Multiline") {
+        if is_set {
+            let updated: asp.vm.RuntimeObject = new asp.vm.RuntimeObject();
+            updated.component_kind = ComponentRegExp;
+            updated.prog_id = "VBScript.RegExp";
+            updated.text_value = asp.runtime.clone_runtime_string(obj.text_value);
+            updated.int_value = obj.int_value;
+            if strings.equal_fold_ascii(member, "Pattern") {
+                updated.text_value = property_value(values).to_output_string();
+            } else {
+                let bit: Int = strings.equal_fold_ascii(member, "Global") ? 1 : (strings.equal_fold_ascii(member, "IgnoreCase") ? 2 : 4);
+                if property_value(values).is_truthy() {
+                    updated.int_value = updated.int_value | bit;
+                } else {
+                    updated.int_value = updated.int_value & (7 - bit);
+                }
+            }
+            evaluator.set_object(ctx, obj_id, updated);
+            return asp.runtime.variant_empty();
+        }
+        if strings.equal_fold_ascii(member, "Pattern") {
+            return asp.runtime.variant_string(obj.text_value);
+        }
+        let bit: Int = strings.equal_fold_ascii(member, "Global") ? 1 : (strings.equal_fold_ascii(member, "IgnoreCase") ? 2 : 4);
+        return asp.runtime.variant_bool((obj.int_value & bit) != 0);
+    }
+    if strings.equal_fold_ascii(member, "Test") && values.len() > 0 {
+        let input: String = values.get(0).to_output_string();
+        return asp.runtime.variant_bool(eg_vbregexp_test(obj.text_value, input, obj.int_value) != 0);
+    }
+    if strings.equal_fold_ascii(member, "Execute") && values.len() > 0 {
+        return regexp_execute(evaluator, ctx, obj.text_value, obj.int_value, values.get(0).to_output_string());
+    }
+    if strings.equal_fold_ascii(member, "Replace") && values.len() > 1 {
+        let input: String = values.get(0).to_output_string();
+        let replacement: String = values.get(1).to_output_string();
+        return asp.runtime.variant_string(regexp_replace(obj.text_value, obj.int_value, input, replacement));
+    }
+    evaluator.raise_runtime_error(ctx, 438, "regular expression member not found: " + member, obj.prog_id);
+    return asp.runtime.variant_empty();
+}
+
+func invoke_match_collection(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    _ = is_set;
+    if strings.equal_fold_ascii(member, "Count") {
+        return asp.runtime.variant_int(obj.int_value);
+    }
+    if (strings.equal_fold_ascii(member, "Item") || std.len(member) == 0) && values.len() > 0 {
+        let index: Int = asp.variant_to_int(values.get(0));
+        let ids: collections.Vector<String> = strings.split(obj.text_value, ",");
+        if index >= 0 && index < obj.int_value && index < ids.len() {
+            return asp.runtime.variant_object(strconv.atoi(ids.get(index)));
+        }
+    }
+    evaluator.raise_runtime_error(ctx, 9, "match index out of range", obj.prog_id);
+    return asp.runtime.variant_empty();
+}
+
+func invoke_match(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    _ = is_set;
+    let key: String = std.len(member) == 0 ? "value" : strings.to_lower_ascii(member);
+    if key == "value" {
+        return asp.runtime.variant_string(obj.text_value);
+    }
+    if key == "firstindex" {
+        return asp.runtime.variant_int(obj.cursor);
+    }
+    if key == "length" {
+        return asp.runtime.variant_int(obj.int_value);
+    }
+    if key == "submatches" {
+        if values.len() > 0 {
+            let index: Int = asp.variant_to_int(values.get(0));
+            if index >= 0 && index < obj.auxiliary_int {
+                return asp.runtime.variant_string(match_capture_at(obj.auxiliary_text, index));
+            }
+            evaluator.raise_runtime_error(ctx, 9, "submatch index out of range", obj.prog_id);
+            return asp.runtime.variant_empty();
+        }
+        let submatches: asp.vm.RuntimeObject = new asp.vm.RuntimeObject();
+        submatches.component_kind = ComponentSubMatches;
+        submatches.prog_id = "VBScript.SubMatches";
+        submatches.default_member = "Item";
+        submatches.text_value = asp.runtime.clone_runtime_string(obj.auxiliary_text);
+        submatches.int_value = obj.auxiliary_int;
+        let result: asp.runtime.Variant = asp.runtime.variant_object(ctx.objects.add(submatches));
+        _ = __gc_keepalive(obj);
+        _ = __gc_keepalive(submatches);
+        return result;
+    }
+    evaluator.raise_runtime_error(ctx, 438, "match member not found: " + member, obj.prog_id);
+    return asp.runtime.variant_empty();
+}
+
+func invoke_submatches(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool) -> asp.runtime.Variant {
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_id);
+    _ = is_set;
+    if strings.equal_fold_ascii(member, "Count") {
+        return asp.runtime.variant_int(obj.int_value);
+    }
+    if ((strings.equal_fold_ascii(member, "Item") || std.len(member) == 0) && values.len() > 0) {
+        let index: Int = asp.variant_to_int(values.get(0));
+        if index >= 0 && index < obj.int_value {
+            return asp.runtime.variant_string(match_capture_at(obj.text_value, index));
+        }
+        evaluator.raise_runtime_error(ctx, 9, "submatch index out of range", obj.prog_id);
+        return asp.runtime.variant_empty();
+    }
+    evaluator.raise_runtime_error(ctx, 438, "submatches member not found: " + member, obj.prog_id);
+    return asp.runtime.variant_empty();
+}

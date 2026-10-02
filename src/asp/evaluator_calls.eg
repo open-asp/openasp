@@ -1,0 +1,2724 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp;
+
+use asp.object.database;
+use asp.runtime;
+use asp.compiler;
+use asp.vm;
+use asp.object;
+
+use std;
+use fs;
+use path;
+use strings;
+use strconv;
+use collections;
+use os;
+use os.process;
+use time;
+use math;
+use runtime;
+
+extern func __gc_keepalive(obj: Any) -> Void;
+extern func eg_asp_vm_member_select(arena_handle: Int, member_id: Int, object_kind: Int, candidate_id: Int, argument_count: Int, member_flags: Int) -> Int;
+extern func eg_vbs_now_millis() -> Int;
+extern func eg_vbs_make_date(year: Int, month: Int, day: Int, hour: Int, minute: Int, second: Int) -> Int;
+extern func eg_vbs_date_add(millis: Int, interval: Int, amount: Int) -> Int;
+extern func eg_vbs_date_part(millis: Int, part: Int) -> Int;
+extern func eg_vbs_parse_date(text: String) -> Int;
+extern func eg_vbs_format_date(millis: Int, mode: Int) -> String;
+extern func eg_vbs_chr_w(codepoint: Int) -> String;
+extern func eg_vbs_sgn(value: Float64) -> Int;
+extern func eg_vbs_atn(value: Float64) -> Float64;
+extern func eg_vbs_sin(value: Float64) -> Float64;
+extern func eg_vbs_cos(value: Float64) -> Float64;
+extern func eg_vbs_tan(value: Float64) -> Float64;
+extern func eg_vbs_exp(value: Float64) -> Float64;
+extern func eg_vbs_log(value: Float64) -> Float64;
+extern func eg_vbs_is_compat_builtin(name: String) -> Int;
+extern func eg_vbs_is_values_only_builtin(name: String) -> Int;
+extern func eg_vbs_string_to_bool(text: String) -> Int;
+
+// This module owns call and assignment dispatch for both execution engines.
+// Functions taking arg_ids evaluate AST nodes lazily; functions taking values
+// are entered by bytecode after evaluation. These paths must remain
+// semantically equivalent, especially for ByRef, default members, and Err.
+//
+// Numeric member ids are optimization hints, not authority. Every accelerated
+// path validates object kind, arity, and flags before dispatch and falls back to
+// case-insensitive name lookup when a cached id is stale or incompatible.
+func evaluator_calls_is_compat_builtin(name: String) -> Bool {
+    return eg_vbs_is_compat_builtin(name) != 0;
+}
+
+func evaluator_calls_is_values_only_builtin(name: String) -> Bool {
+    return eg_vbs_is_values_only_builtin(name) != 0;
+}
+
+func evaluator_calls_date_interval(text: String) -> Int {
+    let value: String = strings.to_lower_ascii(strings.trim_space(text));
+    if value == "yyyy" {
+        return 0;
+    }
+    if value == "q" {
+        return 1;
+    }
+    if value == "m" {
+        return 2;
+    }
+    if value == "y" || value == "d" || value == "w" {
+        return 3;
+    }
+    if value == "ww" {
+        return 6;
+    }
+    if value == "h" {
+        return 7;
+    }
+    if value == "n" {
+        return 8;
+    }
+    if value == "s" {
+        return 9;
+    }
+    return -1;
+}
+
+func evaluator_calls_date_part_code(text: String) -> Int {
+    let value: String = strings.to_lower_ascii(strings.trim_space(text));
+    if value == "yyyy" {
+        return 0;
+    }
+    if value == "m" {
+        return 1;
+    }
+    if value == "d" {
+        return 2;
+    }
+    if value == "h" {
+        return 3;
+    }
+    if value == "n" {
+        return 4;
+    }
+    if value == "s" {
+        return 5;
+    }
+    if value == "w" {
+        return 6;
+    }
+    if value == "y" {
+        return 7;
+    }
+    if value == "ww" {
+        return 8;
+    }
+    if value == "q" {
+        return 9;
+    }
+    return -1;
+}
+
+func evaluator_calls_date_millis(value: asp.runtime.Variant) -> Int {
+    if value.kind == asp.runtime.VariantDate {
+        return value.date_value;
+    }
+    if value.kind == asp.runtime.VariantInt || value.kind == asp.runtime.VariantFloat {
+        return ((variant_to_float64(value) - 25569.0) * 86400000.0) => Int;
+    }
+    return eg_vbs_parse_date(value.to_output_string());
+}
+
+func evaluator_calls_url_encode(text: String) -> String {
+    let digits: String = "0123456789ABCDEF";
+    let out: std.StringBuilder = new std.StringBuilder(std.len(text) * 3 + 1);
+    let i: Int = 0;
+    loop i < std.len(text) {
+        let ch: Int = std.byte_at(text, i);
+        if (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '.' || ch == '_' || ch == '~' {
+            _ = out.append(std.substr(text, i, 1));
+        } else if ch == ' ' {
+            _ = out.append("+");
+        } else {
+            _ = out.append("%");
+            _ = out.append(std.substr(digits, (ch >> 4) & 15, 1));
+            _ = out.append(std.substr(digits, ch & 15, 1));
+        }
+        i += 1;
+    }
+    let result: String = out.to_string();
+    _ = out.free();
+    return result;
+}
+
+func evaluator_calls_html_encode(text: String) -> String {
+    let out: String = strings.replace_all(text, "&", "&amp;");
+    out = strings.replace_all(out, "<", "&lt;");
+    out = strings.replace_all(out, ">", "&gt;");
+    out = strings.replace_all(out, "\"", "&quot;");
+    out = strings.replace_all(out, "'", "&#39;");
+    return out;
+}
+
+func evaluator_calls_first_codepoint(text: String) -> Int {
+    if std.len(text) == 0 {
+        return 0;
+    }
+    let b0: Int = std.byte_at(text, 0);
+    if b0 < 128 {
+        return b0;
+    }
+    if (b0 & 224) == 192 && std.len(text) >= 2 {
+        return ((b0 & 31) << 6) | (std.byte_at(text, 1) & 63);
+    }
+    if (b0 & 240) == 224 && std.len(text) >= 3 {
+        return ((b0 & 15) << 12) | ((std.byte_at(text, 1) & 63) << 6) | (std.byte_at(text, 2) & 63);
+    }
+    if (b0 & 248) == 240 && std.len(text) >= 4 {
+        return ((b0 & 7) << 18) | ((std.byte_at(text, 1) & 63) << 12) | ((std.byte_at(text, 2) & 63) << 6) | (std.byte_at(text, 3) & 63);
+    }
+    return b0;
+}
+
+func evaluator_calls_type_name(value: asp.runtime.Variant) -> String {
+    if value.kind == asp.runtime.VariantEmpty {
+        return "Empty";
+    }
+    if value.kind == asp.runtime.VariantNull {
+        return "Null";
+    }
+    if value.kind == asp.runtime.VariantBool {
+        return "Boolean";
+    }
+    if value.kind == asp.runtime.VariantInt {
+        return value.int_value >= -32768 && value.int_value <= 32767 ? "Integer" : "Long";
+    }
+    if value.kind == asp.runtime.VariantFloat {
+        return "Double";
+    }
+    if value.kind == asp.runtime.VariantString {
+        return "String";
+    }
+    if value.kind == asp.runtime.VariantDate {
+        return "Date";
+    }
+    if value.kind == asp.runtime.VariantArray {
+        return "Variant()";
+    }
+    if value.kind == asp.runtime.VariantNothing {
+        return "Nothing";
+    }
+    return "Object";
+}
+
+func evaluator_calls_var_type(value: asp.runtime.Variant) -> Int {
+    if value.kind == asp.runtime.VariantNull {
+        return 1;
+    }
+    if value.kind == asp.runtime.VariantInt {
+        return value.int_value >= -32768 && value.int_value <= 32767 ? 2 : 3;
+    }
+    if value.kind == asp.runtime.VariantFloat {
+        return 5;
+    }
+    if value.kind == asp.runtime.VariantDate {
+        return 7;
+    }
+    if value.kind == asp.runtime.VariantString {
+        return 8;
+    }
+    if value.kind == asp.runtime.VariantObject || value.kind == asp.runtime.VariantNothing {
+        return 9;
+    }
+    if value.kind == asp.runtime.VariantBool {
+        return 11;
+    }
+    if value.kind == asp.runtime.VariantArray {
+        return 8204;
+    }
+    return 0;
+}
+
+func evaluator_calls_format_number(values: collections.Vector<asp.runtime.Variant>) -> asp.runtime.Variant {
+    if values.len() == 0 {
+        return asp.runtime.variant_string("");
+    }
+    let decimals: Int = values.len() >= 2 ? variant_to_int(values.get(1)) : 2;
+    let places: Int = decimals < 0 ? 2 : (decimals > 12 ? 12 : decimals);
+    let factor: Int = 1;
+    let i: Int = 0;
+    loop i < places {
+        factor = factor * 10;
+        i += 1;
+    }
+    let number: Float64 = variant_to_float64(values.get(0));
+    let negative: Bool = number < 0.0;
+    let magnitude: Float64 = negative ? 0.0 - number : number;
+    let scaled: Int = (magnitude * (factor => Float64) + 0.5) => Int;
+    let whole: Int = factor == 0 ? scaled : scaled / factor;
+    let fraction: Int = factor == 0 ? 0 : scaled % factor;
+    let text: String = (negative ? "-" : "") + strconv.itoa(whole);
+    if places > 0 {
+        let fraction_text: String = strconv.itoa(fraction);
+        text += "." + strings.repeat("0", places - std.len(fraction_text)) + fraction_text;
+    }
+    return asp.runtime.variant_string(text);
+}
+
+func evaluator_calls_string_compare(left: String, right: String) -> Int {
+    let i: Int = 0;
+    let limit: Int = std.len(left) < std.len(right) ? std.len(left) : std.len(right);
+    loop i < limit {
+        let a: Int = std.byte_at(left, i);
+        let b: Int = std.byte_at(right, i);
+        if a != b {
+            return a < b ? -1 : 1;
+        }
+        i += 1;
+    }
+    return std.len(left) == std.len(right) ? 0 : (std.len(left) < std.len(right) ? -1 : 1);
+}
+
+func evaluator_calls_is_response_cookies_expr(program: asp.compiler.VbsProgram, expr: asp.compiler.VbsExprNode) -> Bool {
+    if expr.kind != asp.compiler.VbsExprCall {
+        return false;
+    }
+    if strings.equal_fold_ascii(expr.text, "Response.Cookies") {
+        return true;
+    }
+    if strings.equal_fold_ascii(expr.text, "Item") && expr.left_id >= 0 && expr.left_id < program.runtime_expr_count() {
+        return evaluator_calls_is_response_cookies_expr(program, program.get_expr(expr.left_id));
+    }
+    if !strings.equal_fold_ascii(expr.text, "Cookies") || expr.left_id < 0 || expr.left_id >= program.runtime_expr_count() {
+        return false;
+    }
+    let base: asp.compiler.VbsExprNode = program.get_expr(expr.left_id);
+    return base.kind == asp.compiler.VbsExprIdentifier && strings.equal_fold_ascii(base.text, "Response");
+}
+
+// Compatibility built-ins are grouped here because they share pre-evaluated
+// arguments and have no ByRef behavior. Native date/math helpers provide
+// locale-independent primitives; this layer applies VBScript coercion.
+func evaluator_calls_compat_builtin(evaluator: Evaluator, program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, scope: asp.vm.Scope, name: String, values: collections.Vector<asp.runtime.Variant>) -> asp.runtime.Variant {
+    if strings.equal_fold_ascii(name, "Server.URLEncode") {
+        return asp.runtime.variant_string(evaluator_calls_url_encode(values.len() > 0 ? values.get(0).to_output_string() : ""));
+    }
+    if strings.equal_fold_ascii(name, "Server.HTMLEncode") {
+        return asp.runtime.variant_string(evaluator_calls_html_encode(values.len() > 0 ? values.get(0).to_output_string() : ""));
+    }
+    if strings.equal_fold_ascii(name, "Asc") || strings.equal_fold_ascii(name, "AscW") {
+        return asp.runtime.variant_int(values.len() > 0 ? evaluator_calls_first_codepoint(values.get(0).to_output_string()) : 0);
+    }
+    if strings.equal_fold_ascii(name, "AscB") {
+        let text: String = values.len() > 0 ? values.get(0).to_output_string() : "";
+        return asp.runtime.variant_int(std.len(text) > 0 ? std.byte_at(text, 0) : 0);
+    }
+    if strings.equal_fold_ascii(name, "ChrW") {
+        return asp.runtime.variant_string(values.len() > 0 ? eg_vbs_chr_w(variant_to_int(values.get(0))) : "");
+    }
+    if strings.equal_fold_ascii(name, "Date") || strings.equal_fold_ascii(name, "Now") || strings.equal_fold_ascii(name, "Time") {
+        let now: Int = eg_vbs_now_millis();
+        if strings.equal_fold_ascii(name, "Date") {
+            return asp.runtime.variant_date(eg_vbs_make_date(eg_vbs_date_part(now, 0), eg_vbs_date_part(now, 1), eg_vbs_date_part(now, 2), 0, 0, 0), 1);
+        }
+        return asp.runtime.variant_date(now, strings.equal_fold_ascii(name, "Time") ? 2 : 0);
+    }
+    if strings.equal_fold_ascii(name, "CDate") {
+        if values.len() == 0 {
+            return asp.runtime.variant_empty();
+        }
+        let millis: Int = evaluator_calls_date_millis(values.get(0));
+        return millis < -9000000000000000000 ? asp.runtime.variant_empty() : asp.runtime.variant_date(millis);
+    }
+    if strings.equal_fold_ascii(name, "DateSerial") && values.len() >= 3 {
+        return asp.runtime.variant_date(eg_vbs_make_date(variant_to_int(values.get(0)), variant_to_int(values.get(1)), variant_to_int(values.get(2)), 0, 0, 0), 1);
+    }
+    if strings.equal_fold_ascii(name, "DateAdd") && values.len() >= 3 {
+        let interval: Int = evaluator_calls_date_interval(values.get(0).to_output_string());
+        let millis: Int = evaluator_calls_date_millis(values.get(2));
+        return interval < 0 || millis < -9000000000000000000 ? asp.runtime.variant_empty() : asp.runtime.variant_date(eg_vbs_date_add(millis, interval, variant_to_int(values.get(1))));
+    }
+    if strings.equal_fold_ascii(name, "DateDiff") && values.len() >= 3 {
+        let interval: Int = evaluator_calls_date_interval(values.get(0).to_output_string());
+        let left: Int = evaluator_calls_date_millis(values.get(1));
+        let right: Int = evaluator_calls_date_millis(values.get(2));
+        if interval == 0 {
+            return asp.runtime.variant_int(eg_vbs_date_part(right, 0) - eg_vbs_date_part(left, 0));
+        }
+        if interval == 1 || interval == 2 {
+            let months: Int = (eg_vbs_date_part(right, 0) - eg_vbs_date_part(left, 0)) * 12 + eg_vbs_date_part(right, 1) - eg_vbs_date_part(left, 1);
+            return asp.runtime.variant_int(interval == 1 ? months / 3 : months);
+        }
+        let divisor: Int = interval == 6 ? 604800000 : (interval == 7 ? 3600000 : (interval == 8 ? 60000 : (interval == 9 ? 1000 : 86400000)));
+        return asp.runtime.variant_int((right - left) / divisor);
+    }
+    if strings.equal_fold_ascii(name, "DatePart") && values.len() >= 2 {
+        let part: Int = evaluator_calls_date_part_code(values.get(0).to_output_string());
+        let raw: Int = eg_vbs_date_part(evaluator_calls_date_millis(values.get(1)), part);
+        if part == 6 && values.len() >= 3 {
+            let first_day: Int = variant_to_int(values.get(2));
+            return asp.runtime.variant_int(((raw - first_day + 7) % 7) + 1);
+        }
+        return asp.runtime.variant_int(raw);
+    }
+    let date_part: Int = strings.equal_fold_ascii(name, "Year") ? 0
+        : (strings.equal_fold_ascii(name, "Month") ? 1
+        : (strings.equal_fold_ascii(name, "Day") ? 2
+        : (strings.equal_fold_ascii(name, "Hour") ? 3
+        : (strings.equal_fold_ascii(name, "Minute") ? 4
+        : (strings.equal_fold_ascii(name, "Second") ? 5
+        : (strings.equal_fold_ascii(name, "Weekday") ? 6 : -1))))));
+    if date_part >= 0 && values.len() >= 1 {
+        let raw: Int = eg_vbs_date_part(evaluator_calls_date_millis(values.get(0)), date_part);
+        if date_part == 6 && values.len() >= 2 {
+            let first_day: Int = variant_to_int(values.get(1));
+            return asp.runtime.variant_int(((raw - first_day + 7) % 7) + 1);
+        }
+        return asp.runtime.variant_int(raw);
+    }
+    if strings.equal_fold_ascii(name, "IsArray") {
+        return asp.runtime.variant_bool(values.len() > 0 && values.get(0).kind == asp.runtime.VariantArray);
+    }
+    if strings.equal_fold_ascii(name, "IsDate") {
+        return asp.runtime.variant_bool(values.len() > 0 && (values.get(0).kind == asp.runtime.VariantDate || evaluator_calls_date_millis(values.get(0)) >= -9000000000000000000));
+    }
+    if strings.equal_fold_ascii(name, "LenB") {
+        return asp.runtime.variant_int(values.len() > 0 ? std.len(values.get(0).to_output_string()) : 0);
+    }
+    if strings.equal_fold_ascii(name, "LeftB") {
+        return values.len() >= 2
+            ? evaluator_calls_left(values.get(0), variant_to_int(values.get(1)))
+            : asp.runtime.variant_string("");
+    }
+    if strings.equal_fold_ascii(name, "MidB") {
+        return evaluator_calls_mid(values);
+    }
+    if strings.equal_fold_ascii(name, "InStrB") {
+        return evaluator_calls_instr(values);
+    }
+    if strings.equal_fold_ascii(name, "FormatNumber") {
+        return evaluator_calls_format_number(values);
+    }
+    if strings.equal_fold_ascii(name, "Space") {
+        return asp.runtime.variant_string(strings.repeat(" ", values.len() > 0 && variant_to_int(values.get(0)) > 0 ? variant_to_int(values.get(0)) : 0));
+    }
+    if strings.equal_fold_ascii(name, "StrComp") && values.len() >= 2 {
+        let left: String = values.len() >= 3 && variant_to_int(values.get(2)) == 1 ? strings.to_lower_ascii(values.get(0).to_output_string()) : values.get(0).to_output_string();
+        let right: String = values.len() >= 3 && variant_to_int(values.get(2)) == 1 ? strings.to_lower_ascii(values.get(1).to_output_string()) : values.get(1).to_output_string();
+        return asp.runtime.variant_int(evaluator_calls_string_compare(left, right));
+    }
+    if strings.equal_fold_ascii(name, "TypeName") {
+        return asp.runtime.variant_string(values.len() > 0 ? evaluator_calls_type_name(values.get(0)) : "Empty");
+    }
+    if strings.equal_fold_ascii(name, "VarType") {
+        return asp.runtime.variant_int(values.len() > 0 ? evaluator_calls_var_type(values.get(0)) : 0);
+    }
+    if strings.equal_fold_ascii(name, "CBool") {
+        if values.len() != 1 {
+            evaluator.raise_runtime_error(ctx, 450, "CBool requires exactly one argument", "VBScript");
+            return asp.runtime.variant_empty();
+        }
+        let value: asp.runtime.Variant = values.get(0);
+        if value.kind == asp.runtime.VariantObject {
+            value = evaluator.invoke_object_values(program, ctx, scope, value, "", new collections.Vector<asp.runtime.Variant>(), false, asp.runtime.variant_empty(), new collections.Vector<Int>());
+            if evaluator.statement_failed {
+                return asp.runtime.variant_empty();
+            }
+        }
+        if value.kind == asp.runtime.VariantEmpty {
+            return asp.runtime.variant_bool(false);
+        }
+        if value.kind == asp.runtime.VariantBool || value.kind == asp.runtime.VariantInt || value.kind == asp.runtime.VariantFloat {
+            return asp.runtime.variant_bool(value.is_truthy());
+        }
+        if value.kind == asp.runtime.VariantDate {
+            // Date values use Unix milliseconds; Boolean zero is the OLE epoch.
+            return asp.runtime.variant_bool(value.date_value != eg_vbs_make_date(1899, 12, 30, 0, 0, 0));
+        }
+        if value.kind == asp.runtime.VariantString {
+            let converted: Int = eg_vbs_string_to_bool(value.string_value);
+            if converted >= 0 {
+                return asp.runtime.variant_bool(converted != 0);
+            }
+            evaluator.raise_runtime_error(ctx, 0 - converted, converted == -6 ? "Overflow in CBool: use a finite numeric value" : "Type mismatch in CBool: use True, False or a numeric value", "VBScript");
+            return asp.runtime.variant_empty();
+        }
+        let error_number: Int = value.kind == asp.runtime.VariantNull ? 94 : (value.kind == asp.runtime.VariantNothing ? 91 : 13);
+        evaluator.raise_runtime_error(ctx, error_number, error_number == 94 ? "Invalid use of Null in CBool: check IsNull before conversion" : (error_number == 91 ? "Object variable not set in CBool" : "Type mismatch in CBool: a scalar value is required"), "VBScript");
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(name, "RGB") && values.len() >= 3 {
+        return asp.runtime.variant_int((variant_to_int(values.get(0)) & 255) | ((variant_to_int(values.get(1)) & 255) << 8) | ((variant_to_int(values.get(2)) & 255) << 16));
+    }
+    return asp.runtime.variant_empty();
+}
+
+func evaluator_calls_hex_int(value: Int) -> String {
+    if value == 0 {
+        return "0";
+    }
+    let digits: String = "0123456789ABCDEF";
+    let n: Int = value < 0 ? -value : value;
+    let out: String = "";
+    loop n > 0 {
+        let digit: Int = n % 16;
+        out = std.substr(digits, digit, 1) + out;
+        n = n / 16;
+    }
+    return value < 0 ? "-" + out : out;
+}
+
+func evaluator_calls_vb_int(value: asp.runtime.Variant) -> Int {
+    if value.kind != asp.runtime.VariantString {
+        return variant_to_int(value);
+    }
+    let text: String = strings.trim_space(value.to_output_string());
+    if std.len(text) < 3 || std.byte_at(text, 0) != '&' || (std.byte_at(text, 1) != 'H' && std.byte_at(text, 1) != 'h') {
+        return variant_to_int(value);
+    }
+    let out: Int = 0;
+    let i: Int = 2;
+    loop i < std.len(text) {
+        let digit: Int = asp.runtime.hex_nibble(std.byte_at(text, i));
+        if digit < 0 {
+            break;
+        }
+        out = (out * 16) + digit;
+        i += 1;
+    }
+    return out;
+}
+
+func evaluator_calls_split(values: collections.Vector<asp.runtime.Variant>) -> asp.runtime.Variant {
+    let source: String = values.len() > 0 ? values.get(0).to_output_string() : "";
+    let delimiter: String = values.len() > 1 ? values.get(1).to_output_string() : " ";
+    let parts: collections.Vector<String> = strings.split(source, delimiter);
+    let items: collections.Vector<asp.runtime.Variant> = new collections.Vector<asp.runtime.Variant>();
+    let limit: Int = values.len() > 2 ? variant_to_int(values.get(2)) : -1;
+    let take: Int = limit >= 0 && limit < parts.len() ? limit : parts.len();
+    let i: Int = 0;
+    loop i < take {
+        _ = items.push(asp.runtime.variant_string(parts.get(i)));
+        i += 1;
+    }
+    return asp.runtime.variant_array(items);
+}
+
+func evaluator_calls_join(values: collections.Vector<asp.runtime.Variant>) -> asp.runtime.Variant {
+    if values.len() == 0 || values.get(0).kind != asp.runtime.VariantArray {
+        return asp.runtime.variant_string("");
+    }
+    let delimiter: String = values.len() > 1 ? values.get(1).to_output_string() : " ";
+    let items: collections.Vector<asp.runtime.Variant> = values.get(0).array_data.items;
+    let out: std.StringBuilder = new std.StringBuilder(items.len() * (std.len(delimiter) + 8));
+    let i: Int = 0;
+    loop i < items.len() {
+        if i > 0 {
+            _ = out.append(delimiter);
+        }
+        _ = out.append(items.get(i).to_output_string());
+        i += 1;
+    }
+    let joined: String = out.to_string();
+    _ = out.free();
+    return asp.runtime.variant_string(joined);
+}
+
+func evaluator_calls_array_upper_bound(value: asp.runtime.Variant, dimension: Int) -> Int {
+    if dimension < 1 {
+        return -2;
+    }
+    let current: asp.runtime.Variant = value.clone();
+    let current_dimension: Int = 1;
+    loop current_dimension < dimension {
+        if current.kind != asp.runtime.VariantArray || current.array_data.items.len() == 0 {
+            return -2;
+        }
+        current = current.array_data.items.get(0).clone();
+        current_dimension += 1;
+    }
+    if current.kind != asp.runtime.VariantArray {
+        return -2;
+    }
+    return current.array_data.items.len() - 1;
+}
+
+func evaluator_calls_replace(values: collections.Vector<asp.runtime.Variant>) -> asp.runtime.Variant {
+    if values.len() < 3 {
+        return asp.runtime.variant_empty();
+    }
+    let source: String = values.get(0).to_output_string();
+    let find: String = values.get(1).to_output_string();
+    let replacement: String = values.get(2).to_output_string();
+    if std.len(find) == 0 {
+        return asp.runtime.variant_string(source);
+    }
+    let requested_start: Int = values.len() >= 4 ? variant_to_int(values.get(3)) : 1;
+    let start: Int = requested_start < 1 ? 0 : requested_start - 1;
+    if start >= std.len(source) {
+        return asp.runtime.variant_string(source);
+    }
+    let count: Int = values.len() >= 5 ? variant_to_int(values.get(4)) : -1;
+    let text_compare: Bool = values.len() >= 6 && variant_to_int(values.get(5)) == 1;
+    if count == 0 {
+        return asp.runtime.variant_string(source);
+    }
+    let first_match: Int = text_compare
+        ? strings.find_substr_ascii_case_from(source, find, start)
+        : strings.find_substr_from(source, find, start);
+    if first_match < 0 {
+        return asp.runtime.variant_string(source);
+    }
+    let source_view: std.StringView = std.view(source);
+    let out: std.StringBuilder = new std.StringBuilder(std.len(source) + 16);
+    if start > 0 {
+        _ = out.append_view_slice(source_view, 0, start);
+    }
+    let offset: Int = start;
+    let replacements: Int = 0;
+    loop offset < std.len(source) {
+        let match_at: Int = replacements == 0
+            ? first_match
+            : (text_compare
+                ? strings.find_substr_ascii_case_from(source, find, offset)
+                : strings.find_substr_from(source, find, offset));
+        if match_at < 0 || (count >= 0 && replacements >= count) {
+            _ = out.append_view_slice(source_view, offset, std.len(source) - offset);
+            let result: String = out.to_string();
+            _ = out.free();
+            _ = __gc_keepalive(source_view);
+            _ = __gc_keepalive(source);
+            return asp.runtime.variant_string(result);
+        }
+        if match_at > offset {
+            _ = out.append_view_slice(source_view, offset, match_at - offset);
+        }
+        _ = out.append(replacement);
+        offset = match_at + std.len(find);
+        replacements += 1;
+    }
+    let result: String = out.to_string();
+    _ = out.free();
+    _ = __gc_keepalive(source_view);
+    _ = __gc_keepalive(source);
+    return asp.runtime.variant_string(result);
+}
+
+func evaluator_calls_left(value: asp.runtime.Variant, count: Int) -> asp.runtime.Variant {
+    let text: String = value.to_output_string();
+    let take: Int = count < 0 ? 0 : (count > std.len(text) ? std.len(text) : count);
+    if take == std.len(text) {
+        return asp.runtime.variant_string(text);
+    }
+    if take == 0 {
+        return asp.runtime.variant_string("");
+    }
+    return asp.runtime.variant_string(std.substr(text, 0, take));
+}
+
+func evaluator_calls_right(value: asp.runtime.Variant, count: Int) -> asp.runtime.Variant {
+    let text: String = value.to_output_string();
+    let take: Int = count < 0 ? 0 : (count > std.len(text) ? std.len(text) : count);
+    if take == std.len(text) {
+        return asp.runtime.variant_string(text);
+    }
+    if take == 0 {
+        return asp.runtime.variant_string("");
+    }
+    return asp.runtime.variant_string(std.substr(text, std.len(text) - take, take));
+}
+
+func evaluator_calls_mid(values: collections.Vector<asp.runtime.Variant>) -> asp.runtime.Variant {
+    if values.len() < 2 {
+        return asp.runtime.variant_empty();
+    }
+    let text: String = values.get(0).to_output_string();
+    let requested_start: Int = variant_to_int(values.get(1));
+    let start: Int = requested_start < 1 ? 0 : requested_start - 1;
+    if start >= std.len(text) {
+        return asp.runtime.variant_string("");
+    }
+    let available: Int = std.len(text) - start;
+    let requested_length: Int = values.len() >= 3 ? variant_to_int(values.get(2)) : available;
+    let length: Int = requested_length < 0 ? 0 : (requested_length > available ? available : requested_length);
+    if start == 0 && length == std.len(text) {
+        return asp.runtime.variant_string(text);
+    }
+    if length == 0 {
+        return asp.runtime.variant_string("");
+    }
+    return asp.runtime.variant_string(std.substr(text, start, length));
+}
+
+func evaluator_calls_instr(values: collections.Vector<asp.runtime.Variant>) -> asp.runtime.Variant {
+    if values.len() < 2 {
+        return asp.runtime.variant_int(0);
+    }
+    let has_start: Bool = values.len() >= 3;
+    let source_index: Int = has_start ? 1 : 0;
+    let needle_index: Int = has_start ? 2 : 1;
+    let start: Int = has_start ? variant_to_int(values.get(0)) : 1;
+    let compare: Int = values.len() >= 4 ? variant_to_int(values.get(3)) : 0;
+    if start < 1 {
+        return asp.runtime.variant_int(0);
+    }
+    let source: String = values.get(source_index).to_output_string();
+    let needle: String = values.get(needle_index).to_output_string();
+    let found: Int = compare == 1
+        ? strings.find_substr_ascii_case_from(source, needle, start - 1)
+        : strings.index_from(source, needle, start - 1);
+    return asp.runtime.variant_int(found < 0 ? 0 : found + 1);
+}
+
+func evaluator_calls_instr_rev(values: collections.Vector<asp.runtime.Variant>) -> asp.runtime.Variant {
+    if values.len() < 2 {
+        return asp.runtime.variant_int(0);
+    }
+    let source: String = values.get(0).to_output_string();
+    let needle: String = values.get(1).to_output_string();
+    let requested_start: Int = values.len() >= 3 ? variant_to_int(values.get(2)) : std.len(source);
+    let compare: Int = values.len() >= 4 ? variant_to_int(values.get(3)) : 0;
+    let start: Int = requested_start == -1 ? std.len(source) : requested_start;
+    if start < 1 {
+        return asp.runtime.variant_int(0);
+    }
+    if std.len(needle) == 0 {
+        return asp.runtime.variant_int(start);
+    }
+    let subject: String = compare == 1 ? strings.to_lower_ascii(source) : source;
+    let target: String = compare == 1 ? strings.to_lower_ascii(needle) : needle;
+    let limit: Int = start > std.len(source) ? std.len(source) : start;
+    let found: Int = -1;
+    let offset: Int = 0;
+    loop offset < limit {
+        let next: Int = strings.index_from(subject, target, offset);
+        if next < 0 || next + std.len(target) > limit {
+            break;
+        }
+        found = next;
+        offset = next + 1;
+    }
+    return asp.runtime.variant_int(found < 0 ? 0 : found + 1);
+}
+
+func evaluator_calls_form_charset(ctx: asp.runtime.RequestContext) -> String {
+    let content_type: String = ctx.request.headers.get_or("content-type", "");
+    let lower_content_type: String = strings.to_lower_ascii(content_type);
+    let marker: String = "charset=";
+    let charset_pos: Int = strings.find_substr(lower_content_type, marker);
+    if charset_pos >= 0 {
+        let charset: String = strings.trim_space(std.substr(content_type, charset_pos + std.len(marker), std.len(content_type) - charset_pos - std.len(marker)));
+        let separator: Int = strings.find_substr(charset, ";");
+        return separator >= 0 ? strings.trim_space(std.substr(charset, 0, separator)) : charset;
+    }
+    return ctx.response.charset;
+}
+
+func evaluator_calls_form_value(ctx: asp.runtime.RequestContext, key: String) -> String {
+    let raw: String = ctx.request.form.get_or(strings.to_lower_ascii(key), "");
+    let charset: String = evaluator_calls_form_charset(ctx);
+    if std.len(raw) == 0 || asp.runtime.charset_is_utf8(charset) {
+        return raw;
+    }
+    let converted: String = asp.runtime.transcode_text(raw, charset, "UTF-8");
+    return std.len(converted) != 0 ? converted : raw;
+}
+
+func evaluator_calls_request_value(ctx: asp.runtime.RequestContext, key: String) -> String {
+    let lower_key: String = strings.to_lower_ascii(key);
+    if ctx.request.query.has(lower_key) {
+        return ctx.request.query.get(lower_key);
+    }
+    if ctx.request.form.has(lower_key) {
+        return evaluator_calls_form_value(ctx, lower_key);
+    }
+    if ctx.request.cookies.has(lower_key) {
+        return ctx.request.cookies.get(lower_key);
+    }
+    return ctx.request.server_variables.get_or(lower_key, "");
+}
+
+func evaluator_calls_query_value(ctx: asp.runtime.RequestContext, key: String) -> asp.runtime.Variant {
+    let lower_key: String = strings.to_lower_ascii(key);
+    return ctx.request.query.has(lower_key)
+        ? asp.runtime.variant_string(ctx.request.query.get(lower_key))
+        : asp.runtime.variant_empty();
+}
+
+func evaluator_calls_server_variable(ctx: asp.runtime.RequestContext, key: String) -> asp.runtime.Variant {
+    let lower_key: String = strings.to_lower_ascii(key);
+    return ctx.request.server_variables.has(lower_key)
+        ? asp.runtime.variant_string(ctx.request.server_variables.get(lower_key))
+        : asp.runtime.variant_empty();
+}
+
+func evaluator_calls_variants_equal(left: asp.runtime.Variant, right: asp.runtime.Variant) -> Bool {
+    if left.kind != right.kind {
+        return false;
+    }
+    if left.kind == asp.runtime.VariantBool {
+        return left.bool_value == right.bool_value;
+    }
+    if left.kind == asp.runtime.VariantInt {
+        return left.int_value == right.int_value;
+    }
+    if left.kind == asp.runtime.VariantFloat {
+        return left.float_value == right.float_value;
+    }
+    if left.kind == asp.runtime.VariantDate {
+        return left.date_value == right.date_value;
+    }
+    if left.kind == asp.runtime.VariantString {
+        return left.string_value == right.string_value;
+    }
+    if left.kind == asp.runtime.VariantObject {
+        return left.object_value == right.object_value;
+    }
+    if left.kind == asp.runtime.VariantArray {
+        if left.array_data.items.len() != right.array_data.items.len() {
+            return false;
+        }
+        let i: Int = 0;
+        loop i < left.array_data.items.len() {
+            if !evaluator_calls_variants_equal(left.array_data.items.get(i), right.array_data.items.get(i)) {
+                return false;
+            }
+            i += 1;
+        }
+    }
+    return true;
+}
+
+// ByRef copyback must update the active native frame when one exists. Writing
+// only the mirrored Scope would leave subsequent scalar-slot reads stale.
+func evaluator_calls_copyback_to_active_frame(evaluator: Evaluator, program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, caller_scope: asp.vm.Scope, expr_id: Int, value: asp.runtime.Variant, is_set: Bool) -> Void {
+    let caller_routine_id: Int = -1;
+    if std.len(caller_scope.function_name) > 0 {
+        caller_routine_id = evaluator.find_routine_by_function_kind(
+            program, caller_scope.function_name, caller_scope.me_class_name, true
+        );
+        if caller_routine_id < 0 {
+            caller_routine_id = evaluator.find_routine(program, caller_scope.function_name, caller_scope.me_class_name);
+        }
+    }
+    if caller_routine_id >= 0 && evaluator.has_active_bytecode {
+        if evaluator.dynamic_vm_active && evaluator.dynamic_active_index >= 0 {
+            let bytecode: asp.vm.VbsBytecodeProgram = evaluator.dynamic_bytecode_at(evaluator.dynamic_active_index);
+            evaluator.dynamic_runner.assign_frame_copyback(bytecode, ctx, caller_scope, caller_routine_id, expr_id, value);
+        } else {
+            evaluator.shared_runner.assign_frame_copyback(evaluator.active_bytecode, ctx, caller_scope, caller_routine_id, expr_id, value);
+        }
+        return;
+    }
+    evaluator.assign_target_expr(program, ctx, caller_scope, expr_id, value, is_set);
+}
+
+// Enter a user routine from the AST path. Frame metadata selects the scalar VM
+// only when recursion and slot ownership are safe. ByRef arguments are copied
+// back only if writable and changed, avoiding allocations on the common path.
+func evaluator_calls_call_user_routine(evaluator: Evaluator, program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, caller_scope: asp.vm.Scope, routine_id: Int, arg_ids: collections.Vector<Int>, me_object_id: Int = 0, force_interpreted: Bool = false) -> asp.runtime.Variant {
+    if routine_id < 0 || routine_id >= program.runtime_routine_count() {
+        evaluator.raise_runtime_error(ctx, 438, "routine not found", "VBScript");
+        return asp.runtime.variant_empty();
+    }
+    let frame_flags: Int = evaluator.has_active_bytecode
+        ? asp.vm.vbs_routine_frame_flags(evaluator.active_bytecode, routine_id)
+        : 0;
+    let recursive_safe: Bool = (frame_flags & (asp.vm.VbsRoutineFrameRecursiveSafe => Int)) != 0;
+    let interpret_only: Bool = force_interpreted
+        || ((frame_flags & (asp.vm.VbsRoutineFrameHasMetadata => Int)) != 0 && !recursive_safe);
+    if !interpret_only
+    && !evaluator.dynamic_vm_active
+    && evaluator.has_active_bytecode
+    && routine_id < evaluator.active_bytecode.routine_slot_counts.len()
+    && evaluator.active_bytecode.routine_slot_counts.get(routine_id) > 0 {
+        let values: collections.Vector<asp.runtime.Variant> = evaluator.eval_arg_values(program, ctx, caller_scope, arg_ids);
+        let result: asp.runtime.Variant = evaluator_calls_call_fast_scalar_values(
+            evaluator, program, program, ctx, caller_scope, routine_id,
+            values, arg_ids, me_object_id
+        );
+        return evaluator.release_arg_result(values, result);
+    }
+    let routine_name: String = program.runtime_routine_name(routine_id);
+    let routine_is_function: Bool = program.runtime_routine_is_function(routine_id);
+    let routine_block_id: Int = routine_id < evaluator.active_bytecode.routine_block_ids.len()
+    ? evaluator.active_bytecode.routine_block_ids.get_unchecked(routine_id)
+    : program.runtime_routine_block(routine_id);
+    let param_names: collections.Vector<String> = new collections.Vector<String>();
+    let param_by_refs: collections.Vector<Int> = new collections.Vector<Int>();
+    let param_index: Int = 0;
+    loop param_index < program.runtime_routine_param_count(routine_id) {
+        _ = param_names.push(program.runtime_routine_param_name(routine_id, param_index));
+        _ = param_by_refs.push(program.runtime_routine_param_by_ref(routine_id, param_index));
+        param_index += 1;
+    }
+    let writes_mask: Int = routine_id < evaluator.active_bytecode.routine_writes_masks.len()
+    ? evaluator.active_bytecode.routine_writes_masks.get_unchecked(routine_id)
+    : program.runtime_routine_writes_mask(routine_id);
+    let routine_scope: asp.vm.Scope = new asp.vm.Scope();
+    let routine_vars: asp.runtime.KeyValueStore = routine_scope.vars;
+    let copyback_mask: Int = 0;
+    let copyback_initial_values: collections.Vector<asp.runtime.Variant> = new collections.Vector<asp.runtime.Variant>();
+    let routine_owner_class: String = program.runtime_routine_owner(routine_id);
+    routine_scope.set_parent(evaluator.root_scope(ctx));
+    routine_scope.function_name = routine_is_function ? routine_name : "";
+    routine_scope.me_object_id = me_object_id;
+    routine_scope.me_class_name = routine_owner_class;
+    if routine_is_function {
+        _ = routine_vars.set(routine_name, asp.runtime.variant_empty());
+    }
+    let i: Int = 0;
+    loop i < param_names.len() {
+        let param_name: String = param_names.get(i);
+        let by_ref: Bool = i < param_by_refs.len() && param_by_refs.get(i) != 0;
+        let value: asp.runtime.Variant = i < arg_ids.len() ? evaluator.eval_expr_in_scope(program, ctx, caller_scope, arg_ids.get(i)) : asp.runtime.variant_empty();
+        _ = routine_vars.set(param_name, value);
+        if by_ref && i < 31 && (writes_mask & (1 << i)) != 0 && i < arg_ids.len() && evaluator.expr_supports_copyback(program, ctx, caller_scope, arg_ids.get(i)) {
+            copyback_mask = copyback_mask | (1 << i);
+            _ = copyback_initial_values.push(value);
+        }
+        i += 1;
+    }
+    let result: Int = 0;
+    if evaluator.dynamic_vm_active && evaluator.dynamic_active_index >= 0 && !interpret_only {
+        result = evaluator.dynamic_runner.execute_block(evaluator.dynamic_bytecode_at(evaluator.dynamic_active_index), ctx, routine_scope, routine_block_id);
+    } else if evaluator.has_active_bytecode && !interpret_only {
+        result = evaluator.shared_runner.execute_block(evaluator.active_bytecode, ctx, routine_scope, routine_block_id);
+    } else {
+        result = evaluator.execute_block_in_scope(program, ctx, routine_scope, routine_block_id);
+    }
+    let routine_value: asp.runtime.Variant = asp.runtime.variant_empty();
+    if routine_is_function {
+        let fn_value: asp.runtime.Variant = routine_vars.get_or_empty(routine_name);
+        routine_value = fn_value;
+    }
+    i = 0;
+    let copyback_index: Int = 0;
+    loop i < param_names.len() && i < 31 {
+        if (copyback_mask & (1 << i)) == 0 {
+            i += 1;
+            skip;
+        }
+        let copyback_name: String = param_names.get(i);
+        let copyback_expr_id: Int = arg_ids.get(i);
+        let copyback_value: asp.runtime.Variant = routine_vars.get_or_empty(copyback_name);
+        if evaluator_calls_variants_equal(copyback_initial_values.get(copyback_index), copyback_value) {
+            copyback_index += 1;
+            i += 1;
+            skip;
+        }
+        evaluator_calls_copyback_to_active_frame(evaluator, program, ctx, caller_scope, copyback_expr_id, copyback_value, true);
+        copyback_index += 1;
+        i += 1;
+    }
+    if result == 2 || result == 3 {
+        return routine_value;
+    }
+    if result == 1 {
+        return asp.runtime.variant_empty();
+    }
+    return routine_value;
+}
+
+// Execute a routine in a compact native scalar frame. `program` describes the
+// callee, while `argument_program` describes assignment targets in the caller;
+// conflating them breaks ByRef calls made across dynamic programs.
+func evaluator_calls_call_fast_scalar_values(evaluator: Evaluator, program: asp.compiler.VbsProgram, argument_program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, caller_scope: asp.vm.Scope, routine_id: Int, values: collections.Vector<asp.runtime.Variant>, arg_expr_ids: collections.Vector<Int>, me_object_id: Int = 0, dynamic_bytecode: asp.vm.VbsBytecodeProgram = (new asp.vm.VbsBytecodeProgram())) -> asp.runtime.Variant {
+    if routine_id < 0 || routine_id >= program.runtime_routine_count() {
+        return asp.runtime.variant_empty();
+    }
+    let use_dynamic: Bool = evaluator.dynamic_vm_active && evaluator.dynamic_active_index >= 0;
+    let routine_block_id: Int = use_dynamic && routine_id < dynamic_bytecode.routine_block_ids.len()
+    ? dynamic_bytecode.routine_block_ids.get_unchecked(routine_id)
+    : routine_id < evaluator.active_bytecode.routine_block_ids.len()
+    ? evaluator.active_bytecode.routine_block_ids.get_unchecked(routine_id)
+    : program.runtime_routine_block(routine_id);
+    let slot_count: Int = use_dynamic && routine_id < dynamic_bytecode.routine_slot_counts.len()
+    ? dynamic_bytecode.routine_slot_counts.get(routine_id)
+    : routine_id < evaluator.active_bytecode.routine_slot_counts.len()
+    ? evaluator.active_bytecode.routine_slot_counts.get(routine_id)
+    : 0;
+    if slot_count <= 0 || (!use_dynamic && !evaluator.has_active_bytecode) {
+        return asp.runtime.variant_empty();
+    }
+    let writes_mask: Int = use_dynamic && routine_id < dynamic_bytecode.routine_writes_masks.len()
+    ? dynamic_bytecode.routine_writes_masks.get_unchecked(routine_id)
+    : routine_id < evaluator.active_bytecode.routine_writes_masks.len()
+    ? evaluator.active_bytecode.routine_writes_masks.get_unchecked(routine_id)
+    : program.runtime_routine_writes_mask(routine_id);
+    let param_count: Int = use_dynamic && routine_id < dynamic_bytecode.routine_param_counts.len()
+    ? dynamic_bytecode.routine_param_counts.get_unchecked(routine_id)
+    : routine_id < evaluator.active_bytecode.routine_param_counts.len()
+    ? evaluator.active_bytecode.routine_param_counts.get_unchecked(routine_id)
+    : program.runtime_routine_param_count(routine_id);
+    let root_scope: asp.vm.Scope = caller_scope;
+    loop root_scope.has_parent && root_scope.parent != root_scope {
+        root_scope = root_scope.parent;
+    }
+    let routine_scope: asp.vm.Scope = new asp.vm.Scope();
+    routine_scope.set_parent(root_scope);
+    routine_scope.function_name = program.runtime_routine_is_function(routine_id)
+        ? program.runtime_routine_name(routine_id)
+        : "";
+    routine_scope.me_object_id = me_object_id;
+    routine_scope.me_class_name = program.runtime_routine_owner(routine_id);
+    let active_bytecode: asp.vm.VbsBytecodeProgram = use_dynamic ? dynamic_bytecode : evaluator.active_bytecode;
+    if (asp.vm.vbs_routine_frame_flags(active_bytecode, routine_id)
+        & (asp.vm.VbsRoutineFrameExecute => Int)) != 0 {
+        writes_mask = 2147483647;
+    }
+    if routine_id < active_bytecode.routine_slot_names.len() {
+        let slot_names: collections.Vector<String> = asp.vm.vbs_routine_slot_names(active_bytecode, routine_id);
+        let slot_index: Int = 0;
+        loop slot_index < slot_names.len() {
+            let slot_value: asp.runtime.Variant = slot_index > 0 && slot_index - 1 < values.len()
+                ? values.get(slot_index - 1)
+                : asp.runtime.variant_empty();
+            _ = routine_scope.vars.set(slot_names.get(slot_index), slot_value);
+            slot_index += 1;
+        }
+    }
+    // The overwhelmingly common scalar routine has no writable ByRef
+    // parameters. Avoid allocating and scanning copyback state in that case.
+    if writes_mask == 0 || param_count == 0 {
+        let fast_result: asp.runtime.Variant = use_dynamic
+            ? evaluator.dynamic_runner.execute_fast_scalar_block(dynamic_bytecode, ctx, routine_scope, routine_id, routine_block_id, slot_count, values)
+            : evaluator.shared_runner.execute_fast_scalar_block(evaluator.active_bytecode, ctx, routine_scope, routine_id, routine_block_id, slot_count, values);
+        return fast_result;
+    }
+    let result: asp.runtime.Variant = use_dynamic
+        ? evaluator.dynamic_runner.execute_fast_scalar_block(dynamic_bytecode, ctx, routine_scope, routine_id, routine_block_id, slot_count, values)
+        : evaluator.shared_runner.execute_fast_scalar_block(evaluator.active_bytecode, ctx, routine_scope, routine_id, routine_block_id, slot_count, values);
+    // The scalar frame writes final parameter values back into `values`.
+    // Copy back only writable ByRef arguments whose original expression is a
+    // legal assignment target; ByVal parameters and literals stay isolated.
+    let i: Int = 0;
+    loop i < param_count && i < 31 && i < values.len() && i < arg_expr_ids.len() {
+        if (writes_mask & (1 << i)) != 0
+        && program.runtime_routine_param_by_ref(routine_id, i) != 0
+        && evaluator.expr_supports_copyback(argument_program, ctx, caller_scope, arg_expr_ids.get(i)) {
+            evaluator_calls_copyback_to_active_frame(evaluator, argument_program, ctx, caller_scope, arg_expr_ids.get(i), values.get(i), true);
+        }
+        i += 1;
+    }
+    return result;
+}
+
+func evaluator_calls_block_slot_count(bytecode: asp.vm.VbsBytecodeProgram, block_id: Int) -> Int {
+    if block_id < 0 || block_id >= bytecode.block_pcs.len() || block_id >= bytecode.block_end_pcs.len() {
+        return 0;
+    }
+    let pc: Int = bytecode.block_pcs.get(block_id);
+    let end_pc: Int = bytecode.instruction_count();
+    let routine_index: Int = 0;
+    loop routine_index < bytecode.routine_block_ids.len() {
+        let next_block_id: Int = bytecode.routine_block_ids.get(routine_index);
+        if next_block_id >= 0 && next_block_id < bytecode.block_pcs.len() {
+            let next_pc: Int = bytecode.block_pcs.get(next_block_id);
+            if next_pc > pc && next_pc < end_pc {
+                end_pc = next_pc;
+            }
+        }
+        routine_index += 1;
+    }
+    let slot_count: Int = 0;
+    loop pc >= 0 && pc < end_pc && pc < bytecode.instruction_count() {
+        let op: Int = bytecode.instruction_word(pc * 3);
+        let arg0: Int = bytecode.instruction_word(pc * 3 + 1);
+        let arg1: Int = bytecode.instruction_word(pc * 3 + 2);
+        if op == (asp.vm.VbsBytecodePushScalarSlot => Int)
+        || op == (asp.vm.VbsBytecodeAssignScalarSlot => Int)
+        || op == (asp.vm.VbsBytecodeInitScalarArray => Int)
+        || op == (asp.vm.VbsBytecodeReDimScalarArray => Int) {
+            if arg0 + 1 > slot_count {
+                slot_count = arg0 + 1;
+            }
+        } else if (op == (asp.vm.VbsBytecodeForLoop => Int) || op == (asp.vm.VbsBytecodeForEachLoop => Int))
+        && arg1 >= 0
+        && arg1 + 1 > slot_count {
+            slot_count = arg1 + 1;
+        }
+        pc += 1;
+    }
+    if slot_count == 0 {
+        pc = 0;
+        loop pc < bytecode.instruction_count() {
+            let op: Int = bytecode.instruction_word(pc * 3);
+            let arg0: Int = bytecode.instruction_word(pc * 3 + 1);
+            let arg1: Int = bytecode.instruction_word(pc * 3 + 2);
+            if (op == (asp.vm.VbsBytecodePushScalarSlot => Int)
+                || op == (asp.vm.VbsBytecodeAssignScalarSlot => Int)
+                || op == (asp.vm.VbsBytecodeInitScalarArray => Int)
+                || op == (asp.vm.VbsBytecodeReDimScalarArray => Int))
+            && arg0 + 1 > slot_count {
+                slot_count = arg0 + 1;
+            } else if (op == (asp.vm.VbsBytecodeForLoop => Int) || op == (asp.vm.VbsBytecodeForEachLoop => Int))
+            && arg1 >= 0
+            && arg1 + 1 > slot_count {
+                slot_count = arg1 + 1;
+            }
+            pc += 1;
+        }
+    }
+    return slot_count;
+}
+
+// Pre-evaluated counterpart to call_user_routine. `values` may be rewritten by
+// the scalar VM for ByRef parameters, so callers must keep it alive until all
+// copyback operations have completed.
+func evaluator_calls_call_user_routine_values(evaluator: Evaluator, program: asp.compiler.VbsProgram, argument_program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, caller_scope: asp.vm.Scope, routine_id: Int, values: collections.Vector<asp.runtime.Variant>, arg_expr_ids: collections.Vector<Int>, me_object_id: Int = 0, force_interpreted: Bool = false, dynamic_bytecode: asp.vm.VbsBytecodeProgram = (new asp.vm.VbsBytecodeProgram())) -> asp.runtime.Variant {
+    if routine_id < 0 || routine_id >= program.runtime_routine_count() {
+        evaluator.raise_runtime_error(ctx, 438, "routine not found", "VBScript");
+        return asp.runtime.variant_empty();
+    }
+    let frame_bytecode: asp.vm.VbsBytecodeProgram = evaluator.dynamic_vm_active && evaluator.dynamic_active_index >= 0
+        ? dynamic_bytecode
+        : evaluator.active_bytecode;
+    let frame_flags: Int = asp.vm.vbs_routine_frame_flags(frame_bytecode, routine_id);
+    let recursive_safe: Bool = (frame_flags & (asp.vm.VbsRoutineFrameRecursiveSafe => Int)) != 0;
+    let interpret_only: Bool = force_interpreted
+        || ((frame_flags & (asp.vm.VbsRoutineFrameHasMetadata => Int)) != 0 && !recursive_safe);
+    if !interpret_only {
+        if evaluator.dynamic_vm_active && evaluator.dynamic_active_index >= 0 {
+            if routine_id < dynamic_bytecode.routine_slot_counts.len() && dynamic_bytecode.routine_slot_counts.get(routine_id) > 0 {
+                return evaluator_calls_call_fast_scalar_values(evaluator, program, argument_program, ctx, caller_scope, routine_id, values, arg_expr_ids, me_object_id, dynamic_bytecode);
+            }
+        } else if evaluator.has_active_bytecode && routine_id < evaluator.active_bytecode.routine_slot_counts.len() && evaluator.active_bytecode.routine_slot_counts.get(routine_id) > 0 {
+            return evaluator_calls_call_fast_scalar_values(evaluator, program, argument_program, ctx, caller_scope, routine_id, values, arg_expr_ids, me_object_id);
+        }
+    }
+    let routine_name: String = program.runtime_routine_name(routine_id);
+    let routine_is_function: Bool = program.runtime_routine_is_function(routine_id);
+    let routine_block_id: Int = program.runtime_routine_block(routine_id);
+    let param_names: collections.Vector<String> = new collections.Vector<String>();
+    let param_by_refs: collections.Vector<Int> = new collections.Vector<Int>();
+    let param_index: Int = 0;
+    loop param_index < program.runtime_routine_param_count(routine_id) {
+        _ = param_names.push(program.runtime_routine_param_name(routine_id, param_index));
+        _ = param_by_refs.push(program.runtime_routine_param_by_ref(routine_id, param_index));
+        param_index += 1;
+    }
+    let writes_mask: Int = program.runtime_routine_writes_mask(routine_id);
+    let routine_scope: asp.vm.Scope = new asp.vm.Scope();
+    let routine_vars: asp.runtime.KeyValueStore = routine_scope.vars;
+    let copyback_mask: Int = 0;
+    let copyback_initial_values: collections.Vector<asp.runtime.Variant> = new collections.Vector<asp.runtime.Variant>();
+    let routine_owner_class: String = program.runtime_routine_owner(routine_id);
+    routine_scope.set_parent(evaluator.root_scope(ctx));
+    routine_scope.function_name = routine_is_function ? routine_name : "";
+    routine_scope.me_object_id = me_object_id;
+    routine_scope.me_class_name = routine_owner_class;
+    if routine_is_function {
+        _ = routine_vars.set(routine_name, asp.runtime.variant_empty());
+    }
+    let i: Int = 0;
+    loop i < param_names.len() {
+        let param_name: String = param_names.get(i);
+        let by_ref: Bool = i < param_by_refs.len() && param_by_refs.get(i) != 0;
+        let value: asp.runtime.Variant = i < values.len() ? values.get(i) : asp.runtime.variant_empty();
+        _ = routine_vars.set(param_name, value);
+        if by_ref && i < 31 && (writes_mask & (1 << i)) != 0 && i < arg_expr_ids.len() {
+            let can_copyback: Bool = evaluator.expr_supports_copyback(argument_program, ctx, caller_scope, arg_expr_ids.get(i));
+            if can_copyback {
+                copyback_mask = copyback_mask | (1 << i);
+                _ = copyback_initial_values.push(value);
+            }
+        }
+        i += 1;
+    }
+    let result: Int = 0;
+    if evaluator.dynamic_vm_active && evaluator.dynamic_active_index >= 0 && !interpret_only {
+        result = evaluator.dynamic_runner.execute_block(dynamic_bytecode, ctx, routine_scope, routine_block_id);
+    } else if evaluator.has_active_bytecode && !interpret_only {
+        result = evaluator.shared_runner.execute_block(evaluator.active_bytecode, ctx, routine_scope, routine_block_id);
+    } else {
+        result = evaluator.execute_block_in_scope(program, ctx, routine_scope, routine_block_id);
+    }
+    let routine_value: asp.runtime.Variant = asp.runtime.variant_empty();
+    if routine_is_function {
+        routine_value = routine_vars.get_or_empty(routine_name);
+    }
+    i = 0;
+    let copyback_index: Int = 0;
+    loop i < param_names.len() && i < 31 {
+        if (copyback_mask & (1 << i)) == 0 {
+            i += 1;
+            skip;
+        }
+        let copyback_name: String = param_names.get(i);
+        let copyback_expr_id: Int = arg_expr_ids.get(i);
+        let copyback_value: asp.runtime.Variant = routine_vars.get_or_empty(copyback_name);
+        if evaluator_calls_variants_equal(copyback_initial_values.get(copyback_index), copyback_value) {
+            copyback_index += 1;
+            i += 1;
+            skip;
+        }
+        evaluator_calls_copyback_to_active_frame(evaluator, argument_program, ctx, caller_scope, copyback_expr_id, copyback_value, true);
+        copyback_index += 1;
+        i += 1;
+    }
+    if result == 2 || result == 3 {
+        return routine_value;
+    }
+    if result == 1 {
+        return asp.runtime.variant_empty();
+    }
+    return routine_value;
+}
+
+func evaluator_calls_find_object_routine(evaluator: Evaluator, program: asp.compiler.VbsProgram, member: String, default_member: String, class_name: String, is_set: Bool = false) -> Int {
+    let routine_id: Int = evaluator.find_routine(program, member, class_name);
+    if routine_id >= 0 || std.len(member) != 0 {
+        if routine_id >= 0 && routine_id < program.runtime_routine_count() && program.runtime_routine_is_function(routine_id) != is_set {
+            return routine_id;
+        }
+        let directional_id: Int = evaluator.find_routine_by_function_kind(program, member, class_name, !is_set);
+        if directional_id >= 0 {
+            return directional_id;
+        }
+        return is_set ? -1 : routine_id;
+    }
+    let default_id: Int = evaluator.find_routine_by_function_kind(program, default_member, class_name, !is_set);
+    return default_id >= 0 ? default_id : evaluator.find_routine(program, default_member, class_name);
+}
+
+// Resolve dotted/default members and dispatch by runtime object kind. The
+// arg-id form preserves lazy evaluation and exact l-values for ByRef copyback.
+func evaluator_calls_invoke_object(evaluator: Evaluator, program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, scope: asp.vm.Scope, obj_value: asp.runtime.Variant, member: String, arg_ids: collections.Vector<Int>, is_set: Bool = false, set_value: asp.runtime.Variant = (asp.runtime.variant_empty())) -> asp.runtime.Variant {
+    if obj_value.kind != asp.runtime.VariantObject {
+        evaluator.raise_runtime_error(ctx, 91, "object required", "VBScript");
+        return asp.runtime.variant_empty();
+    }
+    let member_dot: Int = member_name_dot(member);
+    if member_dot >= 0 {
+        let intermediate: asp.runtime.Variant = evaluator.invoke_object(program, ctx, scope, obj_value, member_name_left(member, member_dot), new collections.Vector<Int>());
+        if intermediate.kind != asp.runtime.VariantObject {
+            evaluator.raise_runtime_error(ctx, 438, "value does not support member access", "VBScript");
+            return asp.runtime.variant_empty();
+        }
+        return evaluator.invoke_object(program, ctx, scope, intermediate, member_name_right(member, member_dot), arg_ids, is_set, set_value);
+    }
+    let values: collections.Vector<asp.runtime.Variant> = evaluator.eval_arg_values(program, ctx, scope, arg_ids);
+    if is_set {
+        _ = values.push(set_value);
+    }
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_value.object_value);
+    if obj.kind == asp.vm.RuntimeObjectDictionary {
+        let result: asp.runtime.Variant = evaluator.invoke_dictionary(ctx, obj_value.object_value, member, values, is_set);
+        return evaluator.release_arg_result(values, result);
+    }
+    if obj.kind == asp.vm.RuntimeObjectAdoConnection {
+        let result: asp.runtime.Variant = evaluator.invoke_ado_connection(ctx, obj_value.object_value, member, values, is_set);
+        if !is_set && strings.equal_fold_ascii(member, "Execute") && arg_ids.len() >= 2 && result.kind == asp.runtime.VariantObject {
+            let recordset: asp.vm.RuntimeObject = evaluator.get_object(ctx, result.object_value);
+            if recordset.kind == asp.vm.RuntimeObjectAdoRecordset && evaluator.expr_supports_copyback(program, ctx, scope, arg_ids.get(1)) {
+                evaluator.assign_target_expr(program, ctx, scope, arg_ids.get(1), asp.runtime.variant_int(recordset.int_value), false);
+            }
+        }
+        return evaluator.release_arg_result(values, result);
+    }
+    if obj.kind == asp.vm.RuntimeObjectAdoRecordset {
+        let result: asp.runtime.Variant = evaluator.invoke_ado_recordset(ctx, obj_value.object_value, member, values, is_set);
+        return evaluator.release_arg_result(values, result);
+    }
+    if asp.object.kind_of(obj) != asp.object.ComponentUnknown {
+        let result: asp.runtime.Variant = evaluator.invoke_component(ctx, obj_value.object_value, member, values, is_set);
+        return evaluator.release_arg_result(values, result);
+    }
+    if obj.kind == asp.vm.RuntimeObjectUserClass {
+        if strings.equal_fold_ascii(obj.class_name, "__asp_err") {
+            if strings.equal_fold_ascii(member, "Clear") {
+                ctx.error_state.clear();
+                _ = obj.store.set("Number", asp.runtime.variant_int(0));
+                _ = obj.store.set("Description", asp.runtime.variant_string(""));
+                _ = obj.store.set("Source", asp.runtime.variant_string(""));
+                evaluator.set_object(ctx, obj_value.object_value, obj);
+                return evaluator.release_arg_result(values, asp.runtime.variant_empty());
+            }
+            if strings.equal_fold_ascii(member, "Raise") && values.len() >= 1 {
+                let source: String = values.len() >= 2 ? values.get(1).to_output_string() : "VBScript";
+                let description: String = values.len() >= 3 ? values.get(2).to_output_string() : "runtime error " + strconv.itoa(variant_to_int(values.get(0)));
+                evaluator.raise_runtime_error(ctx, variant_to_int(values.get(0)), description, source);
+                return evaluator.release_arg_result(values, asp.runtime.variant_empty());
+            }
+            if obj.store.has(member) {
+                return evaluator.release_arg_result(values, obj.store.get_or_empty(member));
+            }
+        }
+        let field_name: String = std.len(member) == 0 ? obj.default_member : member;
+        if std.len(field_name) != 0 && obj.store.has(field_name) {
+            if is_set && values.len() >= 1 {
+                _ = obj.store.set(field_name, values.get(values.len() - 1));
+                evaluator.set_object(ctx, obj_value.object_value, obj);
+                return evaluator.release_arg_result(values, asp.runtime.variant_empty());
+            }
+            let field_value: asp.runtime.Variant = obj.store.get_or_empty(field_name);
+            if arg_ids.len() > 0 && field_value.kind == asp.runtime.VariantArray {
+                let result: asp.runtime.Variant = evaluator.invoke_array(program, ctx, scope, field_value, arg_ids, false, asp.runtime.variant_empty());
+                return evaluator.release_arg_result(values, result);
+            }
+            return evaluator.release_arg_result(values, field_value);
+        }
+        let routine_id: Int = evaluator_calls_find_object_routine(evaluator, program, member, obj.default_member, obj.class_name, is_set);
+        if routine_id >= 0 {
+            if is_set {
+                let result: asp.runtime.Variant = evaluator.call_user_routine_values(program, program, ctx, scope, routine_id, values, arg_ids, obj_value.object_value, false);
+                _ = __gc_keepalive(values);
+                _ = __gc_keepalive(obj_value);
+                return evaluator.release_arg_result(values, result);
+            }
+            let result: asp.runtime.Variant = evaluator.call_user_routine(program, ctx, scope, routine_id, arg_ids, obj_value.object_value, false);
+            return evaluator.release_arg_result(values, result);
+        }
+        if evaluator.has_active_bytecode {
+            let active_routine_id: Int = evaluator_calls_find_object_routine(evaluator, evaluator.active_bytecode.program, member, obj.default_member, obj.class_name, is_set);
+            if active_routine_id >= 0 {
+                let result: asp.runtime.Variant = evaluator.call_user_routine_values(evaluator.active_bytecode.program, program, ctx, scope, active_routine_id, values, arg_ids, obj_value.object_value, false);
+                _ = __gc_keepalive(values);
+                _ = __gc_keepalive(obj_value);
+                return evaluator.release_arg_result(values, result);
+            }
+        }
+        let dynamic_index: Int = evaluator.dynamic_definition_indices.len() - 1;
+        loop dynamic_index >= 0 {
+            let candidate_index: Int = evaluator.dynamic_definition_indices.get(dynamic_index);
+            let candidate_bytecode: asp.vm.VbsBytecodeProgram = evaluator.dynamic_bytecode_at(candidate_index);
+            let candidate: asp.compiler.VbsProgram = candidate_bytecode.program;
+            let candidate_id: Int = evaluator_calls_find_object_routine(evaluator, candidate, member, obj.default_member, obj.class_name, is_set);
+            if candidate_id >= 0 {
+                let result: asp.runtime.Variant = evaluator.call_dynamic_routine_values(candidate_bytecode, candidate_index, program, ctx, scope, candidate_id, values, arg_ids, obj_value.object_value);
+                _ = __gc_keepalive(values);
+                _ = __gc_keepalive(obj_value);
+                return evaluator.release_arg_result(values, result);
+            }
+            dynamic_index -= 1;
+        }
+        dynamic_index = evaluator.dynamic_program_sources.len() - 1;
+        loop dynamic_index >= 0 {
+            let candidate: asp.compiler.VbsProgram = (new asp.compiler.VbsParser()).parse_script_source(evaluator.dynamic_program_sources.get(dynamic_index));
+            candidate.freeze_decoded();
+            let candidate_id: Int = evaluator_calls_find_object_routine(evaluator, candidate, member, obj.default_member, obj.class_name, is_set);
+            if candidate_id >= 0 {
+                let result: asp.runtime.Variant = evaluator.call_user_routine_values(candidate, program, ctx, scope, candidate_id, values, arg_ids, obj_value.object_value, true);
+                return evaluator.release_arg_result(values, result);
+            }
+            dynamic_index -= 1;
+        }
+        evaluator.raise_runtime_error(ctx, 438, "class member not found: " + member, obj.class_name);
+        return evaluator.release_arg_result(values, asp.runtime.variant_empty());
+    }
+    evaluator.raise_runtime_error(ctx, 438, "object member not found: " + member, "VBScript");
+    return evaluator.release_arg_result(values, asp.runtime.variant_empty());
+}
+
+// VM-facing object dispatcher. It copies the input vector before appending a
+// property-set value because the source vector may be shared with a native
+// frame and later used for ByRef synchronization.
+func evaluator_calls_invoke_object_values(evaluator: Evaluator, program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, scope: asp.vm.Scope, obj_value: asp.runtime.Variant, member: String, values: collections.Vector<asp.runtime.Variant>, is_set: Bool = false, set_value: asp.runtime.Variant = (asp.runtime.variant_empty()), arg_expr_ids: collections.Vector<Int> = (new collections.Vector<Int>())) -> asp.runtime.Variant {
+    if obj_value.kind != asp.runtime.VariantObject {
+        evaluator.raise_runtime_error(ctx, 91, "object required", "VBScript");
+        return asp.runtime.variant_empty();
+    }
+    let member_dot: Int = member_name_dot(member);
+    if member_dot >= 0 {
+        let intermediate: asp.runtime.Variant = evaluator.invoke_object_values(program, ctx, scope, obj_value, member_name_left(member, member_dot), new collections.Vector<asp.runtime.Variant>());
+        if intermediate.kind != asp.runtime.VariantObject {
+            evaluator.raise_runtime_error(ctx, 438, "value does not support member access", "VBScript");
+            return asp.runtime.variant_empty();
+        }
+        return evaluator.invoke_object_values(program, ctx, scope, intermediate, member_name_right(member, member_dot), values, is_set, set_value, arg_expr_ids);
+    }
+    let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_value.object_value);
+    let call_values: collections.Vector<asp.runtime.Variant> = new collections.Vector<asp.runtime.Variant>();
+    let i: Int = 0;
+    loop i < values.len() {
+        _ = call_values.push(values.get(i));
+        i += 1;
+    }
+    if is_set {
+        _ = call_values.push(set_value);
+    }
+    if obj.kind == asp.vm.RuntimeObjectDictionary {
+        return evaluator.invoke_dictionary(ctx, obj_value.object_value, member, call_values, is_set);
+    }
+    if obj.kind == asp.vm.RuntimeObjectAdoConnection {
+        let result: asp.runtime.Variant = evaluator.invoke_ado_connection(ctx, obj_value.object_value, member, call_values, is_set);
+        if !is_set && strings.equal_fold_ascii(member, "Execute") && arg_expr_ids.len() >= 2 && result.kind == asp.runtime.VariantObject {
+            let recordset: asp.vm.RuntimeObject = evaluator.get_object(ctx, result.object_value);
+            if recordset.kind == asp.vm.RuntimeObjectAdoRecordset && evaluator.expr_supports_copyback(program, ctx, scope, arg_expr_ids.get(1)) {
+                evaluator.assign_target_expr(program, ctx, scope, arg_expr_ids.get(1), asp.runtime.variant_int(recordset.int_value), false);
+            }
+        }
+        return result;
+    }
+    if obj.kind == asp.vm.RuntimeObjectAdoRecordset {
+        return evaluator.invoke_ado_recordset(ctx, obj_value.object_value, member, call_values, is_set);
+    }
+    if asp.object.kind_of(obj) != asp.object.ComponentUnknown {
+        let result: asp.runtime.Variant = evaluator.invoke_component(ctx, obj_value.object_value, member, call_values, is_set);
+        _ = __gc_keepalive(call_values);
+        _ = __gc_keepalive(values);
+        return result;
+    }
+    if obj.kind == asp.vm.RuntimeObjectUserClass {
+        if strings.equal_fold_ascii(obj.class_name, "__asp_err") {
+            if strings.equal_fold_ascii(member, "Clear") {
+                ctx.error_state.clear();
+                _ = obj.store.set("Number", asp.runtime.variant_int(0));
+                _ = obj.store.set("Description", asp.runtime.variant_string(""));
+                _ = obj.store.set("Source", asp.runtime.variant_string(""));
+                evaluator.set_object(ctx, obj_value.object_value, obj);
+                return asp.runtime.variant_empty();
+            }
+            if strings.equal_fold_ascii(member, "Raise") && call_values.len() >= 1 {
+                let source: String = call_values.len() >= 2 ? call_values.get(1).to_output_string() : "VBScript";
+                let description: String = call_values.len() >= 3 ? call_values.get(2).to_output_string() : "runtime error " + strconv.itoa(variant_to_int(call_values.get(0)));
+                evaluator.raise_runtime_error(ctx, variant_to_int(call_values.get(0)), description, source);
+                return asp.runtime.variant_empty();
+            }
+            if obj.store.has(member) {
+                return obj.store.get_or_empty(member);
+            }
+        }
+        let field_name: String = std.len(member) == 0 ? obj.default_member : member;
+        if std.len(field_name) != 0 && obj.store.has(field_name) {
+            if is_set && call_values.len() >= 1 {
+                _ = obj.store.set(field_name, call_values.get(call_values.len() - 1));
+                evaluator.set_object(ctx, obj_value.object_value, obj);
+                return asp.runtime.variant_empty();
+            }
+            let field_value: asp.runtime.Variant = obj.store.get_or_empty(field_name);
+            if values.len() > 0 && field_value.kind == asp.runtime.VariantArray {
+                return evaluator.invoke_array_values(ctx, field_value, values, false, asp.runtime.variant_empty(), obj.class_name + "." + field_name);
+            }
+            return field_value;
+        }
+        let routine_id: Int = evaluator_calls_find_object_routine(evaluator, program, member, obj.default_member, obj.class_name, is_set);
+        if routine_id >= 0 {
+            if is_set {
+                let result: asp.runtime.Variant = evaluator.call_user_routine_values(program, program, ctx, scope, routine_id, call_values, arg_expr_ids, obj_value.object_value, false);
+                _ = __gc_keepalive(call_values);
+                _ = __gc_keepalive(obj_value);
+                return result;
+            }
+            return evaluator.call_user_routine_values(program, program, ctx, scope, routine_id, values, arg_expr_ids, obj_value.object_value, false);
+        }
+        if evaluator.has_active_bytecode {
+            let active_routine_id: Int = evaluator_calls_find_object_routine(evaluator, evaluator.active_bytecode.program, member, obj.default_member, obj.class_name, is_set);
+            if active_routine_id >= 0 {
+                if is_set {
+                    let result: asp.runtime.Variant = evaluator.call_user_routine_values(evaluator.active_bytecode.program, program, ctx, scope, active_routine_id, call_values, arg_expr_ids, obj_value.object_value, false);
+                    _ = __gc_keepalive(call_values);
+                    _ = __gc_keepalive(obj_value);
+                    return result;
+                }
+                return evaluator.call_user_routine_values(evaluator.active_bytecode.program, program, ctx, scope, active_routine_id, values, arg_expr_ids, obj_value.object_value, false);
+            }
+        }
+        let dynamic_index: Int = evaluator.dynamic_definition_indices.len() - 1;
+        loop dynamic_index >= 0 {
+            let candidate_index: Int = evaluator.dynamic_definition_indices.get(dynamic_index);
+            let candidate_bytecode: asp.vm.VbsBytecodeProgram = evaluator.dynamic_bytecode_at(candidate_index);
+            let candidate: asp.compiler.VbsProgram = candidate_bytecode.program;
+            let candidate_id: Int = evaluator_calls_find_object_routine(evaluator, candidate, member, obj.default_member, obj.class_name, is_set);
+            if candidate_id >= 0 {
+                if is_set {
+                    let result: asp.runtime.Variant = evaluator.call_dynamic_routine_values(candidate_bytecode, candidate_index, program, ctx, scope, candidate_id, call_values, arg_expr_ids, obj_value.object_value);
+                    _ = __gc_keepalive(call_values);
+                    _ = __gc_keepalive(obj_value);
+                    return result;
+                }
+                return evaluator.call_dynamic_routine_values(candidate_bytecode, candidate_index, program, ctx, scope, candidate_id, values, arg_expr_ids, obj_value.object_value);
+            }
+            dynamic_index -= 1;
+        }
+        dynamic_index = evaluator.dynamic_program_sources.len() - 1;
+        loop dynamic_index >= 0 {
+            let candidate: asp.compiler.VbsProgram = (new asp.compiler.VbsParser()).parse_script_source(evaluator.dynamic_program_sources.get(dynamic_index));
+            candidate.freeze_decoded();
+            let candidate_id: Int = evaluator_calls_find_object_routine(evaluator, candidate, member, obj.default_member, obj.class_name, is_set);
+            if candidate_id >= 0 {
+                let fallback_values: collections.Vector<asp.runtime.Variant> = is_set ? call_values : values;
+                return evaluator.call_user_routine_values(candidate, program, ctx, scope, candidate_id, fallback_values, arg_expr_ids, obj_value.object_value, true);
+            }
+            dynamic_index -= 1;
+        }
+        evaluator.raise_runtime_error(ctx, 438, "class member not found: " + member, obj.class_name);
+        return asp.runtime.variant_empty();
+    }
+    evaluator.raise_runtime_error(ctx, 438, "object member not found: " + member, "VBScript");
+    return asp.runtime.variant_empty();
+}
+
+func evaluator_calls_invoke_object_member_id_values(evaluator: Evaluator, program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, scope: asp.vm.Scope, obj_value: asp.runtime.Variant, member: String, member_id: Int, values: collections.Vector<asp.runtime.Variant>, arg_expr_ids: collections.Vector<Int>) -> asp.runtime.Variant {
+    if obj_value.kind == asp.runtime.VariantObject && member_id > 0 {
+        let routine_id: Int = member_id - 1;
+        let obj: asp.vm.RuntimeObject = evaluator.get_object(ctx, obj_value.object_value);
+        if obj.kind == asp.vm.RuntimeObjectUserClass
+        && !strings.equal_fold_ascii(obj.class_name, "__asp_err")
+        && std.len(member) > 0
+        && !obj.store.has(member)
+        && routine_id >= 0
+        && routine_id < program.runtime_routine_count()
+        && strings.equal_fold_ascii(program.runtime_routine_owner(routine_id), obj.class_name) {
+            let flags: Int = 0;
+            let i: Int = 0;
+            loop i < program.runtime_routine_param_count(routine_id) {
+                if program.runtime_routine_param_by_ref(routine_id, i) != 0 {
+                    flags = flags | 8;
+                    break;
+                }
+                i += 1;
+            }
+            let selected: Int = eg_asp_vm_member_select(
+                ctx.request_arena_handle,
+                member_id,
+                obj.kind => Int,
+                routine_id,
+                values.len(),
+                flags
+            );
+            if selected == routine_id {
+                return evaluator.call_user_routine_values(program, program, ctx, scope, selected, values, arg_expr_ids, obj_value.object_value, false);
+            }
+        }
+    }
+    return evaluator_calls_invoke_object_values(evaluator, program, ctx, scope, obj_value, member, values, false, asp.runtime.variant_empty(), arg_expr_ids);
+}
+
+func evaluator_calls_eval_object_member_id_values(evaluator: Evaluator, program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, scope: asp.vm.Scope, name: String, member_id: Int, values: collections.Vector<asp.runtime.Variant>, arg_expr_ids: collections.Vector<Int>) -> asp.runtime.Variant {
+    let dot: Int = member_name_dot(name);
+    if dot > 0 {
+        let target: asp.runtime.Variant = evaluator.resolve_identifier(ctx, scope, member_name_left(name, dot), program);
+        if target.kind == asp.runtime.VariantObject {
+            return evaluator_calls_invoke_object_member_id_values(
+                evaluator,
+                program,
+                ctx,
+                scope,
+                target,
+                member_name_right(name, dot),
+                member_id,
+                values,
+                arg_expr_ids
+            );
+        }
+    }
+    return evaluator_calls_eval_call_values(evaluator, program, ctx, scope, name, values, arg_expr_ids);
+}
+
+// Fast dispatch table for stable host built-ins. The native selector guards
+// cached bytecode against ABI drift; rejection continues through name lookup.
+func evaluator_calls_eval_builtin_member_id_values(evaluator: Evaluator, program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, scope: asp.vm.Scope, name: String, member_id: Int, values: collections.Vector<asp.runtime.Variant>, arg_expr_ids: collections.Vector<Int>) -> asp.runtime.Variant {
+    let selected: Int = eg_asp_vm_member_select(ctx.request_arena_handle, member_id, 100, member_id, values.len(), 0);
+    if selected != member_id {
+        return evaluator_calls_eval_call_values(evaluator, program, ctx, scope, name, values, arg_expr_ids);
+    }
+    if member_id == 1 {
+        return values.len() >= 1 ? asp.runtime.variant_string(evaluator_calls_request_value(ctx, values.get(0).to_output_string())) : asp.runtime.variant_string("");
+    }
+    if member_id == 2 {
+        return values.len() >= 1
+        ? evaluator_calls_query_value(ctx, values.get(0).to_output_string())
+        : asp.runtime.variant_string(ctx.request.query_string);
+    }
+    if member_id == 3 {
+        return values.len() >= 1 ? asp.runtime.variant_string(evaluator_calls_form_value(ctx, values.get(0).to_output_string())) : asp.runtime.variant_string("");
+    }
+    if member_id == 4 {
+        return values.len() >= 1 ? asp.runtime.variant_string(ctx.request.cookies.get_or(strings.to_lower_ascii(values.get(0).to_output_string()), "")) : asp.runtime.variant_string("");
+    }
+    if member_id == 5 {
+        if values.len() < 1 {
+            return asp.runtime.variant_string("");
+        }
+        return evaluator_calls_server_variable(ctx, values.get(0).to_output_string());
+    }
+    if member_id == 6 {
+        let count: Int = values.len() >= 1 ? variant_to_int(values.get(0)) : std.len(ctx.request.body);
+        let chunk: String = ctx.request.binary_read(count);
+        return asp.runtime.variant_string(chunk);
+    }
+    if member_id == 7 || member_id == 8 {
+        return values.len() >= 1 ? ctx.session.get_or_empty(values.get(0).to_output_string()) : asp.runtime.variant_empty();
+    }
+    if member_id == 9 || member_id == 10 {
+        return values.len() >= 1 ? ctx.application.get_or_empty(values.get(0).to_output_string()) : asp.runtime.variant_empty();
+    }
+    if member_id == 11 {
+        return values.len() >= 1
+        ? asp.runtime.variant_string(server_map_path_for_request(evaluator.engine, ctx, values.get(0).to_output_string()))
+        : asp.runtime.variant_string(asp_windows_path(evaluator.engine.root_dir));
+    }
+    if member_id == 12 && values.len() >= 1 {
+        return evaluator.create_object_by_progid(ctx, values.get(0).to_output_string());
+    }
+    if member_id == 13 {
+        return asp.runtime.variant_string(evaluator_calls_url_encode(values.len() > 0 ? values.get(0).to_output_string() : ""));
+    }
+    if member_id == 14 {
+        return asp.runtime.variant_string(evaluator_calls_html_encode(values.len() > 0 ? values.get(0).to_output_string() : ""));
+    }
+    if member_id == 15 {
+        return evaluator_calls_replace(values);
+    }
+    if member_id == 16 {
+        return evaluator_calls_instr(values);
+    }
+    if member_id == 17 {
+        return values.len() >= 1
+            ? asp.runtime.variant_int(std.len(values.get(0).to_output_string()))
+            : asp.runtime.variant_int(0);
+    }
+    if member_id == 18 {
+        return values.len() >= 1
+            ? asp.runtime.variant_string(values.get(0).to_output_string())
+            : asp.runtime.variant_string("");
+    }
+    if member_id == 19 {
+        return values.len() >= 2
+            ? evaluator_calls_left(values.get(0), variant_to_int(values.get(1)))
+            : asp.runtime.variant_string("");
+    }
+    if member_id == 20 {
+        return values.len() >= 2
+            ? evaluator_calls_right(values.get(0), variant_to_int(values.get(1)))
+            : asp.runtime.variant_string("");
+    }
+    if member_id == 21 {
+        return evaluator_calls_mid(values);
+    }
+    if member_id == 22 {
+        return values.len() >= 1
+            ? asp.runtime.variant_string(strings.to_lower_ascii(values.get(0).to_output_string()))
+            : asp.runtime.variant_string("");
+    }
+    if member_id == 23 {
+        return values.len() >= 1
+            ? asp.runtime.variant_string(strings.to_upper_ascii(values.get(0).to_output_string()))
+            : asp.runtime.variant_string("");
+    }
+    if member_id == 24 {
+        if values.len() < 1 {
+            return asp.runtime.variant_string("");
+        }
+        let trim_value: asp.runtime.Variant = values.get(0);
+        return trim_value.kind == asp.runtime.VariantNull
+            ? asp.runtime.variant_null()
+            : asp.runtime.variant_string(strings.trim_space(trim_value.to_output_string()));
+    }
+    if member_id == 25 {
+        return asp.runtime.variant_bool(values.len() >= 1 && values.get(0).kind == asp.runtime.VariantNull);
+    }
+    if member_id == 26 {
+        return asp.runtime.variant_bool(values.len() >= 1 && values.get(0).kind == asp.runtime.VariantEmpty);
+    }
+    if member_id == 27 {
+        return asp.runtime.variant_bool(values.len() >= 1 && variant_is_numeric(values.get(0)));
+    }
+    if member_id == 28 || member_id == 29 {
+        return values.len() >= 1
+            ? asp.runtime.variant_int(evaluator_calls_vb_int(values.get(0)))
+            : asp.runtime.variant_int(0);
+    }
+    if member_id == 30 {
+        return values.len() >= 1
+            ? asp.runtime.variant_float(variant_to_float64(values.get(0)))
+            : asp.runtime.variant_float(0.0);
+    }
+    return evaluator_calls_eval_call_values(evaluator, program, ctx, scope, name, values, arg_expr_ids);
+}
+
+// Canonical name-based call resolution for interpreted expressions. The order
+// is observable VBScript behavior: host built-ins, user routines and dynamic
+// definitions precede treating an identifier as an object or array.
+func evaluator_calls_eval_call(evaluator: Evaluator, program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, scope: asp.vm.Scope, name: String, arg_ids: collections.Vector<Int>) -> asp.runtime.Variant {
+    if strings.equal_fold_ascii(name, "Eval") || strings.equal_fold_ascii(name, "Execute") || evaluator_calls_is_values_only_builtin(name) {
+        let values: collections.Vector<asp.runtime.Variant> = evaluator.eval_arg_values(program, ctx, scope, arg_ids);
+        let result: asp.runtime.Variant = evaluator_calls_eval_call_values(evaluator, program, ctx, scope, name, values, arg_ids);
+        return evaluator.release_arg_result(values, result);
+    }
+    if evaluator_calls_is_compat_builtin(name) {
+        let values: collections.Vector<asp.runtime.Variant> = evaluator.eval_arg_values(program, ctx, scope, arg_ids);
+        let result: asp.runtime.Variant = evaluator_calls_compat_builtin(evaluator, program, ctx, scope, name, values);
+        return evaluator.release_arg_result(values, result);
+    }
+    if strings.equal_fold_ascii(name, "Request") {
+        if arg_ids.len() >= 1 {
+            return asp.runtime.variant_string(evaluator_calls_request_value(ctx, evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string()));
+        }
+        return asp.runtime.variant_string("");
+    }
+    if strings.equal_fold_ascii(name, "Request.QueryString") {
+        if arg_ids.len() >= 1 {
+            let key: String = strings.to_lower_ascii(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string());
+            return evaluator_calls_query_value(ctx, key);
+        }
+        return asp.runtime.variant_string(ctx.request.query_string);
+    }
+    if strings.equal_fold_ascii(name, "Request.Form") {
+        if arg_ids.len() >= 1 {
+            let key: String = strings.to_lower_ascii(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string());
+            let value: String = evaluator_calls_form_value(ctx, key);
+            return asp.runtime.variant_string(value);
+        }
+        return asp.runtime.variant_string("");
+    }
+    if strings.equal_fold_ascii(name, "Request.Cookies") {
+        if arg_ids.len() >= 1 {
+            let key: String = strings.to_lower_ascii(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string());
+            return asp.runtime.variant_string(ctx.request.cookies.get_or(key, ""));
+        }
+        return asp.runtime.variant_string("");
+    }
+    if strings.equal_fold_ascii(name, "Request.ServerVariables") {
+        if arg_ids.len() >= 1 {
+            let key: String = strings.to_lower_ascii(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string());
+            if key == "all_http" {
+                let keys: collections.Vector<String> = ctx.request.headers.keys();
+                let text: String = "";
+                let i: Int = 0;
+                loop i < keys.len() {
+                    text += "HTTP_" + strings.replace_all(strings.to_upper_ascii(keys.get(i)), "-", "_") + ":" + ctx.request.headers.get(keys.get(i)) + "\n";
+                    i += 1;
+                }
+                _ = keys.free();
+                return asp.runtime.variant_string(text);
+            }
+            if key == "all_raw" {
+                let keys: collections.Vector<String> = ctx.request.headers.keys();
+                let text: String = "";
+                let i: Int = 0;
+                loop i < keys.len() {
+                    text += keys.get(i) + ":" + ctx.request.headers.get(keys.get(i)) + "\n";
+                    i += 1;
+                }
+                _ = keys.free();
+                return asp.runtime.variant_string(text);
+            }
+            return evaluator_calls_server_variable(ctx, key);
+        }
+        return asp.runtime.variant_string("");
+    }
+    if strings.equal_fold_ascii(name, "Request.BinaryRead") {
+        let count: Int = arg_ids.len() >= 1 ? variant_to_int(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0))) : std.len(ctx.request.body);
+        let chunk: String = ctx.request.binary_read(count);
+        return asp.runtime.variant_string(chunk);
+    }
+    if strings.equal_fold_ascii(name, "Session") || strings.equal_fold_ascii(name, "Session.Contents") {
+        if arg_ids.len() >= 1 {
+            return ctx.session.get_or_empty(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string());
+        }
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(name, "Application") || strings.equal_fold_ascii(name, "Application.Contents") {
+        if arg_ids.len() >= 1 {
+            return ctx.application.get_or_empty(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string());
+        }
+        return asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(name, "Array") {
+        let values: collections.Vector<asp.runtime.Variant> = evaluator.eval_arg_values(program, ctx, scope, arg_ids);
+        let result: asp.runtime.Variant = asp.runtime.variant_array(values);
+        return evaluator.release_arg_result(values, result);
+    }
+    if strings.equal_fold_ascii(name, "Server.MapPath") {
+        if arg_ids.len() >= 1 {
+            return asp.runtime.variant_string(server_map_path_for_request(evaluator.engine, ctx, evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string()));
+        }
+        return asp.runtime.variant_string(asp_windows_path(evaluator.engine.root_dir));
+    }
+    if (strings.equal_fold_ascii(name, "CreateObject") || strings.equal_fold_ascii(name, "Server.CreateObject")) && arg_ids.len() >= 1 {
+        return evaluator.create_object_by_progid(ctx, evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string());
+    }
+    if strings.equal_fold_ascii(name, "CStr") && arg_ids.len() >= 1 {
+        return asp.runtime.variant_string(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string());
+    }
+    if ((strings.equal_fold_ascii(name, "CInt") || strings.equal_fold_ascii(name, "CLng"))) && arg_ids.len() >= 1 {
+        let input: asp.runtime.Variant = evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0));
+        let converted: Int = variant_to_int(input);
+        return asp.runtime.variant_int(converted);
+    }
+    if strings.equal_fold_ascii(name, "CDbl") && arg_ids.len() >= 1 {
+        return asp.runtime.variant_float(variant_to_float64(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0))));
+    }
+    if strings.equal_fold_ascii(name, "Replace") {
+        let values: collections.Vector<asp.runtime.Variant> = evaluator.eval_arg_values(program, ctx, scope, arg_ids);
+        let result: asp.runtime.Variant = evaluator_calls_replace(values);
+        return evaluator.release_arg_result(values, result);
+    }
+    if strings.equal_fold_ascii(name, "Int") && arg_ids.len() >= 1 {
+        return asp.runtime.variant_int(variant_to_float64(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0))) => Int);
+    }
+    if strings.equal_fold_ascii(name, "Chr") && arg_ids.len() >= 1 {
+        return asp.runtime.variant_string(std.char_from_code(variant_to_int(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)))));
+    }
+    if strings.equal_fold_ascii(name, "LCase") && arg_ids.len() >= 1 {
+        return asp.runtime.variant_string(strings.to_lower_ascii(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string()));
+    }
+    if strings.equal_fold_ascii(name, "UCase") && arg_ids.len() >= 1 {
+        return asp.runtime.variant_string(strings.to_upper_ascii(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string()));
+    }
+    if (strings.equal_fold_ascii(name, "Left") || strings.equal_fold_ascii(name, "LeftB")) && arg_ids.len() >= 2 {
+        return evaluator_calls_left(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)), variant_to_int(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(1))));
+    }
+    if strings.equal_fold_ascii(name, "Right") && arg_ids.len() >= 2 {
+        return evaluator_calls_right(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)), variant_to_int(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(1))));
+    }
+    if strings.equal_fold_ascii(name, "Mid") {
+        let values: collections.Vector<asp.runtime.Variant> = evaluator.eval_arg_values(program, ctx, scope, arg_ids);
+        let result: asp.runtime.Variant = evaluator_calls_mid(values);
+        return evaluator.release_arg_result(values, result);
+    }
+    if strings.equal_fold_ascii(name, "InStr") {
+        let values: collections.Vector<asp.runtime.Variant> = evaluator.eval_arg_values(program, ctx, scope, arg_ids);
+        let result: asp.runtime.Variant = evaluator_calls_instr(values);
+        return evaluator.release_arg_result(values, result);
+    }
+    if strings.equal_fold_ascii(name, "InStrRev") {
+        let values: collections.Vector<asp.runtime.Variant> = evaluator.eval_arg_values(program, ctx, scope, arg_ids);
+        let result: asp.runtime.Variant = evaluator_calls_instr_rev(values);
+        return evaluator.release_arg_result(values, result);
+    }
+    if strings.equal_fold_ascii(name, "Len") && arg_ids.len() >= 1 {
+        return asp.runtime.variant_int(std.len(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string()));
+    }
+    if (strings.equal_fold_ascii(name, "LBound") || strings.equal_fold_ascii(name, "UBound")) && arg_ids.len() >= 1 {
+        let value: asp.runtime.Variant = evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0));
+        let dimension: Int = arg_ids.len() >= 2 ? variant_to_int(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(1))) : 1;
+        let upper: Int = evaluator_calls_array_upper_bound(value.clone(), dimension);
+        if upper < -1 {
+            let array_length: Int = value.kind == asp.runtime.VariantArray && value.array_data != nil ? value.array_data.items.len() : 0;
+            evaluator.raise_runtime_error(ctx, 9, "subscript out of range in " + name + ": dimension=" + strconv.itoa(dimension) + ", kind=" + strconv.itoa(value.kind => Int) + ", length=" + strconv.itoa(array_length), "VBScript");
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_int(strings.equal_fold_ascii(name, "LBound") ? 0 : upper);
+    }
+    if strings.equal_fold_ascii(name, "IsNumeric") && arg_ids.len() >= 1 {
+        return asp.runtime.variant_bool(variant_is_numeric(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0))));
+    }
+    if strings.equal_fold_ascii(name, "IsNull") && arg_ids.len() >= 1 {
+        return asp.runtime.variant_bool(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).kind == asp.runtime.VariantNull);
+    }
+    if strings.equal_fold_ascii(name, "IsEmpty") && arg_ids.len() >= 1 {
+        return asp.runtime.variant_bool(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).kind == asp.runtime.VariantEmpty);
+    }
+    if strings.equal_fold_ascii(name, "Trim") && arg_ids.len() >= 1 {
+        let value: asp.runtime.Variant = evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0));
+        return value.kind == asp.runtime.VariantNull ? asp.runtime.variant_null() : asp.runtime.variant_string(strings.trim_space(value.to_output_string()));
+    }
+    if strings.equal_fold_ascii(name, "IsObject") && arg_ids.len() >= 1 {
+        return asp.runtime.variant_bool(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).kind == asp.runtime.VariantObject);
+    }
+    if strings.equal_fold_ascii(name, "Rnd") {
+        let values: collections.Vector<asp.runtime.Variant> = evaluator.eval_arg_values(program, ctx, scope, arg_ids);
+        let result: asp.runtime.Variant = evaluator.eval_rnd_values(values);
+        return evaluator.release_arg_result(values, result);
+    }
+    if strings.equal_fold_ascii(name, "Randomize") {
+        let values: collections.Vector<asp.runtime.Variant> = evaluator.eval_arg_values(program, ctx, scope, arg_ids);
+        let result: asp.runtime.Variant = evaluator.eval_randomize_values(values);
+        return evaluator.release_arg_result(values, result);
+    }
+    if strings.equal_fold_ascii(name, "Timer") {
+        let day_ms: Int = time.now_ms() % 86400000;
+        return asp.runtime.variant_float((day_ms => Float64) / 1000.0);
+    }
+    if strings.equal_fold_ascii(name, "GetLoadTime") {
+        let elapsed_ms: Int = time.now_ms() - ctx.started_ms;
+        return asp.runtime.variant_string(strconv.format_float64((elapsed_ms => Float64) / 1000.0));
+    }
+    if strings.equal_fold_ascii(name, "Err.Clear") {
+        _ = ctx.error_state.clear();
+        return asp.runtime.variant_empty();
+    }
+    let dot: Int = member_name_dot(name);
+    if dot >= 0 {
+        let left: String = member_name_left(name, dot);
+        let member: String = member_name_right(name, dot);
+        let resolved: asp.runtime.Variant = evaluator.resolve_identifier(ctx, scope, left, program);
+        if resolved.kind == asp.runtime.VariantObject {
+            return evaluator.invoke_object(program, ctx, scope, resolved, member, arg_ids);
+        }
+        evaluator.raise_runtime_error(ctx, resolved.kind == asp.runtime.VariantNothing ? 91 : 424,
+            "object required for member call: " + name, "VBScript");
+        return asp.runtime.variant_empty();
+    }
+    if scope.me_object_id > 0 && std.len(scope.me_class_name) != 0 {
+        let class_routine_id: Int = evaluator.find_routine(program, name, scope.me_class_name);
+        if class_routine_id >= 0 {
+            return evaluator.call_user_routine(program, ctx, scope, class_routine_id, arg_ids, scope.me_object_id);
+        }
+    }
+    let routine_id: Int = evaluator.find_routine(program, name);
+    if routine_id >= 0 {
+        return evaluator.call_user_routine(program, ctx, scope, routine_id, arg_ids);
+    }
+    if evaluator.has_active_bytecode {
+        let active_routine_id: Int = evaluator.find_routine(evaluator.active_bytecode.program, name);
+        if active_routine_id >= 0 {
+            let values: collections.Vector<asp.runtime.Variant> = evaluator.eval_arg_values(program, ctx, scope, arg_ids);
+            let result: asp.runtime.Variant = evaluator.call_user_routine_values(evaluator.active_bytecode.program, program, ctx, scope, active_routine_id, values, arg_ids);
+            return evaluator.release_arg_result(values, result);
+        }
+    }
+    let dynamic_index: Int = evaluator.dynamic_definition_indices.len() - 1;
+    loop dynamic_index >= 0 {
+        let dynamic_definition_index: Int = evaluator.dynamic_definition_indices.get(dynamic_index);
+        let dynamic_bytecode: asp.vm.VbsBytecodeProgram = evaluator.dynamic_bytecode_at(dynamic_definition_index);
+        let dynamic_program: asp.compiler.VbsProgram = dynamic_bytecode.program;
+        let dynamic_routine_id: Int = evaluator.find_routine(dynamic_program, name);
+        if dynamic_routine_id >= 0 {
+            let values: collections.Vector<asp.runtime.Variant> = evaluator.eval_arg_values(program, ctx, scope, arg_ids);
+            let result: asp.runtime.Variant = evaluator.call_dynamic_routine_values(dynamic_bytecode, dynamic_definition_index, program, ctx, scope, dynamic_routine_id, values, arg_ids);
+            return evaluator.release_arg_result(values, result);
+        }
+        dynamic_index -= 1;
+    }
+    dynamic_index = evaluator.dynamic_program_sources.len() - 1;
+    loop dynamic_index >= 0 {
+        let dynamic_program: asp.compiler.VbsProgram = (new asp.compiler.VbsParser()).parse_script_source(evaluator.dynamic_program_sources.get(dynamic_index));
+        dynamic_program.freeze_decoded();
+        let dynamic_routine_id: Int = evaluator.find_routine(dynamic_program, name);
+        if dynamic_routine_id >= 0 {
+            let values: collections.Vector<asp.runtime.Variant> = evaluator.eval_arg_values(program, ctx, scope, arg_ids);
+            let result: asp.runtime.Variant = evaluator.call_user_routine_values(dynamic_program, program, ctx, scope, dynamic_routine_id, values, arg_ids, 0, true);
+            return evaluator.release_arg_result(values, result);
+        }
+        dynamic_index -= 1;
+    }
+    let resolved: asp.runtime.Variant = evaluator.resolve_identifier(ctx, scope, name, program, true);
+    if resolved.kind == asp.runtime.VariantObject {
+        return evaluator.invoke_object(program, ctx, scope, resolved, "", arg_ids);
+    }
+    if resolved.kind == asp.runtime.VariantArray {
+        return evaluator.invoke_array(program, ctx, scope, resolved, arg_ids, false, asp.runtime.variant_empty());
+    }
+    return asp.runtime.variant_empty();
+}
+
+// Execute may use the compact VM only for a root block of plain assignments.
+// Other statements can introduce definitions or control state whose lifetime
+// currently depends on the interpreter's Scope representation.
+func evaluator_calls_dynamic_execute_vm_eligible(program: asp.compiler.VbsProgram) -> Bool {
+    let i: Int = 0;
+    let count: Int = program.runtime_block_stmt_count(program.root_block_id);
+    loop i < count {
+        let stmt_id: Int = program.runtime_block_stmt(program.root_block_id, i);
+        if program.runtime_stmt_kind(stmt_id) != asp.compiler.VbsStmtAssign {
+            return false;
+        }
+        i += 1;
+    }
+    return count > 0;
+}
+
+// VM-facing name dispatcher. Eval/Execute compile exact source strings and pin
+// successful bytecode; parse failures become Err and are never cached.
+func evaluator_calls_eval_call_values(evaluator: Evaluator, program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, scope: asp.vm.Scope, name: String, values: collections.Vector<asp.runtime.Variant>, arg_expr_ids: collections.Vector<Int> = (new collections.Vector<Int>())) -> asp.runtime.Variant {
+    if strings.equal_fold_ascii(name, "Eval") && values.len() >= 1 {
+        let source: String = values.get(0).to_output_string();
+        let cached_index: Int = evaluator.dynamic_bytecode_enabled ? evaluator.dynamic_bytecode_index(source, 1) : -1;
+        if cached_index >= 0 {
+            return evaluator.eval_dynamic_bytecode(evaluator.dynamic_bytecode_at(cached_index), cached_index, ctx, scope);
+        }
+        let dynamic_program: asp.compiler.VbsProgram = (new asp.compiler.VbsParser()).parse_expr_source(source);
+        if dynamic_program.errors.len() != 0 {
+            evaluator.raise_runtime_error(ctx, 1002, dynamic_program.errors.get(0), "Eval");
+            return asp.runtime.variant_empty();
+        }
+        if dynamic_program.runtime_expr_kind(dynamic_program.root_expr_id) == asp.compiler.VbsExprIdentifier {
+            return evaluator.eval_expr_in_scope(dynamic_program, ctx, scope, dynamic_program.root_expr_id);
+        }
+        if evaluator.dynamic_bytecode_enabled {
+            let bytecode: asp.vm.VbsBytecodeProgram = (new asp.vm.VbsBytecodeCompiler()).compile_expr(dynamic_program, false);
+            if bytecode.ok() {
+                let bytecode_index: Int = evaluator.cache_dynamic_bytecode(source, 1, bytecode, false);
+                if bytecode_index >= 0 {
+                    return evaluator.eval_dynamic_bytecode(evaluator.dynamic_bytecode_at(bytecode_index), bytecode_index, ctx, scope);
+                }
+                return evaluator.eval_dynamic_bytecode(bytecode, -1, ctx, scope);
+            } else {
+            }
+        } else {
+        }
+        dynamic_program.freeze_decoded();
+        return evaluator.eval_expr_in_scope(dynamic_program, ctx, scope, dynamic_program.root_expr_id);
+    }
+    if (strings.equal_fold_ascii(name, "Execute") || strings.equal_fold_ascii(name, "ExecuteGlobal")) && values.len() >= 1 {
+        let source: String = values.get(0).to_output_string();
+        let execute_global: Bool = strings.equal_fold_ascii(name, "ExecuteGlobal");
+        let cached_index: Int = evaluator.dynamic_bytecode_enabled ? evaluator.dynamic_bytecode_index(source, 2) : -1;
+        if cached_index >= 0 {
+            let cached_bytecode: asp.vm.VbsBytecodeProgram = evaluator.dynamic_bytecode_at(cached_index);
+            if execute_global && (cached_bytecode.program.runtime_routine_count() > 0 || cached_bytecode.program.runtime_class_count() > 0) {
+                evaluator.retain_dynamic_definition(cached_index);
+            }
+            let cached_scope: asp.vm.Scope = execute_global ? evaluator.root_scope(ctx) : scope;
+            _ = evaluator.execute_dynamic_bytecode(cached_bytecode, cached_index, ctx, cached_scope);
+            return asp.runtime.variant_empty();
+        }
+        let dynamic_program: asp.compiler.VbsProgram = (new asp.compiler.VbsParser()).parse_script_source(source);
+        if dynamic_program.errors.len() != 0 {
+            evaluator.raise_runtime_error(ctx, 1002, dynamic_program.errors.get(0), name);
+            return asp.runtime.variant_empty();
+        }
+        let execution_scope: asp.vm.Scope = execute_global ? evaluator.root_scope(ctx) : scope;
+        let vm_eligible: Bool = execute_global
+            ? (dynamic_program.runtime_routine_count() > 0 || dynamic_program.runtime_class_count() > 0)
+            : evaluator_calls_dynamic_execute_vm_eligible(dynamic_program);
+        if evaluator.dynamic_bytecode_enabled && vm_eligible {
+            let bytecode: asp.vm.VbsBytecodeProgram = (new asp.vm.VbsBytecodeCompiler()).compile_script(dynamic_program, false, execute_global);
+            if bytecode.ok() {
+                let retain_definitions: Bool = execute_global
+                    && (bytecode.program.runtime_routine_count() > 0 || bytecode.program.runtime_class_count() > 0);
+                let bytecode_index: Int = evaluator.cache_dynamic_bytecode(source, 2, bytecode, retain_definitions);
+                if bytecode_index >= 0 {
+                    _ = evaluator.execute_dynamic_bytecode(evaluator.dynamic_bytecode_at(bytecode_index), bytecode_index, ctx, execution_scope);
+                    return asp.runtime.variant_empty();
+                }
+                if retain_definitions {
+                    _ = evaluator.dynamic_program_sources.push(source);
+                }
+                _ = evaluator.execute_dynamic_bytecode(bytecode, -1, ctx, execution_scope);
+                return asp.runtime.variant_empty();
+            } else {
+            }
+        } else {
+        }
+        dynamic_program.freeze_decoded();
+        if execute_global && (dynamic_program.runtime_routine_count() > 0 || dynamic_program.runtime_class_count() > 0) {
+            _ = evaluator.dynamic_program_sources.push(source);
+        }
+        _ = evaluator.execute_block_in_scope(dynamic_program, ctx, execution_scope, dynamic_program.root_block_id);
+        return asp.runtime.variant_empty();
+    }
+    if evaluator_calls_is_compat_builtin(name) {
+        return evaluator_calls_compat_builtin(evaluator, program, ctx, scope, name, values);
+    }
+    if strings.equal_fold_ascii(name, "Request") {
+        return values.len() >= 1 ? asp.runtime.variant_string(evaluator_calls_request_value(ctx, values.get(0).to_output_string())) : asp.runtime.variant_string("");
+    }
+    if strings.equal_fold_ascii(name, "Request.QueryString") {
+        if values.len() >= 1 {
+            let key: String = strings.to_lower_ascii(values.get(0).to_output_string());
+            return evaluator_calls_query_value(ctx, key);
+        }
+        return asp.runtime.variant_string(ctx.request.query_string);
+    }
+    if strings.equal_fold_ascii(name, "Request.Form") {
+        if values.len() >= 1 {
+            let key: String = values.get(0).to_output_string();
+            let value: String = evaluator_calls_form_value(ctx, key);
+            return asp.runtime.variant_string(value);
+        }
+        return asp.runtime.variant_string("");
+    }
+    if strings.equal_fold_ascii(name, "Request.Cookies") {
+        return values.len() >= 1 ? asp.runtime.variant_string(ctx.request.cookies.get_or(strings.to_lower_ascii(values.get(0).to_output_string()), "")) : asp.runtime.variant_string("");
+    }
+    if strings.equal_fold_ascii(name, "Request.ServerVariables") {
+        if values.len() >= 1 {
+            let key: String = strings.to_lower_ascii(values.get(0).to_output_string());
+            if key == "all_http" {
+                let keys: collections.Vector<String> = ctx.request.headers.keys();
+                let text: String = "";
+                let i: Int = 0;
+                loop i < keys.len() {
+                    text += "HTTP_" + strings.replace_all(strings.to_upper_ascii(keys.get(i)), "-", "_") + ":" + ctx.request.headers.get(keys.get(i)) + "\n";
+                    i += 1;
+                }
+                _ = keys.free();
+                return asp.runtime.variant_string(text);
+            }
+            if key == "all_raw" {
+                let keys: collections.Vector<String> = ctx.request.headers.keys();
+                let text: String = "";
+                let i: Int = 0;
+                loop i < keys.len() {
+                    text += keys.get(i) + ":" + ctx.request.headers.get(keys.get(i)) + "\n";
+                    i += 1;
+                }
+                _ = keys.free();
+                return asp.runtime.variant_string(text);
+            }
+            return evaluator_calls_server_variable(ctx, key);
+        }
+        return asp.runtime.variant_string("");
+    }
+    if strings.equal_fold_ascii(name, "Request.BinaryRead") {
+        let count: Int = values.len() >= 1 ? variant_to_int(values.get(0)) : std.len(ctx.request.body);
+        let chunk: String = ctx.request.binary_read(count);
+        return asp.runtime.variant_string(chunk);
+    }
+    if strings.equal_fold_ascii(name, "Session") || strings.equal_fold_ascii(name, "Session.Contents") {
+        return values.len() >= 1 ? ctx.session.get_or_empty(values.get(0).to_output_string()) : asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(name, "Application") || strings.equal_fold_ascii(name, "Application.Contents") {
+        if values.len() < 1 {
+            return asp.runtime.variant_empty();
+        }
+        let application_key: String = values.get(0).to_output_string();
+        let application_value: asp.runtime.Variant = ctx.application.get_or_empty(application_key);
+        return application_value;
+    }
+    if strings.equal_fold_ascii(name, "Array") {
+        return asp.runtime.variant_array(values);
+    }
+    if strings.equal_fold_ascii(name, "IIf") {
+        return values.len() >= 3
+            ? (values.get(0).is_truthy() ? values.get(1) : values.get(2))
+            : asp.runtime.variant_empty();
+    }
+    if strings.equal_fold_ascii(name, "Split") {
+        return evaluator_calls_split(values);
+    }
+    if strings.equal_fold_ascii(name, "Join") {
+        return evaluator_calls_join(values);
+    }
+    if strings.equal_fold_ascii(name, "vbsescape") {
+        return asp.runtime.variant_string(evaluator_calls_url_encode(values.len() > 0 ? values.get(0).to_output_string() : ""));
+    }
+    if strings.equal_fold_ascii(name, "vbsunescape") {
+        return asp.runtime.variant_string(asp.runtime.url_decode_component(values.len() > 0 ? values.get(0).to_output_string() : ""));
+    }
+    if strings.equal_fold_ascii(name, "Server.MapPath") {
+        if values.len() >= 1 {
+            return asp.runtime.variant_string(server_map_path_for_request(evaluator.engine, ctx, values.get(0).to_output_string()));
+        }
+        return asp.runtime.variant_string(asp_windows_path(evaluator.engine.root_dir));
+    }
+    if (strings.equal_fold_ascii(name, "CreateObject") || strings.equal_fold_ascii(name, "Server.CreateObject")) && values.len() >= 1 {
+        return evaluator.create_object_by_progid(ctx, values.get(0).to_output_string());
+    }
+    if strings.equal_fold_ascii(name, "CStr") && values.len() >= 1 {
+        return asp.runtime.variant_string(values.get(0).to_output_string());
+    }
+    if ((strings.equal_fold_ascii(name, "CInt") || strings.equal_fold_ascii(name, "CLng") || strings.equal_fold_ascii(name, "CByte"))) && values.len() >= 1 {
+        let converted: Int = evaluator_calls_vb_int(values.get(0));
+        return asp.runtime.variant_int(converted);
+    }
+    if strings.equal_fold_ascii(name, "CDbl") && values.len() >= 1 {
+        return asp.runtime.variant_float(variant_to_float64(values.get(0)));
+    }
+    if strings.equal_fold_ascii(name, "Replace") {
+        return evaluator_calls_replace(values);
+    }
+    if strings.equal_fold_ascii(name, "Int") && values.len() >= 1 {
+        return asp.runtime.variant_int(variant_to_float64(values.get(0)) => Int);
+    }
+    if strings.equal_fold_ascii(name, "Chr") && values.len() >= 1 {
+        return asp.runtime.variant_string(std.char_from_code(variant_to_int(values.get(0))));
+    }
+    if strings.equal_fold_ascii(name, "ChrB") && values.len() >= 1 {
+        let byte_value: Int = variant_to_int(values.get(0)) & 255;
+        let byte_hex: String = evaluator_calls_hex_int(byte_value);
+        return asp.runtime.variant_string(asp.runtime.hex_decode_string(std.len(byte_hex) < 2 ? "0" + byte_hex : byte_hex));
+    }
+    if strings.equal_fold_ascii(name, "Hex") && values.len() >= 1 {
+        return asp.runtime.variant_string(evaluator_calls_hex_int(variant_to_int(values.get(0))));
+    }
+    if strings.equal_fold_ascii(name, "String") && values.len() >= 2 {
+        let count: Int = variant_to_int(values.get(0));
+        let fill_value: asp.runtime.Variant = values.get(1);
+        let fill: String = fill_value.kind == asp.runtime.VariantInt
+            ? std.char_from_code(fill_value.int_value)
+            : (std.len(fill_value.to_output_string()) > 0 ? std.substr(fill_value.to_output_string(), 0, 1) : "");
+        return asp.runtime.variant_string(strings.repeat(fill, count > 0 ? count : 0));
+    }
+    if strings.equal_fold_ascii(name, "Abs") && values.len() >= 1 {
+        if values.get(0).kind == asp.runtime.VariantFloat {
+            let number: Float64 = variant_to_float64(values.get(0));
+            return asp.runtime.variant_float(number < 0.0 ? -number : number);
+        }
+        let number: Int = variant_to_int(values.get(0));
+        return asp.runtime.variant_int(number < 0 ? -number : number);
+    }
+    if strings.equal_fold_ascii(name, "Round") && values.len() >= 1 {
+        let number: Float64 = variant_to_float64(values.get(0));
+        return asp.runtime.variant_int(number >= 0.0 ? (number + 0.5) => Int : (number - 0.5) => Int);
+    }
+    if strings.equal_fold_ascii(name, "Sqr") && values.len() >= 1 {
+        return asp.runtime.variant_float(math.sqrt(variant_to_float64(values.get(0)) => Float) => Float64);
+    }
+    if strings.equal_fold_ascii(name, "Sgn") && values.len() >= 1 {
+        return asp.runtime.variant_int(eg_vbs_sgn(variant_to_float64(values.get(0))));
+    }
+    if strings.equal_fold_ascii(name, "Atn") && values.len() >= 1 {
+        return asp.runtime.variant_float(eg_vbs_atn(variant_to_float64(values.get(0))));
+    }
+    if strings.equal_fold_ascii(name, "Sin") && values.len() >= 1 {
+        return asp.runtime.variant_float(eg_vbs_sin(variant_to_float64(values.get(0))));
+    }
+    if strings.equal_fold_ascii(name, "Cos") && values.len() >= 1 {
+        return asp.runtime.variant_float(eg_vbs_cos(variant_to_float64(values.get(0))));
+    }
+    if strings.equal_fold_ascii(name, "Tan") && values.len() >= 1 {
+        return asp.runtime.variant_float(eg_vbs_tan(variant_to_float64(values.get(0))));
+    }
+    if strings.equal_fold_ascii(name, "Exp") && values.len() >= 1 {
+        return asp.runtime.variant_float(eg_vbs_exp(variant_to_float64(values.get(0))));
+    }
+    if strings.equal_fold_ascii(name, "Log") && values.len() >= 1 {
+        return asp.runtime.variant_float(eg_vbs_log(variant_to_float64(values.get(0))));
+    }
+    if strings.equal_fold_ascii(name, "LCase") && values.len() >= 1 {
+        return asp.runtime.variant_string(strings.to_lower_ascii(values.get(0).to_output_string()));
+    }
+    if strings.equal_fold_ascii(name, "UCase") && values.len() >= 1 {
+        return asp.runtime.variant_string(strings.to_upper_ascii(values.get(0).to_output_string()));
+    }
+    if (strings.equal_fold_ascii(name, "Left") || strings.equal_fold_ascii(name, "LeftB")) && values.len() >= 2 {
+        return evaluator_calls_left(values.get(0), variant_to_int(values.get(1)));
+    }
+    if strings.equal_fold_ascii(name, "Right") && values.len() >= 2 {
+        return evaluator_calls_right(values.get(0), variant_to_int(values.get(1)));
+    }
+    if strings.equal_fold_ascii(name, "Mid") {
+        return evaluator_calls_mid(values);
+    }
+    if strings.equal_fold_ascii(name, "InStr") {
+        return evaluator_calls_instr(values);
+    }
+    if strings.equal_fold_ascii(name, "InStrRev") {
+        return evaluator_calls_instr_rev(values);
+    }
+    if strings.equal_fold_ascii(name, "Len") && values.len() >= 1 {
+        return asp.runtime.variant_int(std.len(values.get(0).to_output_string()));
+    }
+    if (strings.equal_fold_ascii(name, "LBound") || strings.equal_fold_ascii(name, "UBound")) && values.len() >= 1 {
+        let value: asp.runtime.Variant = values.get(0);
+        let dimension: Int = values.len() >= 2 ? variant_to_int(values.get(1)) : 1;
+        let upper: Int = evaluator_calls_array_upper_bound(value.clone(), dimension);
+        if upper < -1 {
+            let array_length: Int = value.kind == asp.runtime.VariantArray && value.array_data != nil ? value.array_data.items.len() : 0;
+            evaluator.raise_runtime_error(ctx, 9, "subscript out of range in " + name + ": dimension=" + strconv.itoa(dimension) + ", kind=" + strconv.itoa(value.kind => Int) + ", length=" + strconv.itoa(array_length), "VBScript");
+            return asp.runtime.variant_empty();
+        }
+        return asp.runtime.variant_int(strings.equal_fold_ascii(name, "LBound") ? 0 : upper);
+    }
+    if strings.equal_fold_ascii(name, "IsNumeric") && values.len() >= 1 {
+        return asp.runtime.variant_bool(variant_is_numeric(values.get(0)));
+    }
+    if strings.equal_fold_ascii(name, "IsObject") && values.len() >= 1 {
+        return asp.runtime.variant_bool(values.get(0).kind == asp.runtime.VariantObject);
+    }
+    if strings.equal_fold_ascii(name, "Rnd") {
+        return evaluator.eval_rnd_values(values);
+    }
+    if strings.equal_fold_ascii(name, "IsNull") && values.len() >= 1 {
+        return asp.runtime.variant_bool(values.get(0).kind == asp.runtime.VariantNull);
+    }
+    if strings.equal_fold_ascii(name, "IsEmpty") && values.len() >= 1 {
+        return asp.runtime.variant_bool(values.get(0).kind == asp.runtime.VariantEmpty);
+    }
+    if strings.equal_fold_ascii(name, "Trim") && values.len() >= 1 {
+        let value: asp.runtime.Variant = values.get(0);
+        return value.kind == asp.runtime.VariantNull ? asp.runtime.variant_null() : asp.runtime.variant_string(strings.trim_space(value.to_output_string()));
+    }
+    if strings.equal_fold_ascii(name, "Randomize") {
+        return evaluator.eval_randomize_values(values);
+    }
+    if strings.equal_fold_ascii(name, "Timer") {
+        let day_ms: Int = time.now_ms() % 86400000;
+        return asp.runtime.variant_float((day_ms => Float64) / 1000.0);
+    }
+    if strings.equal_fold_ascii(name, "GetLoadTime") {
+        let elapsed_ms: Int = time.now_ms() - ctx.started_ms;
+        return asp.runtime.variant_string(strconv.format_float64((elapsed_ms => Float64) / 1000.0));
+    }
+    if strings.equal_fold_ascii(name, "Err.Clear") {
+        _ = ctx.error_state.clear();
+        return asp.runtime.variant_empty();
+    }
+    let dot: Int = member_name_dot(name);
+    if dot >= 0 {
+        let resolved: asp.runtime.Variant = evaluator.resolve_identifier(ctx, scope, member_name_left(name, dot), program);
+        if resolved.kind == asp.runtime.VariantObject {
+            return evaluator.invoke_object_values(program, ctx, scope, resolved, member_name_right(name, dot), values, false, asp.runtime.variant_empty(), arg_expr_ids);
+        }
+        evaluator.raise_runtime_error(ctx, resolved.kind == asp.runtime.VariantNothing ? 91 : 424,
+            "object required for member call: " + name, "VBScript");
+        return asp.runtime.variant_empty();
+    }
+    if evaluator.identifier_array_indexes_valid(ctx, scope, name, values) {
+        return evaluator.indexed_identifier_value(ctx, scope, name, values);
+    }
+    if scope.me_object_id > 0 && std.len(scope.me_class_name) != 0 {
+        let class_routine_id: Int = evaluator.find_routine(program, name, scope.me_class_name);
+        if class_routine_id >= 0 {
+            return evaluator.call_user_routine_values(program, program, ctx, scope, class_routine_id, values, arg_expr_ids, scope.me_object_id);
+        }
+    }
+    let routine_id: Int = evaluator.find_routine(program, name);
+    if routine_id >= 0 {
+        return evaluator.call_user_routine_values(program, program, ctx, scope, routine_id, values, arg_expr_ids);
+    }
+    if evaluator.has_active_bytecode {
+        let active_routine_id: Int = evaluator.find_routine(evaluator.active_bytecode.program, name);
+        if active_routine_id >= 0 {
+            return evaluator.call_user_routine_values(evaluator.active_bytecode.program, program, ctx, scope, active_routine_id, values, arg_expr_ids);
+        }
+    }
+    let dynamic_index: Int = evaluator.dynamic_definition_indices.len() - 1;
+    loop dynamic_index >= 0 {
+        let dynamic_definition_index: Int = evaluator.dynamic_definition_indices.get(dynamic_index);
+        let dynamic_bytecode: asp.vm.VbsBytecodeProgram = evaluator.dynamic_bytecode_at(dynamic_definition_index);
+        let dynamic_program: asp.compiler.VbsProgram = dynamic_bytecode.program;
+        let dynamic_routine_id: Int = evaluator.find_routine(dynamic_program, name);
+        if dynamic_routine_id >= 0 {
+            return evaluator.call_dynamic_routine_values(dynamic_bytecode, dynamic_definition_index, program, ctx, scope, dynamic_routine_id, values, arg_expr_ids);
+        }
+        dynamic_index -= 1;
+    }
+    dynamic_index = evaluator.dynamic_program_sources.len() - 1;
+    loop dynamic_index >= 0 {
+        let dynamic_program: asp.compiler.VbsProgram = (new asp.compiler.VbsParser()).parse_script_source(evaluator.dynamic_program_sources.get(dynamic_index));
+        dynamic_program.freeze_decoded();
+        let dynamic_routine_id: Int = evaluator.find_routine(dynamic_program, name);
+        if dynamic_routine_id >= 0 {
+            return evaluator.call_user_routine_values(dynamic_program, program, ctx, scope, dynamic_routine_id, values, arg_expr_ids, 0, true);
+        }
+        dynamic_index -= 1;
+    }
+    let resolved: asp.runtime.Variant = evaluator.resolve_identifier(ctx, scope, name, program, true);
+    if resolved.kind == asp.runtime.VariantObject {
+        return evaluator.invoke_object_values(program, ctx, scope, resolved, "", values, false, asp.runtime.variant_empty(), arg_expr_ids);
+    }
+    if resolved.kind == asp.runtime.VariantArray {
+        let array_source: String = std.len(scope.function_name) > 0
+        ? scope.me_class_name + "." + scope.function_name + ":" + name
+        : name;
+        return evaluator.invoke_array_values(ctx, resolved, values, false, asp.runtime.variant_empty(), array_source);
+    }
+    return asp.runtime.variant_empty();
+}
+
+func evaluator_calls_try_assign_bare_property(evaluator: Evaluator, program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, scope: asp.vm.Scope, name: String, value: asp.runtime.Variant) -> Bool {
+    if scope.me_object_id <= 0
+        || std.len(scope.me_class_name) == 0
+        || scope.call_frame.has(name)
+        || scope.vars.has(name)
+        || evaluator.has_me_field(ctx, scope, name)
+        || (scope.has_parent && std.len(scope.function_name) != 0 && strings.equal_fold_ascii(name, scope.function_name)) {
+        return false;
+    }
+    let getter_id: Int = evaluator.find_routine_by_function_kind(program, name, scope.me_class_name, true);
+    let setter_id: Int = evaluator.find_routine_by_function_kind(program, name, scope.me_class_name, false);
+    if getter_id < 0 || setter_id < 0 {
+        return false;
+    }
+    let values: collections.Vector<asp.runtime.Variant> = new collections.Vector<asp.runtime.Variant>();
+    _ = values.push(value);
+    _ = evaluator.call_user_routine_values(program, program, ctx, scope, setter_id, values, new collections.Vector<Int>(), scope.me_object_id, false);
+    _ = __gc_keepalive(program);
+    _ = __gc_keepalive(ctx);
+    _ = __gc_keepalive(scope);
+    _ = __gc_keepalive(values);
+    _ = __gc_keepalive(value);
+    return true;
+}
+
+// Assignment dispatch mirrors call dispatch: intrinsic ASP properties first,
+// then dotted/default object members, arrays, class properties, and finally a
+// lexical identifier. Session/Application writes also mark persistence dirty.
+func evaluator_calls_assign_target(evaluator: Evaluator, program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, scope: asp.vm.Scope, name: String, arg_ids: collections.Vector<Int>, value: asp.runtime.Variant, is_set: Bool) -> Void {
+    _ = is_set;
+    if strings.equal_fold_ascii(name, "Session") && arg_ids.len() >= 1 {
+        _ = ctx.session.set(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string(), value);
+        ctx.session_dirty = true;
+        return;
+    }
+    if strings.equal_fold_ascii(name, "Application") && arg_ids.len() >= 1 {
+        _ = ctx.application.set(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string(), value);
+        ctx.application_dirty = true;
+        return;
+    }
+    if strings.equal_fold_ascii(name, "Session.Timeout") {
+        ctx.session_timeout_minutes = variant_to_int(value);
+        ctx.session_dirty = true;
+        return;
+    }
+    if strings.equal_fold_ascii(name, "Server.ScriptTimeout") {
+        ctx.script_timeout_seconds = variant_to_int(value);
+        return;
+    }
+    if (strings.equal_fold_ascii(name, "Response.Cookies") || strings.equal_fold_ascii(name, "Response.Cookies.Item")) && arg_ids.len() >= 1 {
+        ctx.response.set_cookie(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string(), value.to_output_string());
+        return;
+    }
+    if strings.equal_fold_ascii(name, "Response.Cookies.Expires") && arg_ids.len() >= 1 {
+        let cookie_name: String = evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string();
+        let expires: String = value.kind == asp.runtime.VariantDate ? eg_vbs_format_date(value.date_value, 3) : value.to_output_string();
+        ctx.response.set_cookie_expires(cookie_name, expires);
+        return;
+    }
+    if strings.equal_fold_ascii(name, "Response.Cookies.Path") && arg_ids.len() >= 1 {
+        ctx.response.set_cookie_path(evaluator.eval_expr_in_scope(program, ctx, scope, arg_ids.get(0)).to_output_string(), value.to_output_string());
+        return;
+    }
+    if strings.equal_fold_ascii(name, "Response.ContentType") {
+        let content_type_value: String = value.to_output_string();
+        ctx.response.content_type = content_type_value;
+        return;
+    }
+    if strings.equal_fold_ascii(name, "Response.Charset") {
+        let charset_value: String = value.to_output_string();
+        ctx.response.charset = charset_value;
+        return;
+    }
+    if strings.equal_fold_ascii(name, "Response.CacheControl") {
+        let cache_control: String = value.to_output_string();
+        _ = ctx.response.add_header("Cache-Control", strings.equal_fold_ascii(cache_control, "no-cache") ? "no-store, no-cache, must-revalidate" : cache_control);
+        return;
+    }
+    if strings.equal_fold_ascii(name, "Response.Expires") {
+        _ = ctx.response.add_header("Expires", variant_to_int(value) < 0 ? "0" : value.to_output_string());
+        return;
+    }
+    if strings.equal_fold_ascii(name, "Response.ExpiresAbsolute") {
+        _ = ctx.response.add_header("Expires", value.kind == asp.runtime.VariantDate ? eg_vbs_format_date(value.date_value, 3) : value.to_output_string());
+        return;
+    }
+    if strings.equal_fold_ascii(name, "Response.Buffer") {
+        ctx.response.buffer_enabled = value.is_truthy();
+        return;
+    }
+    if strings.equal_fold_ascii(name, "Response.Status") {
+        ctx.response.set_status(value.to_output_string());
+        return;
+    }
+    let dot: Int = member_name_dot(name);
+    if dot >= 0 {
+        let target: asp.runtime.Variant = evaluator.resolve_identifier(ctx, scope, member_name_left(name, dot), program);
+        if target.kind == asp.runtime.VariantObject {
+            _ = evaluator.invoke_object(program, ctx, scope, target, member_name_right(name, dot), arg_ids, true, value);
+            return;
+        }
+    }
+    if arg_ids.len() >= 1 {
+        if evaluator.identifier_is_array(ctx, scope, name) {
+            let index_values: collections.Vector<asp.runtime.Variant> = evaluator.eval_arg_values(program, ctx, scope, arg_ids);
+            let assigned: Bool = evaluator.assign_identifier_array_indexed_in_place(ctx, scope, name, index_values, value);
+            evaluator.release_arg_values(index_values);
+            if assigned {
+                return;
+            }
+        }
+        let target: asp.runtime.Variant = evaluator.resolve_identifier(ctx, scope, name, program);
+        if target.kind == asp.runtime.VariantObject {
+            _ = evaluator.invoke_object(program, ctx, scope, target, "", arg_ids, true, value);
+            return;
+        }
+        if target.kind == asp.runtime.VariantArray {
+            let index_values: collections.Vector<asp.runtime.Variant> = evaluator.eval_arg_values(program, ctx, scope, arg_ids);
+            let result: asp.runtime.Variant = evaluator.invoke_array_values(ctx, target, index_values, true, value);
+            evaluator.release_arg_values(index_values);
+            evaluator.assign_identifier(ctx, scope, name, result);
+            return;
+        }
+    }
+    if arg_ids.len() == 0 && evaluator_calls_try_assign_bare_property(evaluator, program, ctx, scope, name, value) {
+        return;
+    }
+    evaluator.assign_identifier(ctx, scope, name, value);
+}
+
+// Pre-evaluated assignment twin used by bytecode. Keep property side effects
+// synchronized with assign_target whenever a host object gains a new member.
+func evaluator_calls_assign_target_values(evaluator: Evaluator, program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, scope: asp.vm.Scope, name: String, arg_values: collections.Vector<asp.runtime.Variant>, value: asp.runtime.Variant, is_set: Bool) -> Void {
+    _ = is_set;
+    if strings.equal_fold_ascii(name, "Session") && arg_values.len() >= 1 {
+        _ = ctx.session.set(arg_values.get(0).to_output_string(), value);
+        ctx.session_dirty = true;
+        return;
+    }
+    if strings.equal_fold_ascii(name, "Application") && arg_values.len() >= 1 {
+        _ = ctx.application.set(arg_values.get(0).to_output_string(), value);
+        ctx.application_dirty = true;
+        return;
+    }
+    if strings.equal_fold_ascii(name, "Session.Timeout") {
+        ctx.session_timeout_minutes = variant_to_int(value);
+        ctx.session_dirty = true;
+        return;
+    }
+    if strings.equal_fold_ascii(name, "Server.ScriptTimeout") {
+        ctx.script_timeout_seconds = variant_to_int(value);
+        return;
+    }
+    if (strings.equal_fold_ascii(name, "Response.Cookies") || strings.equal_fold_ascii(name, "Response.Cookies.Item")) && arg_values.len() >= 1 {
+        ctx.response.set_cookie(arg_values.get(0).to_output_string(), value.to_output_string());
+        return;
+    }
+    if strings.equal_fold_ascii(name, "Response.Cookies.Expires") && arg_values.len() >= 1 {
+        let expires: String = value.kind == asp.runtime.VariantDate ? eg_vbs_format_date(value.date_value, 3) : value.to_output_string();
+        ctx.response.set_cookie_expires(arg_values.get(0).to_output_string(), expires);
+        return;
+    }
+    if strings.equal_fold_ascii(name, "Response.Cookies.Path") && arg_values.len() >= 1 {
+        ctx.response.set_cookie_path(arg_values.get(0).to_output_string(), value.to_output_string());
+        return;
+    }
+    if strings.equal_fold_ascii(name, "Response.ContentType") {
+        let content_type_value: String = value.to_output_string();
+        ctx.response.content_type = content_type_value;
+        return;
+    }
+    if strings.equal_fold_ascii(name, "Response.Charset") {
+        let charset_value: String = value.to_output_string();
+        ctx.response.charset = charset_value;
+        return;
+    }
+    if strings.equal_fold_ascii(name, "Response.CacheControl") {
+        let cache_control: String = value.to_output_string();
+        _ = ctx.response.add_header("Cache-Control", strings.equal_fold_ascii(cache_control, "no-cache") ? "no-store, no-cache, must-revalidate" : cache_control);
+        return;
+    }
+    if strings.equal_fold_ascii(name, "Response.Expires") {
+        _ = ctx.response.add_header("Expires", variant_to_int(value) < 0 ? "0" : value.to_output_string());
+        return;
+    }
+    if strings.equal_fold_ascii(name, "Response.ExpiresAbsolute") {
+        _ = ctx.response.add_header("Expires", value.kind == asp.runtime.VariantDate ? eg_vbs_format_date(value.date_value, 3) : value.to_output_string());
+        return;
+    }
+    if strings.equal_fold_ascii(name, "Response.Buffer") {
+        ctx.response.buffer_enabled = value.is_truthy();
+        return;
+    }
+    if strings.equal_fold_ascii(name, "Response.Status") {
+        ctx.response.set_status(value.to_output_string());
+        return;
+    }
+    let dot: Int = member_name_dot(name);
+    if dot >= 0 {
+        let target: asp.runtime.Variant = evaluator.resolve_identifier(ctx, scope, member_name_left(name, dot), program);
+        if target.kind == asp.runtime.VariantObject {
+            _ = evaluator.invoke_object_values(program, ctx, scope, target, member_name_right(name, dot), arg_values, true, value);
+            return;
+        }
+    }
+    if arg_values.len() >= 1 {
+        if evaluator.assign_identifier_array_indexed_in_place(ctx, scope, name, arg_values, value) {
+            return;
+        }
+        let target: asp.runtime.Variant = evaluator.resolve_identifier(ctx, scope, name, program);
+        if target.kind == asp.runtime.VariantObject {
+            _ = evaluator.invoke_object_values(program, ctx, scope, target, "", arg_values, true, value);
+            return;
+        }
+        if target.kind == asp.runtime.VariantArray {
+            let updated_array: asp.runtime.Variant = evaluator.invoke_array_values(ctx, target, arg_values, true, value);
+            evaluator.assign_identifier(ctx, scope, name, updated_array);
+            return;
+        }
+    }
+    if arg_values.len() == 0 && evaluator_calls_try_assign_bare_property(evaluator, program, ctx, scope, name, value) {
+        return;
+    }
+    evaluator.assign_identifier(ctx, scope, name, value);
+}
+
+func evaluator_calls_copyback_base_value(evaluator: Evaluator, ctx: asp.runtime.RequestContext, scope: asp.vm.Scope, name: String) -> asp.runtime.Variant {
+    let current_scope: asp.vm.Scope = scope;
+    loop true {
+        if current_scope.vars.has(name) {
+            return current_scope.vars.get_or_empty(name);
+        }
+        if evaluator.has_me_field(ctx, current_scope, name) {
+            return evaluator.get_me_field(ctx, current_scope, name);
+        }
+        if !current_scope.has_parent {
+            break;
+        }
+        current_scope = current_scope.parent;
+    }
+    return ctx.locals.get_or_empty(name);
+}
+
+// Accept only true l-values for ByRef copyback. Constants and routine names are
+// rejected; indexed Session/Application values and arrays are writable.
+func evaluator_calls_expr_supports_copyback(evaluator: Evaluator, program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, scope: asp.vm.Scope, expr_id: Int) -> Bool {
+    if expr_id < 0 || expr_id >= program.runtime_expr_count() {
+        return false;
+    }
+    let expr_node: asp.compiler.VbsExprNode = program.get_expr(expr_id);
+    let expr_kind: asp.compiler.VbsExprKind = expr_node.kind;
+    let expr_text: String = expr_node.text;
+    let expr_left_id: Int = expr_node.left_id;
+    if expr_kind == asp.compiler.VbsExprIdentifier {
+        // Statement-call arguments such as `object.ReadOnlyProperty` are kept
+        // as dotted identifiers. They may be read as ByRef values, but a
+        // getter-only property is not a legal copyback target. Public fields
+        // remain writable through the object's store, and Property Let/Set
+        // routines remain writable through their non-function member.
+        let dot: Int = member_name_dot(expr_text);
+        if dot >= 0 {
+            let target: asp.runtime.Variant = evaluator.resolve_identifier(
+                ctx, scope, member_name_left(expr_text, dot), program
+            );
+            if target.kind == asp.runtime.VariantObject {
+                let object_value: asp.vm.RuntimeObject = evaluator.get_object(ctx, target.object_value);
+                if object_value.kind == asp.vm.RuntimeObjectUserClass {
+                    let member: String = member_name_right(expr_text, dot);
+                    if object_value.store.has(member) {
+                        return true;
+                    }
+                    return evaluator.find_routine_by_function_kind(
+                        program, member, object_value.class_name, false
+                    ) >= 0;
+                }
+            }
+        }
+        let current_scope: asp.vm.Scope = scope;
+        let depth: Int = 0;
+        let has_binding: Bool = false;
+        loop true {
+            if current_scope.has_const(expr_text) {
+                return false;
+            }
+            if current_scope.vars.has(expr_text) || evaluator.has_me_field(ctx, current_scope, expr_text) {
+                has_binding = true;
+            }
+            if !current_scope.has_parent {
+                break;
+            }
+            current_scope = current_scope.parent;
+            depth += 1;
+        }
+        if !has_binding && !ctx.locals.has(expr_text) {
+            if evaluator.find_routine(program, expr_text, scope.me_class_name) >= 0 || evaluator.find_routine(program, expr_text) >= 0 {
+                return false;
+            }
+        }
+        return true;
+    }
+    if expr_kind == asp.compiler.VbsExprCall {
+        if expr_left_id >= 0 {
+            let left_expr: asp.compiler.VbsExprNode = program.get_expr(expr_left_id);
+            let left_kind: asp.compiler.VbsExprKind = left_expr.kind;
+            let left_text: String = left_expr.text;
+            if left_kind != asp.compiler.VbsExprIdentifier || std.len(expr_text) != 0 {
+                return false;
+            }
+            if strings.equal_fold_ascii(left_text, "Session") || strings.equal_fold_ascii(left_text, "Application") {
+                return true;
+            }
+            let base_value: asp.runtime.Variant = evaluator_calls_copyback_base_value(evaluator, ctx, scope, left_text);
+            return base_value.kind == asp.runtime.VariantArray;
+        }
+        if strings.equal_fold_ascii(expr_text, "Session") || strings.equal_fold_ascii(expr_text, "Application") {
+            return true;
+        }
+        let base_value: asp.runtime.Variant = evaluator_calls_copyback_base_value(evaluator, ctx, scope, expr_text);
+        return base_value.kind == asp.runtime.VariantArray;
+    }
+    return false;
+}
+
+// Assign through an AST l-value, recursively rebuilding array parents when
+// copy-on-write returns a detached child.
+func evaluator_calls_assign_target_expr(evaluator: Evaluator, program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, scope: asp.vm.Scope, expr_id: Int, value: asp.runtime.Variant, is_set: Bool) -> Void {
+    if expr_id < 0 || expr_id >= program.runtime_expr_count() {
+        evaluator.raise_runtime_error(ctx, 438, "invalid assignment target", "VBScript");
+        return;
+    }
+    let expr: asp.compiler.VbsExprNode = program.get_expr(expr_id);
+    if expr.kind == asp.compiler.VbsExprIdentifier {
+        evaluator.assign_target(program, ctx, scope, expr.text, new collections.Vector<Int>(), value, is_set);
+        return;
+    }
+    if expr.kind == asp.compiler.VbsExprCall {
+        if evaluator_calls_is_response_cookies_expr(program, expr) && expr.arg_ids.len() >= 1 {
+            ctx.response.set_cookie(evaluator.eval_expr_in_scope(program, ctx, scope, expr.arg_ids.get(0)).to_output_string(), value.to_output_string());
+            return;
+        }
+        if expr.left_id >= 0 {
+            let left_expr: asp.compiler.VbsExprNode = program.get_expr(expr.left_id);
+            if left_expr.kind == asp.compiler.VbsExprIdentifier && std.len(expr.text) == 0 {
+                evaluator.assign_target(program, ctx, scope, left_expr.text, expr.arg_ids, value, is_set);
+                return;
+            }
+            if evaluator_calls_is_response_cookies_expr(program, left_expr) && strings.equal_fold_ascii(expr.text, "Expires") && left_expr.arg_ids.len() >= 1 {
+                let cookie_name: String = evaluator.eval_expr_in_scope(program, ctx, scope, left_expr.arg_ids.get(0)).to_output_string();
+                let expires: String = value.kind == asp.runtime.VariantDate ? eg_vbs_format_date(value.date_value, 3) : value.to_output_string();
+                ctx.response.set_cookie_expires(cookie_name, expires);
+                return;
+            }
+            if evaluator_calls_is_response_cookies_expr(program, left_expr) && strings.equal_fold_ascii(expr.text, "Path") && left_expr.arg_ids.len() >= 1 {
+                ctx.response.set_cookie_path(evaluator.eval_expr_in_scope(program, ctx, scope, left_expr.arg_ids.get(0)).to_output_string(), value.to_output_string());
+                return;
+            }
+            let target: asp.runtime.Variant = evaluator.eval_expr_in_scope(program, ctx, scope, expr.left_id);
+            if target.kind == asp.runtime.VariantObject {
+                _ = evaluator.invoke_object(program, ctx, scope, target, expr.text, expr.arg_ids, true, value);
+                return;
+            }
+            if target.kind == asp.runtime.VariantArray && std.len(expr.text) == 0 {
+                evaluator.assign_target_expr(program, ctx, scope, expr.left_id, evaluator.invoke_array(program, ctx, scope, target, expr.arg_ids, true, value), is_set);
+                return;
+            }
+            evaluator.raise_runtime_error(ctx, 438, "assignment target is not an object", "VBScript");
+            return;
+        }
+        evaluator.assign_target(program, ctx, scope, expr.text, expr.arg_ids, value, is_set);
+        return;
+    }
+    evaluator.raise_runtime_error(ctx, 438, "unsupported assignment target", "VBScript");
+}
+
+// VM variant of AST assignment. base_value and arg_values are captured before
+// the call so side effects are not evaluated twice during ByRef copyback.
+func evaluator_calls_assign_target_expr_values(evaluator: Evaluator, program: asp.compiler.VbsProgram, ctx: asp.runtime.RequestContext, scope: asp.vm.Scope, expr_id: Int, base_value: asp.runtime.Variant, arg_values: collections.Vector<asp.runtime.Variant>, value: asp.runtime.Variant, is_set: Bool) -> Void {
+    if expr_id < 0 || expr_id >= program.runtime_expr_count() {
+        evaluator.raise_runtime_error(ctx, 438, "invalid assignment target", "VBScript");
+        return;
+    }
+    let expr: asp.compiler.VbsExprNode = program.get_expr(expr_id);
+    if expr.kind == asp.compiler.VbsExprIdentifier {
+        evaluator.assign_target_values(program, ctx, scope, expr.text, new collections.Vector<asp.runtime.Variant>(), value, is_set);
+        return;
+    }
+    if expr.kind == asp.compiler.VbsExprCall {
+        if evaluator_calls_is_response_cookies_expr(program, expr) && arg_values.len() >= 1 {
+            ctx.response.set_cookie(arg_values.get(0).to_output_string(), value.to_output_string());
+            return;
+        }
+        if expr.left_id >= 0 {
+            let left_expr: asp.compiler.VbsExprNode = program.get_expr(expr.left_id);
+            if left_expr.kind == asp.compiler.VbsExprIdentifier && std.len(expr.text) == 0 {
+                if base_value.kind == asp.runtime.VariantObject {
+                    _ = evaluator.invoke_object_values(program, ctx, scope, base_value, "", arg_values, true, value);
+                    return;
+                }
+                if base_value.kind == asp.runtime.VariantArray {
+                    evaluator.assign_identifier(ctx, scope, left_expr.text, evaluator.invoke_array_values(ctx, base_value, arg_values, true, value));
+                    return;
+                }
+                evaluator.assign_target_values(program, ctx, scope, left_expr.text, arg_values, value, is_set);
+                return;
+            }
+            if evaluator_calls_is_response_cookies_expr(program, left_expr) && strings.equal_fold_ascii(expr.text, "Expires") && left_expr.arg_ids.len() >= 1 {
+                let cookie_name: String = evaluator.eval_expr_in_scope(program, ctx, scope, left_expr.arg_ids.get(0)).to_output_string();
+                let expires: String = value.kind == asp.runtime.VariantDate ? eg_vbs_format_date(value.date_value, 3) : value.to_output_string();
+                ctx.response.set_cookie_expires(cookie_name, expires);
+                return;
+            }
+            if evaluator_calls_is_response_cookies_expr(program, left_expr) && strings.equal_fold_ascii(expr.text, "Path") && left_expr.arg_ids.len() >= 1 {
+                ctx.response.set_cookie_path(evaluator.eval_expr_in_scope(program, ctx, scope, left_expr.arg_ids.get(0)).to_output_string(), value.to_output_string());
+                return;
+            }
+            if base_value.kind == asp.runtime.VariantObject {
+                _ = evaluator.invoke_object_values(program, ctx, scope, base_value, expr.text, arg_values, true, value);
+                return;
+            }
+        } else {
+            evaluator.assign_target_values(program, ctx, scope, expr.text, arg_values, value, is_set);
+            return;
+        }
+    }
+    evaluator.assign_target_expr(program, ctx, scope, expr_id, value, is_set);
+}

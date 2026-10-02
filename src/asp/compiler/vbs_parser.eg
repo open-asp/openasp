@@ -1,0 +1,1729 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.compiler;
+
+use asp.runtime;
+
+use asp;
+use std;
+use strings;
+use strconv;
+use collections;
+
+extern func __gc_keepalive(obj: Any) -> Void;
+extern func eg_gc_preempt_guard_enter() -> Void;
+extern func eg_gc_preempt_guard_leave() -> Void;
+extern func eg_vbs_parse_date(text: String) -> Int;
+
+// VBScript octal literals use `&nnn` with an optional trailing type marker.
+// Parse manually because the standard converter does not accept that grammar.
+func vbs_parse_octal_int(text: String) -> Int {
+    let value: Int = 0;
+    let i: Int = 1;
+    let end: Int = std.len(text) > 1 && std.byte_at(text, std.len(text) - 1) == '&' ? std.len(text) - 1 : std.len(text);
+    loop i < end {
+        value = value * 8 + std.byte_at(text, i) - '0';
+        i += 1;
+    }
+    return value;
+}
+
+// Recursive-descent VBScript parser.
+//
+// `tokens` and `pos` form the cursor. `line` follows the last consumed token
+// for diagnostics. `with_targets` is a stack because nested With blocks rewrite
+// leading-dot expressions. `pending_stmt_ids` temporarily owns statements
+// parsed while constructing class initializers. All AST references are integer
+// IDs into VbsProgram tables so growing vectors cannot invalidate references.
+class VbsParser {
+    var tokens: collections.Vector<VbsToken>;
+    var pos: Int;
+    var stop_at_then: Bool;
+    var stop_at_comma: Bool;
+    var stop_at_separator: Bool;
+    var stop_at_keyword: String;
+    var with_names: collections.Vector<String>;
+    var with_counter: Int;
+    var pending_stmt_ids: collections.Vector<Int>;
+
+    func init(self: VbsParser) -> Void {
+        self.tokens = new collections.Vector<VbsToken>();
+        self.pos = 0;
+        self.stop_at_then = false;
+        self.stop_at_comma = false;
+        self.stop_at_separator = false;
+        self.stop_at_keyword = "";
+        self.with_names = new collections.Vector<String>();
+        self.with_counter = 0;
+        self.pending_stmt_ids = new collections.Vector<Int>();
+    }
+
+    // Cursor helpers never advance beyond EOF. `peek` returns the final token
+    // as a stable sentinel, which keeps lookahead callers branch-light.
+    func current(self: VbsParser) -> VbsToken {
+        return self.tokens.get(self.pos);
+    }
+
+    func peek(self: VbsParser, offset: Int) -> VbsToken {
+        let idx: Int = self.pos + offset;
+        if idx < 0 || idx >= self.tokens.len() {
+            return self.tokens.get(self.tokens.len() - 1);
+        }
+        return self.tokens.get(idx);
+    }
+
+    func advance(self: VbsParser) -> VbsToken {
+        let tok: VbsToken = self.current();
+        if self.pos + 1 < self.tokens.len() {
+            self.pos += 1;
+        }
+        return tok;
+    }
+
+    // Keyword checks are ASCII case-insensitive to match VBScript. Sequences
+    // are used for compound terminators such as `End If`.
+    func at_keyword(self: VbsParser, word: String) -> Bool {
+        return self.current().kind == VbsTokenIdentifier && strings.equal_fold_ascii(self.current().text, word);
+    }
+
+    func at_sequence(self: VbsParser, left: String, right: String) -> Bool {
+        return self.current().kind == VbsTokenIdentifier
+        && strings.equal_fold_ascii(self.current().text, left)
+        && self.peek(1).kind == VbsTokenIdentifier
+        && strings.equal_fold_ascii(self.peek(1).text, right);
+    }
+
+    // Newline and colon are equivalent statement separators after lexing.
+    func at_separator(self: VbsParser) -> Bool {
+        return self.current().kind == VbsTokenNewline || self.current().kind == VbsTokenColon;
+    }
+
+    func skip_separators(self: VbsParser) -> Void {
+        loop self.at_separator() {
+            _ = self.advance();
+        }
+    }
+
+    // Expression parsing stops at delimiters owned by the surrounding
+    // statement grammar. This prevents a call argument from consuming `Then`
+    // or another clause keyword.
+    func expr_should_stop(self: VbsParser) -> Bool {
+        if self.current().kind == VbsTokenEof || self.current().kind == VbsTokenRParen {
+            return true;
+        }
+        if self.stop_at_comma && self.current().kind == VbsTokenComma {
+            return true;
+        }
+        if self.stop_at_separator && self.at_separator() {
+            return true;
+        }
+        if self.stop_at_then && self.at_keyword("then") {
+            return true;
+        }
+        if std.len(self.stop_at_keyword) != 0 && self.at_keyword(self.stop_at_keyword) {
+            return true;
+        }
+        return false;
+    }
+
+    // AST construction helpers centralize name folding and qualified-call
+    // flattening, preserving one canonical representation for later binding.
+    func add_identifier_expr(self: VbsParser, program: VbsProgram, name: String) -> Int {
+        let expr: VbsExprNode = new VbsExprNode();
+        expr.kind = VbsExprIdentifier;
+        expr.text = name;
+        return program.add_expr(expr);
+    }
+
+    func flatten_call_target(self: VbsParser, program: VbsProgram, expr_id: Int) -> String {
+        if expr_id < 0 || expr_id >= program.exprs.len() {
+            return "";
+        }
+        let expr: VbsExprNode = deserialize_vbs_expr_node(serialize_vbs_expr_node(program.get_expr(expr_id)));
+        if expr.kind == VbsExprIdentifier {
+            return expr.text;
+        }
+        if expr.kind != VbsExprCall || std.len(expr.text) == 0 {
+            return "";
+        }
+        if expr.left_id < 0 {
+            return expr.text;
+        }
+        let left_name: String = self.flatten_call_target(program, expr.left_id);
+        if std.len(left_name) == 0 {
+            return "";
+        }
+        return left_name + "." + expr.text;
+    }
+
+    // Extends a primary expression with calls, indexes, and member accesses.
+    // VBScript uses the same parentheses for calls and default-member indexing;
+    // this stage records syntax only and leaves semantic dispatch to runtime.
+    func parse_postfix_call_chain(self: VbsParser, program: VbsProgram, base_expr_id: Int, first_call_name: String = "") -> Int {
+        let current_id: Int = base_expr_id;
+        let call_name: String = first_call_name;
+        loop self.current().kind == VbsTokenLParen || self.current().kind == VbsTokenDot {
+            if self.current().kind == VbsTokenDot && self.current().text == " ." && current_id != base_expr_id {
+                break;
+            }
+            if self.current().kind == VbsTokenDot {
+                _ = self.advance();
+                if self.current().kind != VbsTokenIdentifier {
+                    _ = program.add_error("expected member name after '.'");
+                    break;
+                }
+                let expr: VbsExprNode = new VbsExprNode();
+                expr.kind = VbsExprCall;
+                expr.left_id = current_id;
+                expr.text = self.advance().text;
+                if self.current().kind == VbsTokenLParen {
+                    _ = self.advance();
+                    if self.current().kind != VbsTokenRParen {
+                        loop true {
+                            eg_gc_preempt_guard_enter();
+                            let arg_id: Int = self.parse_arg_expr(program, true, false);
+                            _ = expr.arg_ids.push(arg_id);
+                            eg_gc_preempt_guard_leave();
+                            if self.current().kind == VbsTokenComma {
+                                _ = self.advance();
+                                skip;
+                            }
+                            break;
+                        }
+                    }
+                    if self.current().kind == VbsTokenRParen {
+                        _ = self.advance();
+                    } else {
+                        _ = program.add_error("line " + strconv.itoa(self.current().line) + ": expected ')' after member call before token: " + self.current().text);
+                    }
+                }
+                current_id = program.add_expr(expr);
+                skip;
+            }
+            let expr: VbsExprNode = new VbsExprNode();
+            expr.kind = VbsExprCall;
+            if std.len(call_name) != 0 {
+                expr.text = call_name;
+                call_name = "";
+            } else {
+                expr.left_id = current_id;
+            }
+            _ = self.advance();
+            if self.current().kind != VbsTokenRParen {
+                loop true {
+                    eg_gc_preempt_guard_enter();
+                    let arg_id: Int = self.parse_arg_expr(program, true, false);
+                    _ = expr.arg_ids.push(arg_id);
+                    eg_gc_preempt_guard_leave();
+                    if self.current().kind == VbsTokenComma {
+                        _ = self.advance();
+                        skip;
+                    }
+                    break;
+                }
+            }
+            if self.current().kind == VbsTokenRParen {
+                _ = self.advance();
+            } else {
+                _ = program.add_error("line " + strconv.itoa(self.current().line) + ": expected ')' after call before token: " + self.current().text);
+            }
+            current_id = program.add_expr(expr);
+        }
+        return current_id;
+    }
+
+    // Parses one argument with caller-provided terminators. The temporary stop
+    // settings are restored before return so nested calls cannot leak grammar
+    // state into the enclosing expression.
+    func parse_arg_expr(self: VbsParser, program: VbsProgram, stop_at_comma: Bool, stop_at_separator: Bool, stop_word: String = "") -> Int {
+        let saved_comma: Bool = self.stop_at_comma;
+        let saved_separator: Bool = self.stop_at_separator;
+        let saved_word: String = self.stop_at_keyword;
+        self.stop_at_comma = stop_at_comma;
+        self.stop_at_separator = stop_at_separator;
+        self.stop_at_keyword = stop_word;
+        let expr_id: Int = self.parse_expr(program);
+        self.stop_at_comma = saved_comma;
+        self.stop_at_separator = saved_separator;
+        self.stop_at_keyword = saved_word;
+        return expr_id;
+    }
+
+    // Recognizes literals, identifiers, parenthesized expressions, `New`, and
+    // With-leading members. A returned ID always belongs to `program`.
+    func parse_primary(self: VbsParser, program: VbsProgram) -> Int {
+        if self.expr_should_stop() {
+            return program.add_expr(new VbsExprNode());
+        }
+        if self.current().kind == VbsTokenString {
+            let expr: VbsExprNode = new VbsExprNode();
+            expr.kind = VbsExprString;
+            expr.text = self.advance().text;
+            return program.add_expr(expr);
+        }
+        if self.current().kind == VbsTokenFloat {
+            let expr: VbsExprNode = new VbsExprNode();
+            expr.kind = VbsExprFloat;
+            expr.text = self.advance().text;
+            return program.add_expr(expr);
+        }
+        if self.current().kind == VbsTokenDate {
+            let expr: VbsExprNode = new VbsExprNode();
+            expr.kind = VbsExprDate;
+            expr.int_value = eg_vbs_parse_date(self.advance().text);
+            return program.add_expr(expr);
+        }
+        if self.current().kind == VbsTokenInteger {
+            let expr: VbsExprNode = new VbsExprNode();
+            expr.kind = VbsExprInteger;
+            let raw: String = self.advance().text;
+            let raw_end: Int = std.len(raw) > 0 && std.byte_at(raw, std.len(raw) - 1) == '&' ? std.len(raw) - 1 : std.len(raw);
+            expr.int_value = strings.starts_with(raw, "&H") || strings.starts_with(raw, "&h")
+                ? strings.parse_hex_int(std.substr(raw, 2, raw_end - 2))
+                : (std.len(raw) > 0 && std.byte_at(raw, 0) == '&' ? vbs_parse_octal_int(raw) : strconv.atoi(raw));
+            return program.add_expr(expr);
+        }
+        if self.current().kind == VbsTokenDot && self.with_names.len() > 0 {
+            let with_name: String = self.with_names.get(self.with_names.len() - 1);
+            return self.parse_postfix_call_chain(program, self.add_identifier_expr(program, with_name));
+        }
+        if self.current().kind == VbsTokenIdentifier {
+            let name: String = self.advance().text;
+            if strings.equal_fold_ascii(name, "true") || strings.equal_fold_ascii(name, "false") {
+                let expr: VbsExprNode = new VbsExprNode();
+                expr.kind = VbsExprBool;
+                expr.bool_value = strings.equal_fold_ascii(name, "true");
+                return self.parse_postfix_call_chain(program, program.add_expr(expr));
+            }
+            if strings.equal_fold_ascii(name, "nothing") {
+                let expr: VbsExprNode = new VbsExprNode();
+                expr.kind = VbsExprNothing;
+                return self.parse_postfix_call_chain(program, program.add_expr(expr));
+            }
+            if strings.equal_fold_ascii(name, "new") {
+                let expr: VbsExprNode = new VbsExprNode();
+                expr.kind = VbsExprNew;
+                if self.current().kind == VbsTokenIdentifier {
+                    expr.text = self.advance().text;
+                } else {
+                    _ = program.add_error("expected class name after New");
+                }
+                return self.parse_postfix_call_chain(program, program.add_expr(expr));
+            }
+            return self.parse_postfix_call_chain(program, self.add_identifier_expr(program, name), name);
+        }
+        if self.current().kind == VbsTokenLParen {
+            _ = self.advance();
+            let expr_id: Int = self.parse_expr(program);
+            if self.current().kind == VbsTokenRParen {
+                _ = self.advance();
+            } else {
+                _ = program.add_error("line " + strconv.itoa(self.current().line) + ": expected ')' before token: " + self.current().text);
+            }
+            return self.parse_postfix_call_chain(program, expr_id);
+        }
+        _ = program.add_error("line " + strconv.itoa(self.current().line) + ": unexpected token in expression: " + self.current().text);
+        _ = self.advance();
+        return program.add_expr(new VbsExprNode());
+    }
+
+    // The following methods are one precedence level each. They intentionally
+    // mirror VBScript's non-C ordering: exponentiation binds around unary
+    // operators, concatenation is separate from addition, and logical
+    // Not/And/Xor/Or/Eqv/Imp are successively weaker.
+    func parse_unary(self: VbsParser, program: VbsProgram) -> Int {
+        if self.current().kind == VbsTokenMinus {
+            _ = self.advance();
+            let expr: VbsExprNode = new VbsExprNode();
+            expr.kind = VbsExprNeg;
+            expr.left_id = self.parse_unary(program);
+            return program.add_expr(expr);
+        }
+        if self.current().kind == VbsTokenPlus {
+            _ = self.advance();
+            return self.parse_unary(program);
+        }
+        return self.parse_power(program);
+    }
+
+    func parse_power(self: VbsParser, program: VbsProgram) -> Int {
+        let left_id: Int = self.parse_primary(program);
+        if !self.expr_should_stop() && self.current().kind == VbsTokenCaret {
+            _ = self.advance();
+            let expr: VbsExprNode = new VbsExprNode();
+            expr.kind = VbsExprPow;
+            expr.left_id = left_id;
+            expr.right_id = self.parse_unary(program);
+            return program.add_expr(expr);
+        }
+        return left_id;
+    }
+
+    func parse_mul(self: VbsParser, program: VbsProgram) -> Int {
+        let left_id: Int = self.parse_unary(program);
+        loop !self.expr_should_stop() && (self.current().kind == VbsTokenStar || self.current().kind == VbsTokenSlash || self.current().kind == VbsTokenBackslash || (self.current().kind == VbsTokenIdentifier && strings.equal_fold_ascii(self.current().text, "mod"))) {
+            let op_tok: VbsToken = self.advance();
+            let expr: VbsExprNode = new VbsExprNode();
+            expr.kind = op_tok.kind == VbsTokenStar ? VbsExprMul : (op_tok.kind == VbsTokenBackslash ? VbsExprIntDiv : (op_tok.kind == VbsTokenIdentifier ? VbsExprMod : VbsExprDiv));
+            expr.left_id = left_id;
+            expr.right_id = self.parse_unary(program);
+            let next_id: Int = program.add_expr(expr);
+            left_id = next_id;
+        }
+        return left_id;
+    }
+
+    func parse_add(self: VbsParser, program: VbsProgram) -> Int {
+        let left_id: Int = self.parse_mul(program);
+        loop !self.expr_should_stop() && (self.current().kind == VbsTokenPlus || self.current().kind == VbsTokenMinus) {
+            let op: VbsTokenKind = self.advance().kind;
+            let expr: VbsExprNode = new VbsExprNode();
+            expr.kind = op == VbsTokenPlus ? VbsExprAdd : VbsExprSub;
+            expr.left_id = left_id;
+            expr.right_id = self.parse_mul(program);
+            let next_id: Int = program.add_expr(expr);
+            left_id = next_id;
+        }
+        return left_id;
+    }
+
+    func parse_concat(self: VbsParser, program: VbsProgram) -> Int {
+        let left_id: Int = self.parse_add(program);
+        loop !self.expr_should_stop() && self.current().kind == VbsTokenAmp {
+            _ = self.advance();
+            let expr: VbsExprNode = new VbsExprNode();
+            expr.kind = VbsExprConcat;
+            expr.left_id = left_id;
+            expr.right_id = self.parse_add(program);
+            let next_id: Int = program.add_expr(expr);
+            left_id = next_id;
+        }
+        return left_id;
+    }
+
+    func parse_compare(self: VbsParser, program: VbsProgram) -> Int {
+        let left_id: Int = self.parse_concat(program);
+        loop !self.expr_should_stop() {
+            let kind: VbsExprKind = VbsExprEmpty;
+            if self.current().kind == VbsTokenEq {
+                kind = VbsExprEq;
+            } else if self.current().kind == VbsTokenNe {
+                kind = VbsExprNe;
+            } else if self.current().kind == VbsTokenLess {
+                kind = VbsExprLt;
+            } else if self.current().kind == VbsTokenLe {
+                kind = VbsExprLe;
+            } else if self.current().kind == VbsTokenGreater {
+                kind = VbsExprGt;
+            } else if self.current().kind == VbsTokenGe {
+                kind = VbsExprGe;
+            } else if self.current().kind == VbsTokenIdentifier && strings.equal_fold_ascii(self.current().text, "is") {
+                kind = VbsExprIs;
+            } else {
+                break;
+            }
+            _ = self.advance();
+            let expr: VbsExprNode = new VbsExprNode();
+            expr.kind = kind;
+            expr.left_id = left_id;
+            if kind == VbsExprIs && self.at_keyword("not") {
+                // "Is Not" negates object identity, not the right operand.
+                _ = self.advance();
+                expr.right_id = self.parse_concat(program);
+                let is_id: Int = program.add_expr(expr);
+                let not_expr: VbsExprNode = new VbsExprNode();
+                not_expr.kind = VbsExprNot;
+                not_expr.left_id = is_id;
+                left_id = program.add_expr(not_expr);
+            } else {
+                expr.right_id = self.parse_concat(program);
+                left_id = program.add_expr(expr);
+            }
+        }
+        return left_id;
+    }
+
+    func parse_not(self: VbsParser, program: VbsProgram) -> Int {
+        if self.current().kind == VbsTokenIdentifier && strings.equal_fold_ascii(self.current().text, "not") {
+            _ = self.advance();
+            let expr: VbsExprNode = new VbsExprNode();
+            expr.kind = VbsExprNot;
+            expr.left_id = self.parse_not(program);
+            return program.add_expr(expr);
+        }
+        return self.parse_compare(program);
+    }
+
+    func parse_bit_and(self: VbsParser, program: VbsProgram) -> Int {
+        let left_id: Int = self.parse_not(program);
+        loop !self.expr_should_stop() && self.current().kind == VbsTokenIdentifier && strings.equal_fold_ascii(self.current().text, "and") {
+            _ = self.advance();
+            let expr: VbsExprNode = new VbsExprNode();
+            expr.kind = VbsExprAnd;
+            expr.left_id = left_id;
+            expr.right_id = self.parse_not(program);
+            let next_id: Int = program.add_expr(expr);
+            left_id = next_id;
+        }
+        return left_id;
+    }
+
+    func parse_bit_xor(self: VbsParser, program: VbsProgram) -> Int {
+        let left_id: Int = self.parse_bit_and(program);
+        loop !self.expr_should_stop() && self.current().kind == VbsTokenIdentifier && strings.equal_fold_ascii(self.current().text, "xor") {
+            _ = self.advance();
+            let expr: VbsExprNode = new VbsExprNode();
+            expr.kind = VbsExprXor;
+            expr.left_id = left_id;
+            expr.right_id = self.parse_bit_and(program);
+            let next_id: Int = program.add_expr(expr);
+            left_id = next_id;
+        }
+        return left_id;
+    }
+
+    func parse_bit_or(self: VbsParser, program: VbsProgram) -> Int {
+        let left_id: Int = self.parse_bit_xor(program);
+        loop !self.expr_should_stop() && self.current().kind == VbsTokenIdentifier && strings.equal_fold_ascii(self.current().text, "or") {
+            _ = self.advance();
+            let expr: VbsExprNode = new VbsExprNode();
+            expr.kind = VbsExprOr;
+            expr.left_id = left_id;
+            expr.right_id = self.parse_bit_xor(program);
+            let next_id: Int = program.add_expr(expr);
+            left_id = next_id;
+        }
+        return left_id;
+    }
+
+    func parse_eqv(self: VbsParser, program: VbsProgram) -> Int {
+        let left_id: Int = self.parse_bit_or(program);
+        loop !self.expr_should_stop() && self.at_keyword("eqv") {
+            _ = self.advance();
+            let xor_expr: VbsExprNode = new VbsExprNode();
+            xor_expr.kind = VbsExprXor;
+            xor_expr.left_id = left_id;
+            xor_expr.right_id = self.parse_bit_or(program);
+            let not_expr: VbsExprNode = new VbsExprNode();
+            not_expr.kind = VbsExprNot;
+            not_expr.left_id = program.add_expr(xor_expr);
+            left_id = program.add_expr(not_expr);
+        }
+        return left_id;
+    }
+
+    func parse_imp(self: VbsParser, program: VbsProgram) -> Int {
+        let left_id: Int = self.parse_eqv(program);
+        loop !self.expr_should_stop() && self.at_keyword("imp") {
+            _ = self.advance();
+            let not_expr: VbsExprNode = new VbsExprNode();
+            not_expr.kind = VbsExprNot;
+            not_expr.left_id = left_id;
+            let or_expr: VbsExprNode = new VbsExprNode();
+            or_expr.kind = VbsExprOr;
+            or_expr.left_id = program.add_expr(not_expr);
+            or_expr.right_id = self.parse_eqv(program);
+            left_id = program.add_expr(or_expr);
+        }
+        return left_id;
+    }
+
+    func parse_expr(self: VbsParser, program: VbsProgram) -> Int {
+        return self.parse_imp(program);
+    }
+
+    // Declaration readers normalize names but retain array-bound expressions
+    // as AST IDs. Bounds may depend on runtime values and cannot be folded here.
+    func parse_name_list(self: VbsParser) -> collections.Vector<String> {
+        let names: collections.Vector<String> = new collections.Vector<String>();
+        loop self.current().kind == VbsTokenIdentifier {
+            _ = names.push(self.advance().text);
+            if self.current().kind == VbsTokenComma {
+                _ = self.advance();
+                skip;
+            }
+            break;
+        }
+        return names;
+    }
+
+    func parse_decl_name_list(self: VbsParser) -> collections.Vector<String> {
+        let names: collections.Vector<String> = new collections.Vector<String>();
+        loop self.current().kind == VbsTokenIdentifier {
+            _ = names.push(self.advance().text);
+            if self.current().kind == VbsTokenLParen {
+                _ = self.advance();
+                loop self.current().kind != VbsTokenEof && self.current().kind != VbsTokenRParen {
+                    _ = self.advance();
+                }
+                if self.current().kind == VbsTokenRParen {
+                    _ = self.advance();
+                }
+            }
+            if self.current().kind == VbsTokenComma {
+                _ = self.advance();
+                skip;
+            }
+            break;
+        }
+        return names;
+    }
+
+    func parse_class_field_list(self: VbsParser, program: VbsProgram, cls: VbsClassDef) -> Void {
+        loop self.current().kind == VbsTokenIdentifier {
+            _ = cls.field_names.push(self.advance().text);
+            let bound_expr_ids: collections.Vector<Int> = new collections.Vector<Int>();
+            if self.current().kind == VbsTokenLParen {
+                _ = self.advance();
+                if self.current().kind != VbsTokenRParen {
+                    loop true {
+                        _ = bound_expr_ids.push(self.parse_arg_expr(program, true, true));
+                        if self.current().kind == VbsTokenComma {
+                            _ = self.advance();
+                            skip;
+                        }
+                        break;
+                    }
+                }
+                if self.current().kind == VbsTokenRParen {
+                    _ = self.advance();
+                } else {
+                    _ = program.add_error("expected ')' after class field array bound");
+                }
+            }
+            _ = cls.field_bound_expr_packs.push(pack_int_parts(bound_expr_ids));
+            if self.current().kind == VbsTokenComma {
+                _ = self.advance();
+                skip;
+            }
+            break;
+        }
+    }
+
+    // Parses call/index tails used by assignment and invocation statements.
+    // Keeping these helpers separate is important because VBScript permits
+    // parentheses in expression calls but has different statement-call rules.
+    func parse_target_tail(self: VbsParser, program: VbsProgram) -> collections.Vector<Int> {
+        let args: collections.Vector<Int> = new collections.Vector<Int>();
+        if self.current().kind == VbsTokenLParen {
+            _ = self.advance();
+            if self.current().kind != VbsTokenRParen {
+                loop true {
+                    let arg_id: Int = self.parse_arg_expr(program, true, false);
+                    _ = __gc_keepalive(args);
+                    _ = args.push(arg_id);
+                    if self.current().kind == VbsTokenComma {
+                        _ = self.advance();
+                        skip;
+                    }
+                    break;
+                }
+            }
+            if self.current().kind == VbsTokenRParen {
+                _ = self.advance();
+            } else {
+                _ = program.add_error("line " + strconv.itoa(self.current().line) + ": expected ')' after target before token: " + self.current().text);
+            }
+        }
+        return args;
+    }
+
+    func parse_inline_call_args(self: VbsParser, program: VbsProgram) -> collections.Vector<Int> {
+        let args: collections.Vector<Int> = new collections.Vector<Int>();
+        if self.at_separator() || self.current().kind == VbsTokenEof {
+            return args;
+        }
+        loop true {
+            let arg_id: Int = self.parse_arg_expr(program, true, true);
+            _ = __gc_keepalive(args);
+            _ = args.push(arg_id);
+            if self.current().kind == VbsTokenComma {
+                _ = self.advance();
+                skip;
+            }
+            break;
+        }
+        return args;
+    }
+
+    // Declaration and assignment parsers each return a statement ID, or a
+    // negative sentinel after recording an error. Callers append only valid IDs.
+    func parse_dim_declaration(self: VbsParser, program: VbsProgram) -> Int {
+        let stmt: VbsStmtNode = new VbsStmtNode();
+        stmt.kind = VbsStmtDim;
+        loop self.current().kind == VbsTokenIdentifier {
+            _ = stmt.names.push(self.advance().text);
+            let rank: Int = 0;
+            if self.current().kind == VbsTokenLParen {
+                _ = self.advance();
+                if self.current().kind != VbsTokenRParen {
+                    loop true {
+                        let arg_id: Int = self.parse_arg_expr(program, true, true);
+                        _ = __gc_keepalive(stmt.target_arg_ids);
+                        _ = stmt.target_arg_ids.push(arg_id);
+                        rank += 1;
+                        if self.current().kind == VbsTokenComma {
+                            _ = self.advance();
+                            skip;
+                        }
+                        break;
+                    }
+                }
+                if self.current().kind == VbsTokenRParen {
+                    _ = self.advance();
+                } else {
+                    _ = program.add_error("expected ')' after array bound");
+                }
+            }
+            _ = stmt.expr_ids.push(rank);
+            if self.current().kind == VbsTokenComma {
+                _ = self.advance();
+                skip;
+            }
+            break;
+        }
+        return program.add_stmt(stmt);
+    }
+
+    func parse_dim(self: VbsParser, program: VbsProgram) -> Int {
+        _ = self.advance();
+        return self.parse_dim_declaration(program);
+    }
+
+    func parse_const(self: VbsParser, program: VbsProgram) -> Int {
+        let stmt: VbsStmtNode = new VbsStmtNode();
+        stmt.kind = VbsStmtConst;
+        _ = self.advance();
+        loop self.current().kind == VbsTokenIdentifier {
+            _ = stmt.names.push(self.advance().text);
+            if self.current().kind == VbsTokenEq {
+                _ = self.advance();
+                let expr_id: Int = self.parse_arg_expr(program, true, true);
+                _ = __gc_keepalive(stmt.expr_ids);
+                _ = stmt.expr_ids.push(expr_id);
+            } else {
+                _ = stmt.expr_ids.push(program.add_expr(new VbsExprNode()));
+                _ = program.add_error("expected '=' after Const name");
+            }
+            if self.current().kind == VbsTokenComma {
+                _ = self.advance();
+                skip;
+            }
+            break;
+        }
+        return program.add_stmt(stmt);
+    }
+
+    func parse_redim_decl(self: VbsParser, program: VbsProgram, preserve: Bool) -> Int {
+        let stmt: VbsStmtNode = new VbsStmtNode();
+        stmt.kind = VbsStmtReDim;
+        stmt.bool_value = preserve;
+        if self.current().kind == VbsTokenIdentifier {
+            stmt.target_name = self.advance().text;
+            if self.current().kind == VbsTokenLParen {
+                _ = self.advance();
+                if self.current().kind != VbsTokenRParen {
+                    loop true {
+                        eg_gc_preempt_guard_enter();
+                        let bound_expr_id: Int = -1;
+                        if self.current().kind == VbsTokenIdentifier
+                        && (strings.equal_fold_ascii(self.current().text, "UBound") || strings.equal_fold_ascii(self.current().text, "LBound"))
+                        && self.peek(1).kind == VbsTokenLParen
+                        && self.peek(2).kind == VbsTokenIdentifier
+                        && self.peek(3).kind == VbsTokenRParen {
+                            let bound_call_name: String = self.advance().text;
+                            _ = self.advance();
+                            let bound_arg_name: String = self.advance().text;
+                            _ = self.advance();
+                            let bound_call: VbsExprNode = new VbsExprNode();
+                            bound_call.kind = VbsExprCall;
+                            bound_call.text = bound_call_name;
+                            let bound_arg_id: Int = self.add_identifier_expr(program, bound_arg_name);
+                            _ = bound_call.arg_ids.push(bound_arg_id);
+                            bound_expr_id = program.add_expr(bound_call);
+                        } else {
+                            bound_expr_id = self.parse_arg_expr(program, true, false);
+                        }
+                        loop self.current().kind == VbsTokenPlus || self.current().kind == VbsTokenMinus {
+                            let bound_operator: VbsTokenKind = self.advance().kind;
+                            let right_bound_expr_id: Int = self.parse_arg_expr(program, true, false);
+                            let combined_bound: VbsExprNode = new VbsExprNode();
+                            combined_bound.kind = bound_operator == VbsTokenPlus ? VbsExprAdd : VbsExprSub;
+                            combined_bound.left_id = bound_expr_id;
+                            combined_bound.right_id = right_bound_expr_id;
+                            bound_expr_id = program.add_expr(combined_bound);
+                        }
+                        // Keep a parser-owned top-level node for the bound.
+                        // Nested call parsing appends several nodes and the
+                        // returned vector slot must not retain a transient
+                        // borrow into that growing expression table.
+                        let stable_bound_expr: VbsExprNode = deserialize_vbs_expr_node(
+                            serialize_vbs_expr_node(program.get_expr(bound_expr_id))
+                        );
+                        let stable_bound_expr_id: Int = program.add_expr(stable_bound_expr);
+                        _ = stmt.target_arg_ids.push(stable_bound_expr_id);
+                        eg_gc_preempt_guard_leave();
+                        if self.current().kind == VbsTokenComma {
+                            _ = self.advance();
+                            skip;
+                        }
+                        break;
+                    }
+                }
+                if self.current().kind == VbsTokenRParen {
+                    _ = self.advance();
+                } else {
+                    _ = program.add_error("line " + strconv.itoa(self.current().line) + ": expected ')' after ReDim bound before token: " + self.current().text);
+                }
+            }
+        } else {
+            _ = program.add_error("expected array name after ReDim");
+        }
+        return program.add_stmt(stmt);
+    }
+
+    func parse_redim(self: VbsParser, program: VbsProgram) -> Int {
+        _ = self.advance();
+        let preserve: Bool = false;
+        if self.at_keyword("preserve") {
+            preserve = true;
+            _ = self.advance();
+        }
+        let first_id: Int = self.parse_redim_decl(program, preserve);
+        loop self.current().kind == VbsTokenComma {
+            _ = self.advance();
+            _ = self.pending_stmt_ids.push(self.parse_redim_decl(program, preserve));
+        }
+        return first_id;
+    }
+
+    func parse_set(self: VbsParser, program: VbsProgram) -> Int {
+        let stmt: VbsStmtNode = new VbsStmtNode();
+        stmt.kind = VbsStmtSetAssign;
+        _ = self.advance();
+        if self.current().kind == VbsTokenIdentifier {
+            let name: String = self.advance().text;
+            stmt.target_name = name;
+            stmt.target_expr_id = self.parse_postfix_call_chain(program, self.add_identifier_expr(program, name), name);
+        } else if self.current().kind == VbsTokenDot && self.with_names.len() > 0 {
+            let with_name: String = self.with_names.get(self.with_names.len() - 1);
+            stmt.target_name = with_name;
+            stmt.target_expr_id = self.parse_postfix_call_chain(program, self.add_identifier_expr(program, with_name));
+        } else {
+            _ = program.add_error("expected assignment target after Set");
+        }
+        if self.current().kind == VbsTokenEq {
+            _ = self.advance();
+            stmt.value_expr_id = self.parse_arg_expr(program, false, true);
+        } else {
+            _ = program.add_error("expected '=' after Set target");
+        }
+        return program.add_stmt(stmt);
+    }
+
+    func parse_call_keyword(self: VbsParser, program: VbsProgram) -> Int {
+        _ = self.advance();
+        if self.current().kind != VbsTokenIdentifier {
+            _ = program.add_error("expected procedure name after Call");
+            return program.add_stmt(new VbsStmtNode());
+        }
+        let stmt: VbsStmtNode = new VbsStmtNode();
+        stmt.kind = VbsStmtCall;
+        let name: String = self.advance().text;
+        let target_expr_id: Int = self.parse_postfix_call_chain(program, self.add_identifier_expr(program, name), name);
+        let target_expr: VbsExprNode = deserialize_vbs_expr_node(serialize_vbs_expr_node(program.get_expr(target_expr_id)));
+        stmt.call_name = self.flatten_call_target(program, target_expr_id);
+        if std.len(stmt.call_name) == 0 {
+            stmt.call_name = name;
+        }
+        if target_expr.kind == VbsExprCall && target_expr.left_id >= 0 {
+            if std.len(target_expr.text) != 0 {
+                stmt.extra_expr_id = target_expr.left_id;
+                stmt.extra_expr_id2 = target_expr_id;
+            }
+            let left_expr: VbsExprNode = deserialize_vbs_expr_node(serialize_vbs_expr_node(program.get_expr(target_expr.left_id)));
+            if left_expr.kind == VbsExprCall && left_expr.arg_ids.len() != 0 {
+                stmt.target_expr_id = target_expr_id;
+            }
+        }
+        if target_expr.kind == VbsExprCall && target_expr.arg_ids.len() != 0 {
+            stmt.call_arg_ids = target_expr.arg_ids;
+        } else {
+            stmt.call_arg_ids = self.parse_inline_call_args(program);
+        }
+        return program.add_stmt(stmt);
+    }
+
+    func parse_name_leading_statement(self: VbsParser, program: VbsProgram) -> Int {
+        let name: String = self.advance().text;
+        let target_expr_id: Int = self.parse_postfix_call_chain(program, self.add_identifier_expr(program, name), name);
+        if self.current().kind == VbsTokenEq {
+            let stmt: VbsStmtNode = new VbsStmtNode();
+            stmt.kind = VbsStmtAssign;
+            stmt.target_name = name;
+            stmt.target_expr_id = target_expr_id;
+            _ = self.advance();
+            stmt.value_expr_id = self.parse_arg_expr(program, false, true);
+            return program.add_stmt(stmt);
+        }
+        let stmt: VbsStmtNode = new VbsStmtNode();
+        stmt.kind = VbsStmtCall;
+        let target_expr: VbsExprNode = deserialize_vbs_expr_node(serialize_vbs_expr_node(program.get_expr(target_expr_id)));
+        let flattened_name: String = self.flatten_call_target(program, target_expr_id);
+        if std.len(flattened_name) != 0 {
+            stmt.call_name = flattened_name;
+        } else {
+            stmt.call_name = name;
+        }
+        if target_expr.kind == VbsExprCall && target_expr.left_id >= 0 {
+            if std.len(target_expr.text) != 0 {
+                stmt.extra_expr_id = target_expr.left_id;
+                stmt.extra_expr_id2 = target_expr_id;
+            }
+            let left_expr: VbsExprNode = deserialize_vbs_expr_node(serialize_vbs_expr_node(program.get_expr(target_expr.left_id)));
+            if left_expr.kind == VbsExprCall && left_expr.arg_ids.len() != 0 {
+                stmt.target_expr_id = target_expr_id;
+            }
+        }
+        if target_expr.kind == VbsExprCall && target_expr.arg_ids.len() != 0 {
+            stmt.call_arg_ids = target_expr.arg_ids;
+        } else {
+            stmt.call_arg_ids = self.parse_inline_call_args(program);
+        }
+        return program.add_stmt(stmt);
+    }
+
+    // Parses until one of the caller-selected terminators is visible without
+    // consuming it. The explicit flags make ownership of compound delimiters
+    // clear and avoid hidden parser mode shared across recursive blocks.
+    func parse_block(self: VbsParser, program: VbsProgram, stop_else: Bool = false, stop_end_if: Bool = false, stop_next: Bool = false, stop_loop: Bool = false, stop_wend: Bool = false, stop_case: Bool = false, stop_end_select: Bool = false, stop_end_sub: Bool = false, stop_end_function: Bool = false, stop_end_class: Bool = false, stop_end_property: Bool = false, stop_end_with: Bool = false) -> Int {
+        let block: VbsStmtBlock = new VbsStmtBlock();
+        self.skip_separators();
+        loop self.current().kind != VbsTokenEof {
+            if stop_else && (self.at_keyword("else") || self.at_keyword("elseif")) {
+                break;
+            }
+            if stop_end_if && self.at_sequence("end", "if") {
+                break;
+            }
+            if stop_next && self.at_keyword("next") {
+                break;
+            }
+            if stop_loop && self.at_keyword("loop") {
+                break;
+            }
+            if stop_wend && self.at_keyword("wend") {
+                break;
+            }
+            if stop_case && self.at_keyword("case") {
+                break;
+            }
+            if stop_end_select && self.at_sequence("end", "select") {
+                break;
+            }
+            if stop_end_sub && self.at_sequence("end", "sub") {
+                break;
+            }
+            if stop_end_function && self.at_sequence("end", "function") {
+                break;
+            }
+            if stop_end_class && self.at_sequence("end", "class") {
+                break;
+            }
+            if stop_end_property && self.at_sequence("end", "property") {
+                break;
+            }
+            if stop_end_with && self.at_sequence("end", "with") {
+                break;
+            }
+            let stmt_id: Int = self.parse_statement(program);
+            _ = __gc_keepalive(block.stmt_ids);
+            _ = block.stmt_ids.push(stmt_id);
+            let pending_index: Int = 0;
+            loop pending_index < self.pending_stmt_ids.len() {
+                _ = block.stmt_ids.push(self.pending_stmt_ids.get(pending_index));
+                pending_index += 1;
+            }
+            self.pending_stmt_ids.clear();
+            self.skip_separators();
+        }
+        return program.add_block(block);
+    }
+
+    // Control-flow readers construct nested block IDs but do not emit jumps.
+    // Bytecode lowering owns branch layout and exit-target resolution.
+    func parse_if_core(self: VbsParser, program: VbsProgram, consumed_head: Bool) -> Int {
+        let stmt: VbsStmtNode = new VbsStmtNode();
+        stmt.kind = VbsStmtIf;
+        if !consumed_head {
+            _ = self.advance();
+        }
+        let saved_then: Bool = self.stop_at_then;
+        self.stop_at_then = true;
+        stmt.cond_expr_id = self.parse_expr(program);
+        self.stop_at_then = saved_then;
+        if self.at_keyword("then") {
+            _ = self.advance();
+        } else {
+            _ = program.add_error("line " + strconv.itoa(self.current().line) + ": expected Then after If before token: " + self.current().text);
+        }
+        if self.at_separator() {
+            self.skip_separators();
+            stmt.then_block_id = self.parse_block(program, true, true);
+            if self.at_keyword("elseif") {
+                let else_block: VbsStmtBlock = new VbsStmtBlock();
+                _ = self.advance();
+                let nested_if_id: Int = self.parse_if_core(program, true);
+                _ = __gc_keepalive(else_block.stmt_ids);
+                _ = else_block.stmt_ids.push(nested_if_id);
+                stmt.else_block_id = program.add_block(else_block);
+            } else if self.at_keyword("else") {
+                _ = self.advance();
+                self.skip_separators();
+                stmt.else_block_id = self.parse_block(program, false, true);
+            }
+            if !consumed_head {
+                if self.at_sequence("end", "if") {
+                    _ = self.advance();
+                    _ = self.advance();
+                } else {
+                    _ = program.add_error("line " + strconv.itoa(self.current().line) + ": expected End If");
+                }
+            }
+        } else {
+            let then_block: VbsStmtBlock = new VbsStmtBlock();
+            let first_stmt_id: Int = self.parse_statement(program);
+            _ = __gc_keepalive(then_block.stmt_ids);
+            _ = then_block.stmt_ids.push(first_stmt_id);
+            loop self.current().kind == VbsTokenColon
+                && !strings.equal_fold_ascii(self.peek(1).text, "else")
+                && !(strings.equal_fold_ascii(self.peek(1).text, "end") && strings.equal_fold_ascii(self.peek(2).text, "if")) {
+                _ = self.advance();
+                let next_stmt_id: Int = self.parse_statement(program);
+                _ = __gc_keepalive(then_block.stmt_ids);
+                _ = then_block.stmt_ids.push(next_stmt_id);
+            }
+            stmt.then_block_id = program.add_block(then_block);
+            if self.current().kind == VbsTokenColon && strings.equal_fold_ascii(self.peek(1).text, "end") && strings.equal_fold_ascii(self.peek(2).text, "if") {
+                _ = self.advance();
+                _ = self.advance();
+                _ = self.advance();
+            }
+            if self.current().kind == VbsTokenColon && strings.equal_fold_ascii(self.peek(1).text, "else") {
+                _ = self.advance();
+            }
+            if self.at_keyword("elseif") {
+                let else_block: VbsStmtBlock = new VbsStmtBlock();
+                _ = self.advance();
+                let nested_if_id: Int = self.parse_if_core(program, true);
+                _ = __gc_keepalive(else_block.stmt_ids);
+                _ = else_block.stmt_ids.push(nested_if_id);
+                stmt.else_block_id = program.add_block(else_block);
+            } else if self.at_keyword("else") {
+                _ = self.advance();
+                let else_block: VbsStmtBlock = new VbsStmtBlock();
+                let first_else_stmt_id: Int = self.parse_statement(program);
+                _ = __gc_keepalive(else_block.stmt_ids);
+                _ = else_block.stmt_ids.push(first_else_stmt_id);
+                loop self.current().kind == VbsTokenColon
+                    && !(strings.equal_fold_ascii(self.peek(1).text, "end") && strings.equal_fold_ascii(self.peek(2).text, "if")) {
+                    _ = self.advance();
+                    let next_else_stmt_id: Int = self.parse_statement(program);
+                    _ = __gc_keepalive(else_block.stmt_ids);
+                    _ = else_block.stmt_ids.push(next_else_stmt_id);
+                }
+                stmt.else_block_id = program.add_block(else_block);
+            }
+        }
+        return program.add_stmt(stmt);
+    }
+
+    func parse_with(self: VbsParser, program: VbsProgram) -> Int {
+        let stmt: VbsStmtNode = new VbsStmtNode();
+        stmt.kind = VbsStmtWith;
+        _ = self.advance();
+        stmt.value_expr_id = self.parse_arg_expr(program, false, true);
+        stmt.target_name = "__egret_with_" + strconv.itoa(self.with_counter);
+        self.with_counter += 1;
+        _ = self.with_names.push(stmt.target_name);
+        self.skip_separators();
+        stmt.body_block_id = self.parse_block(program, false, false, false, false, false, false, false, false, false, false, false, true);
+        _ = self.with_names.pop_back("");
+        if self.at_sequence("end", "with") {
+            _ = self.advance();
+            _ = self.advance();
+        } else {
+            _ = program.add_error("line " + strconv.itoa(self.current().line) + ": expected End With");
+        }
+        return program.add_stmt(stmt);
+    }
+
+    func parse_with_leading_statement(self: VbsParser, program: VbsProgram) -> Int {
+        let with_name: String = self.with_names.get(self.with_names.len() - 1);
+        let target_expr_id: Int = self.parse_postfix_call_chain(program, self.add_identifier_expr(program, with_name));
+        if self.current().kind == VbsTokenEq {
+            let stmt: VbsStmtNode = new VbsStmtNode();
+            stmt.kind = VbsStmtAssign;
+            stmt.target_name = with_name;
+            stmt.target_expr_id = target_expr_id;
+            _ = self.advance();
+            stmt.value_expr_id = self.parse_arg_expr(program, false, true);
+            return program.add_stmt(stmt);
+        }
+        let stmt: VbsStmtNode = new VbsStmtNode();
+        stmt.kind = VbsStmtCall;
+        stmt.call_name = self.flatten_call_target(program, target_expr_id);
+        let target_expr: VbsExprNode = deserialize_vbs_expr_node(serialize_vbs_expr_node(program.get_expr(target_expr_id)));
+        if target_expr.kind == VbsExprCall && target_expr.left_id >= 0 && std.len(target_expr.text) != 0 {
+            stmt.extra_expr_id = target_expr.left_id;
+            stmt.extra_expr_id2 = target_expr_id;
+        }
+        if target_expr.kind == VbsExprCall && target_expr.arg_ids.len() != 0 {
+            stmt.call_arg_ids = target_expr.arg_ids;
+        } else {
+            stmt.call_arg_ids = self.parse_inline_call_args(program);
+        }
+        return program.add_stmt(stmt);
+    }
+
+    func parse_if(self: VbsParser, program: VbsProgram) -> Int {
+        return self.parse_if_core(program, false);
+    }
+
+    func parse_while(self: VbsParser, program: VbsProgram) -> Int {
+        let stmt: VbsStmtNode = new VbsStmtNode();
+        stmt.kind = VbsStmtWhile;
+        _ = self.advance();
+        stmt.cond_expr_id = self.parse_arg_expr(program, false, true);
+        self.skip_separators();
+        stmt.body_block_id = self.parse_block(program, false, false, false, false, true);
+        if self.at_keyword("wend") {
+            _ = self.advance();
+        } else {
+            _ = program.add_error("line " + strconv.itoa(self.current().line) + ": expected Wend");
+        }
+        return program.add_stmt(stmt);
+    }
+
+    func parse_do_loop(self: VbsParser, program: VbsProgram) -> Int {
+        let stmt: VbsStmtNode = new VbsStmtNode();
+        stmt.kind = VbsStmtDoLoop;
+        _ = self.advance();
+        if self.at_keyword("while") {
+            _ = self.advance();
+            stmt.cond_expr_id = self.parse_arg_expr(program, false, true);
+        } else if self.at_keyword("until") {
+            _ = self.advance();
+            let until_expr_id: Int = self.parse_arg_expr(program, false, true);
+            let not_expr: VbsExprNode = new VbsExprNode();
+            not_expr.kind = VbsExprNot;
+            not_expr.left_id = until_expr_id;
+            stmt.cond_expr_id = program.add_expr(not_expr);
+        }
+        self.skip_separators();
+        stmt.body_block_id = self.parse_block(program, false, false, false, true);
+        if self.at_keyword("loop") {
+            _ = self.advance();
+        } else {
+            _ = program.add_error("expected Loop");
+        }
+        if self.at_keyword("while") {
+            stmt.bool_value = true;
+            _ = self.advance();
+            stmt.extra_expr_id = self.parse_arg_expr(program, false, true);
+        } else if self.at_keyword("until") {
+            stmt.bool_value = true;
+            _ = self.advance();
+            let until_expr_id: Int = self.parse_arg_expr(program, false, true);
+            let not_expr: VbsExprNode = new VbsExprNode();
+            not_expr.kind = VbsExprNot;
+            not_expr.left_id = until_expr_id;
+            stmt.extra_expr_id = program.add_expr(not_expr);
+        }
+        return program.add_stmt(stmt);
+    }
+
+    func parse_for(self: VbsParser, program: VbsProgram) -> Int {
+        _ = self.advance();
+        if self.at_keyword("each") {
+            let stmt: VbsStmtNode = new VbsStmtNode();
+            stmt.kind = VbsStmtForEach;
+            _ = self.advance();
+            if self.current().kind == VbsTokenIdentifier {
+                stmt.target_name = self.advance().text;
+            } else {
+                _ = program.add_error("expected variable after For Each");
+            }
+            if self.at_keyword("in") {
+                _ = self.advance();
+            } else {
+                _ = program.add_error("expected In after For Each variable");
+            }
+            stmt.value_expr_id = self.parse_arg_expr(program, false, true);
+            self.skip_separators();
+            stmt.body_block_id = self.parse_block(program, false, false, true);
+            if self.at_keyword("next") {
+                _ = self.advance();
+                if self.current().kind == VbsTokenIdentifier {
+                    _ = self.advance();
+                }
+            } else {
+                _ = program.add_error("expected Next");
+            }
+            return program.add_stmt(stmt);
+        }
+        let stmt: VbsStmtNode = new VbsStmtNode();
+        stmt.kind = VbsStmtFor;
+        if self.current().kind == VbsTokenIdentifier {
+            stmt.target_name = self.advance().text;
+        } else {
+            _ = program.add_error("expected loop variable after For");
+        }
+        if self.current().kind == VbsTokenEq {
+            _ = self.advance();
+        } else {
+            _ = program.add_error("expected '=' after For variable");
+        }
+        stmt.value_expr_id = self.parse_arg_expr(program, false, false, "to");
+        if self.at_keyword("to") {
+            _ = self.advance();
+        } else {
+            _ = program.add_error("expected To in For");
+        }
+        stmt.extra_expr_id = self.parse_arg_expr(program, false, true, "step");
+        if self.at_keyword("step") {
+            _ = self.advance();
+            stmt.extra_expr_id2 = self.parse_arg_expr(program, false, true);
+        }
+        self.skip_separators();
+        stmt.body_block_id = self.parse_block(program, false, false, true);
+        if self.at_keyword("next") {
+            _ = self.advance();
+            if self.current().kind == VbsTokenIdentifier {
+                _ = self.advance();
+            }
+        } else {
+            _ = program.add_error("expected Next");
+        }
+        return program.add_stmt(stmt);
+    }
+
+    func parse_select_case(self: VbsParser, program: VbsProgram) -> Int {
+        let stmt: VbsStmtNode = new VbsStmtNode();
+        stmt.kind = VbsStmtSelectCase;
+        _ = self.advance();
+        if self.at_keyword("case") {
+            _ = self.advance();
+        } else {
+            _ = program.add_error("expected Case after Select");
+        }
+        stmt.value_expr_id = self.parse_arg_expr(program, false, true);
+        self.skip_separators();
+        loop self.current().kind != VbsTokenEof && !self.at_sequence("end", "select") {
+            if !self.at_keyword("case") {
+                _ = program.add_error("expected Case clause");
+                break;
+            }
+            let clause: VbsCaseClause = new VbsCaseClause();
+            _ = self.advance();
+            if self.at_keyword("else") {
+                clause.is_else = true;
+                _ = self.advance();
+            } else {
+                loop true {
+                    let expr_id: Int = self.parse_arg_expr(program, true, true);
+                    _ = __gc_keepalive(clause.expr_ids);
+                    _ = clause.expr_ids.push(expr_id);
+                    if self.current().kind == VbsTokenComma {
+                        _ = self.advance();
+                        skip;
+                    }
+                    break;
+                }
+            }
+            self.skip_separators();
+            clause.block_id = self.parse_block(program, false, false, false, false, false, true, true);
+            _ = stmt.case_clause_ids.push(program.add_case_clause(clause));
+            self.skip_separators();
+        }
+        if self.at_sequence("end", "select") {
+            _ = self.advance();
+            _ = self.advance();
+        } else {
+            _ = program.add_error("expected End Select");
+        }
+        return program.add_stmt(stmt);
+    }
+
+    func parse_exit(self: VbsParser, program: VbsProgram) -> Int {
+        _ = self.advance();
+        let stmt: VbsStmtNode = new VbsStmtNode();
+        if self.at_keyword("function") {
+            stmt.kind = VbsStmtExitFunction;
+            _ = self.advance();
+        } else if self.at_keyword("sub") {
+            stmt.kind = VbsStmtExitSub;
+            _ = self.advance();
+        } else if self.at_keyword("for") {
+            stmt.kind = VbsStmtExitFor;
+            _ = self.advance();
+        } else if self.at_keyword("do") {
+            stmt.kind = VbsStmtExitDo;
+            _ = self.advance();
+        } else if self.at_keyword("property") {
+            stmt.kind = VbsStmtExitProperty;
+            _ = self.advance();
+        } else {
+            _ = program.add_error("line " + strconv.itoa(self.current().line) + ": unknown Exit target: " + self.current().text);
+        }
+        return program.add_stmt(stmt);
+    }
+
+    // Routine parameters default to ByRef under VBScript rules. The parallel
+    // vectors must remain index-aligned; the program later derives copy-back
+    // masks from them for fast routine frames.
+    func parse_param_list(self: VbsParser, program: VbsProgram, param_names: collections.Vector<String>, param_by_refs: collections.Vector<Int>) -> Void {
+        if self.current().kind != VbsTokenLParen {
+            return;
+        }
+        _ = self.advance();
+        if self.current().kind != VbsTokenRParen {
+            loop true {
+                let by_ref: Bool = true;
+                if self.at_keyword("byval") {
+                    by_ref = false;
+                    _ = self.advance();
+                } else if self.at_keyword("byref") {
+                    _ = self.advance();
+                }
+                if self.current().kind == VbsTokenIdentifier {
+                    _ = param_names.push(self.advance().text);
+                    _ = param_by_refs.push(by_ref ? 1 : 0);
+                    if self.current().kind == VbsTokenLParen && self.peek(1).kind == VbsTokenRParen {
+                        _ = self.advance();
+                        _ = self.advance();
+                    }
+                } else {
+                    _ = program.add_error("expected parameter name");
+                }
+                if self.current().kind == VbsTokenComma {
+                    _ = self.advance();
+                    skip;
+                }
+                break;
+            }
+        }
+        if self.current().kind == VbsTokenRParen {
+            _ = self.advance();
+        } else {
+            _ = program.add_error("line " + strconv.itoa(self.current().line) + ": expected ')' after parameter list before token: " + self.current().text);
+        }
+    }
+
+    func parse_routine(self: VbsParser, program: VbsProgram, is_function: Bool, owner_class: String = "", end_keyword: String = "") -> Int {
+        let routine: VbsRoutineDef = new VbsRoutineDef();
+        routine.is_function = is_function;
+        routine.owner_class = owner_class;
+        _ = self.advance();
+        if self.current().kind == VbsTokenIdentifier {
+            routine.name = self.advance().text;
+        } else {
+            _ = program.add_error("expected routine name");
+        }
+        self.parse_param_list(program, routine.param_names, routine.param_by_refs);
+        self.skip_separators();
+        routine.block_id = self.parse_block(program, false, false, false, false, false, false, false, !is_function, is_function, false, end_keyword == "property");
+        if end_keyword == "property" {
+            if self.at_sequence("end", "property") {
+                _ = self.advance();
+                _ = self.advance();
+            } else {
+                _ = program.add_error("line " + strconv.itoa(self.current().line) + ": expected End Property");
+            }
+        } else if is_function {
+            if self.at_sequence("end", "function") {
+                _ = self.advance();
+                _ = self.advance();
+            } else {
+                _ = program.add_error("line " + strconv.itoa(self.current().line) + ": expected End Function");
+            }
+        } else {
+            if self.at_sequence("end", "sub") {
+                _ = self.advance();
+                _ = self.advance();
+            } else {
+                _ = program.add_error("line " + strconv.itoa(self.current().line) + ": expected End Sub");
+            }
+        }
+        return program.add_routine(routine);
+    }
+
+    // Class constants become synthetic initialization statements. They execute
+    // when an instance is created, preserving expression semantics while class
+    // metadata itself stays compact and immutable.
+    func parse_class_const(self: VbsParser, program: VbsProgram, cls: VbsClassDef, init_stmt_ids: collections.Vector<Int>) -> Void {
+        _ = self.advance();
+        loop self.current().kind == VbsTokenIdentifier {
+            let name: String = self.advance().text;
+            _ = cls.field_names.push(name);
+            _ = cls.field_bound_expr_packs.push(pack_int_parts(new collections.Vector<Int>()));
+            let stmt: VbsStmtNode = new VbsStmtNode();
+            stmt.kind = VbsStmtAssign;
+            stmt.target_name = name;
+            stmt.target_expr_id = self.add_identifier_expr(program, name);
+            if self.current().kind == VbsTokenEq {
+                _ = self.advance();
+                stmt.value_expr_id = self.parse_arg_expr(program, true, true);
+            } else {
+                stmt.value_expr_id = program.add_expr(new VbsExprNode());
+                _ = program.add_error("expected '=' after class Const name");
+            }
+            _ = init_stmt_ids.push(program.add_stmt(stmt));
+            if self.current().kind == VbsTokenComma {
+                _ = self.advance();
+                skip;
+            }
+            break;
+        }
+    }
+
+    func install_class_const_initializers(self: VbsParser, program: VbsProgram, cls: VbsClassDef, init_stmt_ids: collections.Vector<Int>) -> Void {
+        if init_stmt_ids.len() == 0 {
+            return;
+        }
+        let initialize_id: Int = -1;
+        let i: Int = 0;
+        loop i < cls.routine_ids.len() {
+            let candidate_id: Int = cls.routine_ids.get(i);
+            let candidate: VbsRoutineDef = program.routines.get(candidate_id);
+            if !candidate.is_function && strings.equal_fold_ascii(candidate.name, "Class_Initialize") {
+                initialize_id = candidate_id;
+                break;
+            }
+            i += 1;
+        }
+        let block: VbsStmtBlock = new VbsStmtBlock();
+        i = 0;
+        loop i < init_stmt_ids.len() {
+            _ = block.stmt_ids.push(init_stmt_ids.get(i));
+            i += 1;
+        }
+        if initialize_id >= 0 {
+            let routine: VbsRoutineDef = program.routines.get(initialize_id);
+            let original: VbsStmtBlock = program.blocks.get(routine.block_id);
+            i = 0;
+            loop i < original.stmt_ids.len() {
+                _ = block.stmt_ids.push(original.stmt_ids.get(i));
+                i += 1;
+            }
+            routine.block_id = program.add_block(block);
+            _ = program.routine_block_ids.set(initialize_id, routine.block_id);
+            return;
+        }
+        let routine: VbsRoutineDef = new VbsRoutineDef();
+        routine.name = "Class_Initialize";
+        routine.owner_class = cls.name;
+        routine.block_id = program.add_block(block);
+        _ = cls.routine_ids.push(program.add_routine(routine));
+    }
+
+    func parse_class(self: VbsParser, program: VbsProgram) -> Int {
+        let cls: VbsClassDef = new VbsClassDef();
+        let init_stmt_ids: collections.Vector<Int> = new collections.Vector<Int>();
+        _ = self.advance();
+        if self.current().kind == VbsTokenIdentifier {
+            cls.name = self.advance().text;
+        } else {
+            _ = program.add_error("expected class name");
+        }
+        self.skip_separators();
+        loop self.current().kind != VbsTokenEof && !self.at_sequence("end", "class") {
+            if self.at_keyword("public") || self.at_keyword("private") {
+                _ = self.advance();
+                let is_default: Bool = false;
+                if self.at_keyword("default")
+                && (strings.equal_fold_ascii(self.peek(1).text, "property")
+                    || strings.equal_fold_ascii(self.peek(1).text, "sub")
+                    || strings.equal_fold_ascii(self.peek(1).text, "function")) {
+                    is_default = true;
+                    _ = self.advance();
+                }
+                if self.at_keyword("property") {
+                    _ = self.advance();
+                    if self.at_keyword("get") {
+                        let routine_id: Int = self.parse_routine(program, true, cls.name, "property");
+                        _ = __gc_keepalive(cls.routine_ids);
+                        _ = cls.routine_ids.push(routine_id);
+                        if is_default {
+                            _ = cls.field_names.push("__egret_default_member__" + program.routines.get(routine_id).name);
+                            _ = cls.field_bound_expr_packs.push(pack_int_parts(new collections.Vector<Int>()));
+                        }
+                        self.skip_separators();
+                        skip;
+                    }
+                    if self.at_keyword("let") || self.at_keyword("set") {
+                        let routine_id: Int = self.parse_routine(program, false, cls.name, "property");
+                        _ = __gc_keepalive(cls.routine_ids);
+                        _ = cls.routine_ids.push(routine_id);
+                        if is_default {
+                            _ = cls.field_names.push("__egret_default_member__" + program.routines.get(routine_id).name);
+                            _ = cls.field_bound_expr_packs.push(pack_int_parts(new collections.Vector<Int>()));
+                        }
+                        self.skip_separators();
+                        skip;
+                    }
+                }
+                if self.at_keyword("const") {
+                    self.parse_class_const(program, cls, init_stmt_ids);
+                    self.skip_separators();
+                    skip;
+                }
+                if self.at_keyword("sub") {
+                    let routine_id: Int = self.parse_routine(program, false, cls.name);
+                    _ = __gc_keepalive(cls.routine_ids);
+                    _ = cls.routine_ids.push(routine_id);
+                    if is_default {
+                        _ = cls.field_names.push("__egret_default_member__" + program.routines.get(routine_id).name);
+                        _ = cls.field_bound_expr_packs.push(pack_int_parts(new collections.Vector<Int>()));
+                    }
+                    self.skip_separators();
+                    skip;
+                }
+                if self.at_keyword("function") {
+                    let routine_id: Int = self.parse_routine(program, true, cls.name);
+                    _ = __gc_keepalive(cls.routine_ids);
+                    _ = cls.routine_ids.push(routine_id);
+                    if is_default {
+                        _ = cls.field_names.push("__egret_default_member__" + program.routines.get(routine_id).name);
+                        _ = cls.field_bound_expr_packs.push(pack_int_parts(new collections.Vector<Int>()));
+                    }
+                    self.skip_separators();
+                    skip;
+                }
+                self.parse_class_field_list(program, cls);
+                self.skip_separators();
+                skip;
+            }
+            if self.at_keyword("property") {
+                _ = self.advance();
+                if self.at_keyword("get") {
+                    _ = cls.routine_ids.push(self.parse_routine(program, true, cls.name, "property"));
+                } else if self.at_keyword("let") || self.at_keyword("set") {
+                    _ = cls.routine_ids.push(self.parse_routine(program, false, cls.name, "property"));
+                } else {
+                    _ = program.add_error("expected Get, Let, or Set after Property");
+                }
+                self.skip_separators();
+                skip;
+            }
+            if self.at_keyword("dim") {
+                _ = self.advance();
+                self.parse_class_field_list(program, cls);
+                self.skip_separators();
+                skip;
+            }
+            if self.at_keyword("const") {
+                self.parse_class_const(program, cls, init_stmt_ids);
+                self.skip_separators();
+                skip;
+            }
+            if self.at_keyword("sub") {
+                let routine_id: Int = self.parse_routine(program, false, cls.name);
+                _ = __gc_keepalive(cls.routine_ids);
+                _ = cls.routine_ids.push(routine_id);
+                self.skip_separators();
+                skip;
+            }
+            if self.at_keyword("function") {
+                let routine_id: Int = self.parse_routine(program, true, cls.name);
+                _ = __gc_keepalive(cls.routine_ids);
+                _ = cls.routine_ids.push(routine_id);
+                self.skip_separators();
+                skip;
+            }
+            _ = program.add_error("line " + strconv.itoa(self.current().line) + ": unexpected token in class body: " + self.current().text);
+            _ = self.advance();
+            self.skip_separators();
+        }
+        if self.at_sequence("end", "class") {
+            _ = self.advance();
+            _ = self.advance();
+        } else {
+            _ = program.add_error("line " + strconv.itoa(self.current().line) + ": expected End Class");
+        }
+        self.install_class_const_initializers(program, cls, init_stmt_ids);
+        let stmt: VbsStmtNode = new VbsStmtNode();
+        stmt.kind = VbsStmtClassDef;
+        stmt.class_id = program.add_class(cls);
+        return program.add_stmt(stmt);
+    }
+
+    // Central statement dispatcher. It owns recovery to the next separator so
+    // malformed input cannot leave the cursor parked on the same token.
+    func parse_statement(self: VbsParser, program: VbsProgram) -> Int {
+        self.skip_separators();
+        if self.current().kind == VbsTokenEof {
+            return program.add_stmt(new VbsStmtNode());
+        }
+        if self.at_keyword("option") && self.peek(1).kind == VbsTokenIdentifier && strings.equal_fold_ascii(self.peek(1).text, "explicit") {
+            let stmt: VbsStmtNode = new VbsStmtNode();
+            stmt.kind = VbsStmtOptionExplicit;
+            _ = self.advance();
+            _ = self.advance();
+            return program.add_stmt(stmt);
+        }
+        if self.at_sequence("on", "error") && self.peek(2).kind == VbsTokenIdentifier && strings.equal_fold_ascii(self.peek(2).text, "resume") && self.peek(3).kind == VbsTokenIdentifier && strings.equal_fold_ascii(self.peek(3).text, "next") {
+            let stmt: VbsStmtNode = new VbsStmtNode();
+            stmt.kind = VbsStmtOnErrorResumeNext;
+            _ = self.advance();
+            _ = self.advance();
+            _ = self.advance();
+            _ = self.advance();
+            return program.add_stmt(stmt);
+        }
+        if self.at_sequence("on", "error") && self.peek(2).kind == VbsTokenIdentifier && strings.equal_fold_ascii(self.peek(2).text, "goto") && self.peek(3).kind == VbsTokenInteger && self.peek(3).text == "0" {
+            let stmt: VbsStmtNode = new VbsStmtNode();
+            stmt.kind = VbsStmtOnErrorGoto0;
+            _ = self.advance();
+            _ = self.advance();
+            _ = self.advance();
+            _ = self.advance();
+            return program.add_stmt(stmt);
+        }
+        if self.at_keyword("rem") {
+            let stmt: VbsStmtNode = new VbsStmtNode();
+            _ = self.advance();
+            loop !self.at_separator() && self.current().kind != VbsTokenEof {
+                _ = self.advance();
+            }
+            return program.add_stmt(stmt);
+        }
+        if self.at_keyword("dim") {
+            return self.parse_dim(program);
+        }
+        if self.at_keyword("public") || self.at_keyword("private") {
+            _ = self.advance();
+            if self.at_keyword("default")
+            && (strings.equal_fold_ascii(self.peek(1).text, "sub")
+                || strings.equal_fold_ascii(self.peek(1).text, "function")) {
+                _ = self.advance();
+            }
+            if self.at_keyword("sub") {
+                let stmt: VbsStmtNode = new VbsStmtNode();
+                stmt.kind = VbsStmtRoutineDef;
+                stmt.routine_id = self.parse_routine(program, false);
+                return program.add_stmt(stmt);
+            }
+            if self.at_keyword("function") {
+                let stmt: VbsStmtNode = new VbsStmtNode();
+                stmt.kind = VbsStmtRoutineDef;
+                stmt.routine_id = self.parse_routine(program, true);
+                return program.add_stmt(stmt);
+            }
+            if self.at_keyword("const") {
+                return self.parse_const(program);
+            }
+            if self.current().kind == VbsTokenIdentifier {
+                return self.parse_dim_declaration(program);
+            }
+        }
+        if self.at_keyword("const") {
+            return self.parse_const(program);
+        }
+        if self.at_keyword("redim") {
+            return self.parse_redim(program);
+        }
+        if self.at_keyword("erase") && self.peek(1).kind == VbsTokenIdentifier {
+            _ = self.advance();
+            let stmt: VbsStmtNode = new VbsStmtNode();
+            stmt.kind = VbsStmtAssign;
+            if self.current().kind == VbsTokenIdentifier {
+                stmt.target_name = self.advance().text;
+                stmt.target_expr_id = self.add_identifier_expr(program, stmt.target_name);
+            } else {
+                _ = program.add_error("expected array name after Erase");
+            }
+            stmt.value_expr_id = self.add_identifier_expr(program, "Empty");
+            return program.add_stmt(stmt);
+        }
+        if self.at_keyword("set") {
+            return self.parse_set(program);
+        }
+        if self.at_keyword("call") {
+            return self.parse_call_keyword(program);
+        }
+        if self.at_keyword("if") {
+            return self.parse_if(program);
+        }
+        if self.at_keyword("while") {
+            return self.parse_while(program);
+        }
+        if self.at_keyword("do") {
+            return self.parse_do_loop(program);
+        }
+        if self.at_keyword("for") {
+            return self.parse_for(program);
+        }
+        if self.at_keyword("select") {
+            return self.parse_select_case(program);
+        }
+        if self.at_keyword("with") {
+            return self.parse_with(program);
+        }
+        if self.at_keyword("exit") {
+            return self.parse_exit(program);
+        }
+        if self.at_keyword("sub") {
+            let stmt: VbsStmtNode = new VbsStmtNode();
+            stmt.kind = VbsStmtRoutineDef;
+            stmt.routine_id = self.parse_routine(program, false);
+            return program.add_stmt(stmt);
+        }
+        if self.at_keyword("function") {
+            let stmt: VbsStmtNode = new VbsStmtNode();
+            stmt.kind = VbsStmtRoutineDef;
+            stmt.routine_id = self.parse_routine(program, true);
+            return program.add_stmt(stmt);
+        }
+        if self.at_keyword("class") {
+            return self.parse_class(program);
+        }
+        if self.current().kind == VbsTokenDot && self.with_names.len() > 0 {
+            return self.parse_with_leading_statement(program);
+        }
+        if self.current().kind == VbsTokenIdentifier {
+            return self.parse_name_leading_statement(program);
+        }
+        _ = program.add_error("line " + strconv.itoa(self.current().line) + ": unexpected token in statement: " + self.current().text);
+        _ = self.advance();
+        return program.add_stmt(new VbsStmtNode());
+    }
+
+    // Public entry points allocate isolated parser state. Script mode accepts
+    // statement blocks; expression mode is used by dynamic Eval-like paths.
+    func parse_script_source(self: VbsParser, text: String) -> VbsProgram {
+        let program: VbsProgram = new VbsProgram();
+        program.source_text = text;
+        self.tokens = (new VbsLexer()).lex(text);
+        self.pos = 0;
+        self.with_names = new collections.Vector<String>();
+        self.with_counter = 0;
+        self.pending_stmt_ids = new collections.Vector<Int>();
+        program.root_block_id = self.parse_block(program);
+        program.bind_static_routine_ids();
+        program.refresh_routine_metadata();
+        return program;
+    }
+
+    func parse_expr_source(self: VbsParser, text: String) -> VbsProgram {
+        let program: VbsProgram = new VbsProgram();
+        program.source_text = text;
+        self.tokens = (new VbsLexer()).lex(text);
+        self.pos = 0;
+        self.stop_at_separator = true;
+        program.root_expr_id = self.parse_expr(program);
+        self.stop_at_separator = false;
+        return program;
+    }
+}

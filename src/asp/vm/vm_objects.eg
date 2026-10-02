@@ -1,0 +1,872 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.vm;
+
+use asp.runtime;
+use asp.compiler;
+use asp.object;
+
+use asp;
+use std;
+use strconv;
+use strings;
+use collections;
+use net.memcache;
+use net.mysql;
+use net.redis;
+use net.tcp;
+use net.udp;
+use net.unix.socket;
+use net.websocket;
+
+extern func __gc_keepalive(obj: Any) -> Void;
+extern func eg_asp_request_arena_generation(arena_handle: Int) -> Int;
+extern func eg_asp_request_arena_escape_check(arena_handle: Int, generation: Int) -> Int;
+extern func eg_asp_request_rows_create(arena_handle: Int, row_count: Int, column_count: Int) -> Int;
+extern func eg_asp_request_rows_generation(arena_handle: Int, rows_handle: Int) -> Int;
+extern func eg_asp_request_rows_set_string(arena_handle: Int, rows_handle: Int, row: Int, column: Int, value: String) -> Int;
+extern func eg_asp_request_rows_set_scalar(arena_handle: Int, rows_handle: Int, row: Int, column: Int, kind: Int, integer: Int, floating: Float64) -> Int;
+extern func eg_asp_request_rows_update_string(arena_handle: Int, rows_handle: Int, row: Int, column: Int, value: String) -> Int;
+extern func eg_asp_request_rows_update_scalar(arena_handle: Int, rows_handle: Int, row: Int, column: Int, kind: Int, integer: Int, floating: Float64) -> Int;
+extern func eg_asp_request_rows_cell_kind(arena_handle: Int, rows_handle: Int, row: Int, column: Int, original: Int) -> Int;
+extern func eg_asp_request_rows_cell_integer(arena_handle: Int, rows_handle: Int, row: Int, column: Int, original: Int) -> Int;
+extern func eg_asp_request_rows_cell_floating(arena_handle: Int, rows_handle: Int, row: Int, column: Int, original: Int) -> Float64;
+extern func eg_asp_request_rows_cell_string(arena_handle: Int, rows_handle: Int, row: Int, column: Int, original: Int) -> String;
+extern func eg_asp_request_rows_cell_changed(arena_handle: Int, rows_handle: Int, row: Int, column: Int) -> Int;
+
+// High-level object category used by language dispatch. Component-specific
+// behavior is refined by `component_kind`; keeping the two dimensions separate
+// avoids expanding this stable VM enum for every COM-compatible ProgID.
+enum RuntimeObjectKind {
+    RuntimeObjectUnknown,
+    RuntimeObjectDictionary,
+    RuntimeObjectAdoConnection,
+    RuntimeObjectAdoRecordset,
+    RuntimeObjectUserClass,
+}
+
+// Unified VM-side object record.
+//
+// The scalar fields are intentionally generic because classic ASP objects
+// expose overlapping concepts such as cursor position, open state, and default
+// members. `store` holds named properties, `items` ordered metadata/values, and
+// `rows` the managed recordset fallback. Network and database resources are not
+// stored here; ObjectSpace owns them in typed side tables so copying this record
+// cannot duplicate an fd or connection.
+//
+// Native rows are request-arena allocations identified by handle plus arena
+// generation. Every access validates both values. A RuntimeObject may outlive a
+// request, but stale arena memory must never be dereferenced.
+class RuntimeObject {
+    var kind: RuntimeObjectKind;
+    var component_kind: asp.object.ComponentKind;
+    var prog_id: String;
+    var class_name: String;
+    var default_member: String;
+    var opened: Bool;
+    var cursor: Int;
+    var page_size: Int;
+    var text_value: String;
+    var auxiliary_text: String;
+    var secondary_text: String;
+    var int_value: Int;
+    var auxiliary_int: Int;
+    var cursor_type: Int;
+    var lock_type: Int;
+    var active_connection_id: Int;
+    var database_driver_kind: Int;
+    var transaction_active: Bool;
+    var transaction_backup_path: String;
+    var store: asp.runtime.KeyValueStore;
+    var items: collections.Vector<asp.runtime.Variant>;
+    var rows: collections.Vector<asp.runtime.KeyValueStore>;
+    var original_rows: collections.Vector<asp.runtime.KeyValueStore>;
+    var native_rows_handle: Int;
+    var native_arena_handle: Int;
+    var native_rows_generation: Int;
+    var native_row_count: Int;
+    var native_column_count: Int;
+
+    func init(self: RuntimeObject) -> Void {
+        self.kind = RuntimeObjectUnknown;
+        self.component_kind = asp.object.ComponentUnknown;
+        self.prog_id = "";
+        self.class_name = "";
+        self.default_member = "Item";
+        self.opened = false;
+        self.cursor = 0;
+        self.page_size = 10;
+        self.text_value = "";
+        self.auxiliary_text = "";
+        self.secondary_text = "";
+        self.int_value = 0;
+        self.auxiliary_int = 0;
+        self.cursor_type = 0;
+        self.lock_type = 0;
+        self.active_connection_id = 0;
+        self.database_driver_kind = 0;
+        self.transaction_active = false;
+        self.transaction_backup_path = "";
+        self.store = new asp.runtime.KeyValueStore();
+        self.items = new collections.Vector<asp.runtime.Variant>();
+        self.rows = new collections.Vector<asp.runtime.KeyValueStore>();
+        self.original_rows = new collections.Vector<asp.runtime.KeyValueStore>();
+        self.native_rows_handle = 0;
+        self.native_arena_handle = 0;
+        self.native_rows_generation = 0;
+        self.native_row_count = 0;
+        self.native_column_count = 0;
+    }
+
+    // Validates the complete native-row capability before use. Generation
+    // checks turn request teardown into an invalid handle instead of UAF.
+    func has_native_rows(self: RuntimeObject) -> Bool {
+        return self.native_rows_handle != 0
+            && self.native_arena_handle != 0
+            && self.native_rows_generation != 0
+            && eg_asp_request_arena_escape_check(self.native_arena_handle, self.native_rows_generation) != 0
+            && eg_asp_request_rows_generation(self.native_arena_handle, self.native_rows_handle) == self.native_rows_generation;
+    }
+
+    func row_count(self: RuntimeObject) -> Int {
+        return self.has_native_rows() ? self.native_row_count : self.rows.len();
+    }
+
+    // Allocates a fixed rectangular row store in the request arena. Column
+    // names remain in `items`; cells are addressed by zero-based row/column.
+    func create_native_rows(self: RuntimeObject, arena_handle: Int, row_count: Int, column_count: Int) -> Bool {
+        let handle: Int = eg_asp_request_rows_create(arena_handle, row_count, column_count);
+        if handle == 0 {
+            return false;
+        }
+        self.native_rows_handle = handle;
+        self.native_arena_handle = arena_handle;
+        self.native_rows_generation = eg_asp_request_arena_generation(arena_handle);
+        self.native_row_count = row_count;
+        self.native_column_count = column_count;
+        return self.native_rows_generation != 0;
+    }
+
+    // Column matching follows VBScript's case-insensitive identifier rules.
+    func native_column_index(self: RuntimeObject, name: String) -> Int {
+        let i: Int = 0;
+        loop i < self.items.len() {
+            if strings.equal_fold_ascii(self.items.get(i).to_output_string(), name) {
+                return i;
+            }
+            i += 1;
+        }
+        return -1;
+    }
+
+    // Converts the compact C cell representation back into a managed Variant.
+    // `original` selects the snapshot used for optimistic update/change checks.
+    func native_cell(self: RuntimeObject, row: Int, column: Int, original: Bool = false) -> asp.runtime.Variant {
+        if !self.has_native_rows() || row < 0 || row >= self.native_row_count || column < 0 || column >= self.native_column_count {
+            return asp.runtime.variant_empty();
+        }
+        let source: Int = original ? 1 : 0;
+        let kind: Int = eg_asp_request_rows_cell_kind(self.native_arena_handle, self.native_rows_handle, row, column, source);
+        if kind == (asp.runtime.VariantNull => Int) {
+            return asp.runtime.variant_null();
+        }
+        if kind == (asp.runtime.VariantBool => Int) {
+            return asp.runtime.variant_bool(eg_asp_request_rows_cell_integer(self.native_arena_handle, self.native_rows_handle, row, column, source) != 0);
+        }
+        if kind == (asp.runtime.VariantInt => Int) {
+            return asp.runtime.variant_int(eg_asp_request_rows_cell_integer(self.native_arena_handle, self.native_rows_handle, row, column, source));
+        }
+        if kind == (asp.runtime.VariantFloat => Int) {
+            return asp.runtime.variant_float(eg_asp_request_rows_cell_floating(self.native_arena_handle, self.native_rows_handle, row, column, source));
+        }
+        if kind == (asp.runtime.VariantString => Int) {
+            return asp.runtime.variant_string(eg_asp_request_rows_cell_string(self.native_arena_handle, self.native_rows_handle, row, column, source));
+        }
+        if kind == (asp.runtime.VariantDate => Int) {
+            return asp.runtime.variant_date(eg_asp_request_rows_cell_integer(self.native_arena_handle, self.native_rows_handle, row, column, source));
+        }
+        return asp.runtime.variant_empty();
+    }
+
+    // Writes either the initial/current pair or only the mutable current cell.
+    // Unsupported Variant kinds fail so object handles cannot escape into C.
+    func set_native_cell(self: RuntimeObject, row: Int, column: Int, value: asp.runtime.Variant, initialize: Bool = true) -> Bool {
+        if !self.has_native_rows() || row < 0 || row >= self.native_row_count || column < 0 || column >= self.native_column_count {
+            return false;
+        }
+        if value.kind == asp.runtime.VariantString {
+            return (initialize
+                ? eg_asp_request_rows_set_string(self.native_arena_handle, self.native_rows_handle, row, column, value.string_value)
+                : eg_asp_request_rows_update_string(self.native_arena_handle, self.native_rows_handle, row, column, value.string_value)) != 0;
+        }
+        let integer: Int = value.kind == asp.runtime.VariantBool
+            ? (value.bool_value ? 1 : 0)
+            : (value.kind == asp.runtime.VariantDate ? value.date_value : value.int_value);
+        return (initialize
+            ? eg_asp_request_rows_set_scalar(self.native_arena_handle, self.native_rows_handle, row, column, value.kind => Int, integer, value.float_value)
+            : eg_asp_request_rows_update_scalar(self.native_arena_handle, self.native_rows_handle, row, column, value.kind => Int, integer, value.float_value)) != 0;
+    }
+
+    func set_native_text_cell(self: RuntimeObject, row: Int, column: Int, value: String) -> Bool {
+        return self.has_native_rows()
+            && eg_asp_request_rows_set_string(self.native_arena_handle, self.native_rows_handle, row, column, value) != 0;
+    }
+
+    func set_native_null_cell(self: RuntimeObject, row: Int, column: Int) -> Bool {
+        return self.has_native_rows()
+            && eg_asp_request_rows_set_scalar(self.native_arena_handle, self.native_rows_handle, row, column, asp.runtime.VariantNull => Int, 0, 0.0) != 0;
+    }
+
+    func native_cell_changed(self: RuntimeObject, row: Int, column: Int) -> Bool {
+        return self.has_native_rows()
+            && eg_asp_request_rows_cell_changed(self.native_arena_handle, self.native_rows_handle, row, column) != 0;
+    }
+
+    // Promotes arena-backed rows to managed stores before the object crosses a
+    // request lifetime boundary. Promotion is all-or-nothing from the caller's
+    // perspective; native handles are cleared only after copying succeeds.
+    func promote_native_rows(self: RuntimeObject) -> Bool {
+        if !self.has_native_rows() {
+            return self.native_rows_handle == 0;
+        }
+        if eg_asp_request_arena_escape_check(self.native_arena_handle, self.native_rows_generation) == 0 {
+            return false;
+        }
+        self.rows.clear();
+        self.original_rows.clear();
+        let row_index: Int = 0;
+        loop row_index < self.native_row_count {
+            let row: asp.runtime.KeyValueStore = new asp.runtime.KeyValueStore();
+            let original: asp.runtime.KeyValueStore = new asp.runtime.KeyValueStore();
+            let column_index: Int = 0;
+            loop column_index < self.native_column_count && column_index < self.items.len() {
+                let name: String = self.items.get(column_index).to_output_string();
+                _ = row.set(name, self.native_cell(row_index, column_index));
+                _ = original.set(name, self.native_cell(row_index, column_index, true));
+                column_index += 1;
+            }
+            _ = self.rows.push(row);
+            _ = self.original_rows.push(original);
+            row_index += 1;
+        }
+        self.native_rows_handle = 0;
+        self.native_arena_handle = 0;
+        self.native_rows_generation = 0;
+        return true;
+    }
+}
+
+// Explicit deep-copy helpers define which VM values can cross scope or
+// persistence boundaries. External resource handles remain owned by ObjectSpace.
+func clone_key_value_store(store: asp.runtime.KeyValueStore) -> asp.runtime.KeyValueStore {
+    let out: asp.runtime.KeyValueStore = new asp.runtime.KeyValueStore();
+    let i: Int = 0;
+    loop i < store.entries.len() {
+        let source_entry: asp.runtime.Variant = store.entries.get(i);
+        let cloned_entry: asp.runtime.Variant = source_entry.clone();
+        _ = out.entry_indices.set(cloned_entry.store_key, i);
+        _ = out.entries.push(cloned_entry);
+        i += 1;
+    }
+    return out;
+}
+
+func clone_runtime_object(obj: RuntimeObject) -> RuntimeObject {
+    let out: RuntimeObject = new RuntimeObject();
+    out.kind = obj.kind;
+    out.component_kind = obj.component_kind;
+    out.prog_id = asp.runtime.clone_runtime_string(obj.prog_id);
+    out.class_name = asp.runtime.clone_runtime_string(obj.class_name);
+    out.default_member = asp.runtime.clone_runtime_string(obj.default_member);
+    out.opened = obj.opened;
+    out.cursor = obj.cursor;
+    out.page_size = obj.page_size;
+    out.text_value = asp.runtime.clone_runtime_string(obj.text_value);
+    out.auxiliary_text = asp.runtime.clone_runtime_string(obj.auxiliary_text);
+    out.secondary_text = asp.runtime.clone_runtime_string(obj.secondary_text);
+    out.int_value = obj.int_value;
+    out.auxiliary_int = obj.auxiliary_int;
+    out.cursor_type = obj.cursor_type;
+    out.lock_type = obj.lock_type;
+    out.active_connection_id = obj.active_connection_id;
+    out.database_driver_kind = obj.database_driver_kind;
+    out.transaction_active = obj.transaction_active;
+    out.transaction_backup_path = asp.runtime.clone_runtime_string(obj.transaction_backup_path);
+    out.native_rows_handle = obj.native_rows_handle;
+    out.native_arena_handle = obj.native_arena_handle;
+    out.native_rows_generation = obj.native_rows_generation;
+    out.native_row_count = obj.native_row_count;
+    out.native_column_count = obj.native_column_count;
+    if obj.kind != RuntimeObjectAdoRecordset {
+        let store_index: Int = 0;
+        loop store_index < obj.store.entries.len() {
+            let source_entry: asp.runtime.Variant = obj.store.entries.get(store_index);
+            let cloned_entry: asp.runtime.Variant = source_entry.clone();
+            _ = out.store.entry_indices.set(cloned_entry.store_key, store_index);
+            _ = out.store.entries.push(cloned_entry);
+            store_index += 1;
+        }
+    }
+    let item_index: Int = 0;
+    loop item_index < obj.items.len() {
+        let source_item: asp.runtime.Variant = obj.items.get(item_index);
+        _ = out.items.push(source_item.clone());
+        item_index += 1;
+    }
+    let row_index: Int = 0;
+    loop row_index < obj.rows.len() {
+        let source_row: asp.runtime.KeyValueStore = obj.rows.get(row_index);
+        _ = out.rows.push(clone_key_value_store(source_row));
+        row_index += 1;
+    }
+    row_index = 0;
+    loop row_index < obj.original_rows.len() {
+        let source_row: asp.runtime.KeyValueStore = obj.original_rows.get(row_index);
+        _ = out.original_rows.push(clone_key_value_store(source_row));
+        row_index += 1;
+    }
+    _ = __gc_keepalive(obj.store.entries);
+    _ = __gc_keepalive(obj.items);
+    _ = __gc_keepalive(obj.rows);
+    _ = __gc_keepalive(obj.original_rows);
+    _ = __gc_keepalive(obj);
+    return out;
+}
+
+// Per-request object registry and owner of non-copyable native resources.
+//
+// Object IDs are stable indexes. Each connection side table has a parallel ID
+// vector because Egret objects cannot embed every native protocol handle. `add`
+// may reuse cleared slots, while `clear` closes every resource before dropping
+// records. A take operation transfers ownership and removes the side-table
+// entry; a close operation consumes it.
+class ObjectSpace {
+    var ids: collections.Vector<Int>;
+    var objects: collections.Vector<RuntimeObject>;
+    var mysql_connection_ids: collections.Vector<Int>;
+    var mysql_connections: collections.Vector<net.mysql.Conn>;
+    var mysql_connection_pools: collections.Vector<net.mysql.Pool>;
+    var redis_connection_ids: collections.Vector<Int>;
+    var redis_connections: collections.Vector<net.redis.Conn>;
+    var memcache_connection_ids: collections.Vector<Int>;
+    var memcache_connections: collections.Vector<net.memcache.Conn>;
+    var websocket_connection_ids: collections.Vector<Int>;
+    var websocket_connections: collections.Vector<net.websocket.Conn>;
+    var socket_ids: collections.Vector<Int>;
+    var socket_fds: collections.Vector<Int>;
+    var socket_types: collections.Vector<Int>;
+    var next_id: Int;
+
+    func init(self: ObjectSpace) -> Void {
+        self.ids = new collections.Vector<Int>();
+        self.objects = new collections.Vector<RuntimeObject>();
+        self.mysql_connection_ids = new collections.Vector<Int>();
+        self.mysql_connections = new collections.Vector<net.mysql.Conn>();
+        self.mysql_connection_pools = new collections.Vector<net.mysql.Pool>();
+        self.redis_connection_ids = new collections.Vector<Int>();
+        self.redis_connections = new collections.Vector<net.redis.Conn>();
+        self.memcache_connection_ids = new collections.Vector<Int>();
+        self.memcache_connections = new collections.Vector<net.memcache.Conn>();
+        self.websocket_connection_ids = new collections.Vector<Int>();
+        self.websocket_connections = new collections.Vector<net.websocket.Conn>();
+        self.socket_ids = new collections.Vector<Int>();
+        self.socket_fds = new collections.Vector<Int>();
+        self.socket_types = new collections.Vector<Int>();
+        self.next_id = 1;
+    }
+
+    func close_connections(self: ObjectSpace) -> Void {
+        let mysql_index: Int = 0;
+        loop mysql_index < self.mysql_connections.len() {
+            let conn: net.mysql.Conn = self.mysql_connections.get(mysql_index);
+            self.mysql_connection_pools.get(mysql_index).put(conn);
+            mysql_index += 1;
+        }
+        let redis_index: Int = 0;
+        loop redis_index < self.redis_connections.len() {
+            let conn: net.redis.Conn = self.redis_connections.get(redis_index);
+            conn.close();
+            redis_index += 1;
+        }
+        let memcache_index: Int = 0;
+        loop memcache_index < self.memcache_connections.len() {
+            let conn: net.memcache.Conn = self.memcache_connections.get(memcache_index);
+            conn.close();
+            memcache_index += 1;
+        }
+        let websocket_index: Int = 0;
+        loop websocket_index < self.websocket_connections.len() {
+            let conn: net.websocket.Conn = self.websocket_connections.get(websocket_index);
+            _ = conn.close();
+            websocket_index += 1;
+        }
+        let socket_index: Int = 0;
+        loop socket_index < self.socket_fds.len() {
+            self.close_socket_fd(self.socket_fds.get(socket_index), self.socket_types.get(socket_index));
+            socket_index += 1;
+        }
+        self.mysql_connection_ids.dispose();
+        self.mysql_connections.dispose();
+        self.mysql_connection_pools.dispose();
+        self.redis_connection_ids.dispose();
+        self.redis_connections.dispose();
+        self.memcache_connection_ids.dispose();
+        self.memcache_connections.dispose();
+        self.websocket_connection_ids.dispose();
+        self.websocket_connections.dispose();
+        self.socket_ids.dispose();
+        self.socket_fds.dispose();
+        self.socket_types.dispose();
+        self.mysql_connection_ids = new collections.Vector<Int>();
+        self.mysql_connections = new collections.Vector<net.mysql.Conn>();
+        self.mysql_connection_pools = new collections.Vector<net.mysql.Pool>();
+        self.redis_connection_ids = new collections.Vector<Int>();
+        self.redis_connections = new collections.Vector<net.redis.Conn>();
+        self.memcache_connection_ids = new collections.Vector<Int>();
+        self.memcache_connections = new collections.Vector<net.memcache.Conn>();
+        self.websocket_connection_ids = new collections.Vector<Int>();
+        self.websocket_connections = new collections.Vector<net.websocket.Conn>();
+        self.socket_ids = new collections.Vector<Int>();
+        self.socket_fds = new collections.Vector<Int>();
+        self.socket_types = new collections.Vector<Int>();
+    }
+
+    // Connection helpers deliberately use linear ID lookup. Per-request object
+    // counts are small, and this avoids maps whose keys and resource ownership
+    // could diverge during teardown.
+    func mysql_connection_index(self: ObjectSpace, object_id: Int) -> Int {
+        let i: Int = 0;
+        loop i < self.mysql_connection_ids.len() {
+            if self.mysql_connection_ids.get(i) == object_id {
+                return i;
+            }
+            i += 1;
+        }
+        return -1;
+    }
+
+    func has_mysql_connection(self: ObjectSpace, object_id: Int) -> Bool {
+        return self.mysql_connection_index(object_id) >= 0;
+    }
+
+    func put_mysql_connection(self: ObjectSpace, object_id: Int, conn: net.mysql.Conn, pool: net.mysql.Pool) -> Void {
+        let index: Int = self.mysql_connection_index(object_id);
+        if index >= 0 {
+            let old: net.mysql.Conn = self.mysql_connections.remove(index, new net.mysql.Conn(0));
+            let old_pool: net.mysql.Pool = self.mysql_connection_pools.get(index);
+            _ = self.mysql_connection_pools.remove(index, old_pool);
+            old_pool.put(old);
+            _ = self.mysql_connection_ids.remove_at(index);
+            _ = self.mysql_connection_ids.push(object_id);
+            _ = self.mysql_connections.push(conn);
+            _ = self.mysql_connection_pools.push(pool);
+            return;
+        }
+        _ = self.mysql_connection_ids.push(object_id);
+        _ = self.mysql_connections.push(conn);
+        _ = self.mysql_connection_pools.push(pool);
+    }
+
+    func mysql_connection(self: ObjectSpace, object_id: Int) -> net.mysql.Conn {
+        let index: Int = self.mysql_connection_index(object_id);
+        return self.mysql_connections.get(index);
+    }
+
+    func close_mysql_connection(self: ObjectSpace, object_id: Int) -> Void {
+        let index: Int = self.mysql_connection_index(object_id);
+        if index < 0 {
+            return;
+        }
+        let conn: net.mysql.Conn = self.mysql_connections.remove(index, new net.mysql.Conn(0));
+        let pool: net.mysql.Pool = self.mysql_connection_pools.get(index);
+        _ = self.mysql_connection_pools.remove(index, pool);
+        pool.put(conn);
+        _ = self.mysql_connection_ids.remove_at(index);
+    }
+
+    func redis_connection_index(self: ObjectSpace, object_id: Int) -> Int {
+        let i: Int = 0;
+        loop i < self.redis_connection_ids.len() {
+            if self.redis_connection_ids.get(i) == object_id {
+                return i;
+            }
+            i += 1;
+        }
+        return -1;
+    }
+
+    func has_redis_connection(self: ObjectSpace, object_id: Int) -> Bool {
+        return self.redis_connection_index(object_id) >= 0;
+    }
+
+    func put_redis_connection(self: ObjectSpace, object_id: Int, conn: net.redis.Conn) -> Void {
+        let index: Int = self.redis_connection_index(object_id);
+        if index >= 0 {
+            let old: net.redis.Conn = self.redis_connections.remove(index, new net.redis.Conn(0));
+            old.close();
+            _ = self.redis_connection_ids.remove_at(index);
+            _ = self.redis_connection_ids.push(object_id);
+            _ = self.redis_connections.push(conn);
+            return;
+        }
+        _ = self.redis_connection_ids.push(object_id);
+        _ = self.redis_connections.push(conn);
+    }
+
+    func take_redis_connection(self: ObjectSpace, object_id: Int) -> net.redis.Conn {
+        let index: Int = self.redis_connection_index(object_id);
+        _ = self.redis_connection_ids.remove_at(index);
+        return self.redis_connections.remove(index, new net.redis.Conn(0));
+    }
+
+    func close_redis_connection(self: ObjectSpace, object_id: Int) -> Void {
+        let index: Int = self.redis_connection_index(object_id);
+        if index < 0 {
+            return;
+        }
+        let conn: net.redis.Conn = self.redis_connections.remove(index, new net.redis.Conn(0));
+        conn.close();
+        _ = self.redis_connection_ids.remove_at(index);
+    }
+
+    func memcache_connection_index(self: ObjectSpace, object_id: Int) -> Int {
+        let i: Int = 0;
+        loop i < self.memcache_connection_ids.len() {
+            if self.memcache_connection_ids.get(i) == object_id {
+                return i;
+            }
+            i += 1;
+        }
+        return -1;
+    }
+
+    func has_memcache_connection(self: ObjectSpace, object_id: Int) -> Bool {
+        return self.memcache_connection_index(object_id) >= 0;
+    }
+
+    func put_memcache_connection(self: ObjectSpace, object_id: Int, conn: net.memcache.Conn) -> Void {
+        self.close_memcache_connection(object_id);
+        _ = self.memcache_connection_ids.push(object_id);
+        _ = self.memcache_connections.push(conn);
+    }
+
+    func take_memcache_connection(self: ObjectSpace, object_id: Int) -> net.memcache.Conn {
+        let index: Int = self.memcache_connection_index(object_id);
+        _ = self.memcache_connection_ids.remove_at(index);
+        return self.memcache_connections.remove(index, new net.memcache.Conn(0));
+    }
+
+    func close_memcache_connection(self: ObjectSpace, object_id: Int) -> Void {
+        let index: Int = self.memcache_connection_index(object_id);
+        if index < 0 {
+            return;
+        }
+        let conn: net.memcache.Conn = self.memcache_connections.remove(index, new net.memcache.Conn(0));
+        conn.close();
+        _ = self.memcache_connection_ids.remove_at(index);
+    }
+
+    func websocket_connection_index(self: ObjectSpace, object_id: Int) -> Int {
+        let i: Int = 0;
+        loop i < self.websocket_connection_ids.len() {
+            if self.websocket_connection_ids.get(i) == object_id {
+                return i;
+            }
+            i += 1;
+        }
+        return -1;
+    }
+
+    func has_websocket_connection(self: ObjectSpace, object_id: Int) -> Bool {
+        return self.websocket_connection_index(object_id) >= 0;
+    }
+
+    func put_websocket_connection(self: ObjectSpace, object_id: Int, conn: net.websocket.Conn) -> Void {
+        self.close_websocket_connection(object_id);
+        _ = self.websocket_connection_ids.push(object_id);
+        _ = self.websocket_connections.push(conn);
+    }
+
+    func take_websocket_connection(self: ObjectSpace, object_id: Int) -> net.websocket.Conn {
+        let index: Int = self.websocket_connection_index(object_id);
+        _ = self.websocket_connection_ids.remove_at(index);
+        return self.websocket_connections.remove(index, new net.websocket.Conn());
+    }
+
+    func close_websocket_connection(self: ObjectSpace, object_id: Int) -> Void {
+        let index: Int = self.websocket_connection_index(object_id);
+        if index < 0 {
+            return;
+        }
+        let conn: net.websocket.Conn = self.websocket_connections.remove(index, new net.websocket.Conn());
+        _ = conn.close();
+        _ = self.websocket_connection_ids.remove_at(index);
+    }
+
+    func socket_index(self: ObjectSpace, object_id: Int) -> Int {
+        let i: Int = 0;
+        loop i < self.socket_ids.len() {
+            if self.socket_ids.get(i) == object_id {
+                return i;
+            }
+            i += 1;
+        }
+        return -1;
+    }
+
+    func has_socket(self: ObjectSpace, object_id: Int) -> Bool {
+        return self.socket_index(object_id) >= 0;
+    }
+
+    func socket_fd(self: ObjectSpace, object_id: Int) -> Int {
+        let index: Int = self.socket_index(object_id);
+        return index >= 0 ? self.socket_fds.get(index) : -1;
+    }
+
+    func socket_type(self: ObjectSpace, object_id: Int) -> Int {
+        let index: Int = self.socket_index(object_id);
+        return index >= 0 ? self.socket_types.get(index) : 0;
+    }
+
+    func close_socket_fd(self: ObjectSpace, fd: Int, socket_type: Int) -> Void {
+        if socket_type == 1 {
+            net.tcp.close(fd);
+        } else if socket_type == 2 {
+            net.udp.close(fd);
+        } else if socket_type == 3 {
+            net.unix.socket.close(fd);
+        }
+    }
+
+    func put_socket(self: ObjectSpace, object_id: Int, fd: Int, socket_type: Int) -> Void {
+        self.close_socket(object_id);
+        _ = self.socket_ids.push(object_id);
+        _ = self.socket_fds.push(fd);
+        _ = self.socket_types.push(socket_type);
+    }
+
+    func take_socket_fd(self: ObjectSpace, object_id: Int) -> Int {
+        let index: Int = self.socket_index(object_id);
+        if index < 0 {
+            return -1;
+        }
+        let fd: Int = self.socket_fds.get(index);
+        _ = self.socket_ids.remove_at(index);
+        _ = self.socket_fds.remove_at(index);
+        _ = self.socket_types.remove_at(index);
+        return fd;
+    }
+
+    func close_socket(self: ObjectSpace, object_id: Int) -> Void {
+        let index: Int = self.socket_index(object_id);
+        if index < 0 {
+            return;
+        }
+        self.close_socket_fd(self.socket_fds.get(index), self.socket_types.get(index));
+        _ = self.socket_ids.remove_at(index);
+        _ = self.socket_fds.remove_at(index);
+        _ = self.socket_types.remove_at(index);
+    }
+
+    // Adds or resolves language-visible objects. Returned IDs are the only
+    // object identity exposed through Variant values.
+    func add(self: ObjectSpace, obj: RuntimeObject) -> Int {
+        let id: Int = self.next_id;
+        let obj_store: asp.runtime.KeyValueStore = obj.store;
+        let obj_items: collections.Vector<asp.runtime.Variant> = obj.items;
+        let obj_rows: collections.Vector<asp.runtime.KeyValueStore> = obj.rows;
+        let obj_original_rows: collections.Vector<asp.runtime.KeyValueStore> = obj.original_rows;
+        self.next_id += 1;
+        _ = self.ids.push(id);
+        _ = self.objects.push(obj);
+        _ = __gc_keepalive(obj_store);
+        _ = __gc_keepalive(obj_items);
+        _ = __gc_keepalive(obj_rows);
+        _ = __gc_keepalive(obj_original_rows);
+        _ = __gc_keepalive(self.ids);
+        _ = __gc_keepalive(self.objects);
+        _ = __gc_keepalive(self);
+        return id;
+    }
+
+    func get(self: ObjectSpace, id: Int) -> RuntimeObject {
+        let i: Int = 0;
+        loop i < self.ids.len() {
+            if self.ids.get(i) == id {
+                return self.objects.get(i);
+            }
+            i += 1;
+        }
+        return new RuntimeObject();
+    }
+
+    func set(self: ObjectSpace, id: Int, obj: RuntimeObject) -> Bool {
+        let i: Int = 0;
+        loop i < self.ids.len() {
+            if self.ids.get(i) == id {
+                _ = self.objects.push(obj);
+                let appended_index: Int = self.objects.len() - 1;
+                self.objects.swap(i, appended_index);
+                _ = self.objects.pop_back(new RuntimeObject());
+                return true;
+            }
+            i += 1;
+        }
+        return false;
+    }
+
+    func clear(self: ObjectSpace) -> Void {
+        self.close_connections();
+        self.ids.dispose();
+        self.objects.dispose();
+        self.ids = new collections.Vector<Int>();
+        self.objects = new collections.Vector<RuntimeObject>();
+        self.next_id = 1;
+    }
+
+    func create_dictionary(self: ObjectSpace) -> Int {
+        return self.create_component("Scripting.Dictionary");
+    }
+
+    func create_ado_connection(self: ObjectSpace) -> Int {
+        return self.create_component("ADODB.Connection");
+    }
+
+    func create_ado_recordset(self: ObjectSpace) -> Int {
+        return self.create_component("ADODB.Recordset");
+    }
+
+    func create_component(self: ObjectSpace, prog_id: String) -> Int {
+        let component: asp.object.ComponentDescriptor = asp.object.resolve(prog_id);
+        if component.kind == asp.object.ComponentUnknown {
+            return 0;
+        }
+        let obj: RuntimeObject = new RuntimeObject();
+        obj.component_kind = component.kind;
+        obj.prog_id = component.prog_id;
+        obj.default_member = component.default_member;
+        if component.kind == asp.object.ComponentDictionary {
+            obj.kind = RuntimeObjectDictionary;
+        } else if component.kind == asp.object.ComponentAdoConnection {
+            obj.kind = RuntimeObjectAdoConnection;
+        } else if component.kind == asp.object.ComponentAdoRecordset {
+            obj.kind = RuntimeObjectAdoRecordset;
+        }
+        return self.add(obj);
+    }
+
+    func create_user_class(self: ObjectSpace, class_name: String) -> Int {
+        let obj: RuntimeObject = new RuntimeObject();
+        obj.kind = RuntimeObjectUserClass;
+        obj.class_name = class_name;
+        obj.prog_id = class_name;
+        obj.default_member = "Value";
+        return self.add(obj);
+    }
+}
+
+// One routine's local bindings. Names and values are parallel vectors to keep
+// deterministic declaration order and cheap indexed access after binding.
+class CallFrame {
+    var slots: collections.Vector<asp.runtime.Variant>;
+    var slot_indices: collections.Map<String, Int>;
+
+    func init(self: CallFrame) -> Void {
+        self.slots = new collections.Vector<asp.runtime.Variant>();
+        self.slot_indices = new collections.Map<String, Int>();
+    }
+
+    func bind(self: CallFrame, name: String, value: asp.runtime.Variant) -> Int {
+        let key: String = strings.to_lower_ascii(name);
+        let existing: Int = self.slot_indices.get_or(key, -1);
+        if existing >= 0 {
+            _ = self.slots.set(existing, value);
+            return existing;
+        }
+        let slot: Int = self.slots.len();
+        _ = self.slots.push(value);
+        _ = self.slot_indices.set(key, slot);
+        return slot;
+    }
+
+    func has(self: CallFrame, name: String) -> Bool {
+        return self.slot_indices.has(strings.to_lower_ascii(name));
+    }
+
+    func get_or_empty(self: CallFrame, name: String) -> asp.runtime.Variant {
+        let slot: Int = self.slot_indices.get_or(strings.to_lower_ascii(name), -1);
+        return slot >= 0 && slot < self.slots.len() ? self.slots.get(slot) : asp.runtime.variant_empty();
+    }
+
+    func set(self: CallFrame, name: String, value: asp.runtime.Variant) -> Void {
+        let slot: Int = self.slot_indices.get_or(strings.to_lower_ascii(name), -1);
+        if slot >= 0 && slot < self.slots.len() {
+            _ = self.slots.set(slot, value);
+        } else {
+            _ = self.bind(name, value);
+        }
+    }
+}
+
+// Lexical/runtime scope. `parent` supports nested dynamic execution; constants
+// are tracked separately so assignment can reject writes without changing the
+// value representation. `reset` is required before a pooled scope is reused.
+class Scope {
+    var vars: asp.runtime.KeyValueStore;
+    var const_names: collections.Vector<String>;
+    var call_frame: CallFrame;
+    var parent: Scope;
+    var has_parent: Bool;
+    var function_name: String;
+    var me_object_id: Int;
+    var me_class_name: String;
+
+    func init(self: Scope) -> Void {
+        self.vars = new asp.runtime.KeyValueStore();
+        self.const_names = new collections.Vector<String>();
+        self.call_frame = new CallFrame();
+        self.parent = self;
+        self.has_parent = false;
+        self.function_name = "";
+        self.me_object_id = 0;
+        self.me_class_name = "";
+    }
+
+    func set_parent(self: Scope, parent: Scope) -> Void {
+        self.parent = parent;
+        self.has_parent = true;
+    }
+
+    func has_const(self: Scope, name: String) -> Bool {
+        let lc: String = strings.to_lower_ascii(name);
+        let i: Int = 0;
+        loop i < self.const_names.len() {
+            if self.const_names.get(i) == lc {
+                return true;
+            }
+            i += 1;
+        }
+        return false;
+    }
+
+    func add_const(self: Scope, name: String) -> Void {
+        let lc: String = strings.to_lower_ascii(name);
+        if !self.has_const(lc) {
+            _ = self.const_names.push(lc);
+        }
+    }
+
+    func reset(self: Scope) -> Void {
+        self.vars.clear();
+        self.const_names.clear();
+        self.call_frame.slots.clear();
+        self.call_frame.slot_indices.dispose();
+        self.call_frame.slot_indices = new collections.Map<String, Int>();
+        self.parent = self;
+        self.has_parent = false;
+        self.function_name = "";
+        self.me_object_id = 0;
+        self.me_class_name = "";
+    }
+}

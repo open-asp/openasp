@@ -1,0 +1,350 @@
+// Copyright (c) 2026 OpenASP.dev
+// SPDX-License-Identifier: MIT
+
+module asp.object.database;
+
+use asp;
+use asp.object;
+use asp.runtime;
+use asp.vm;
+
+use collections;
+use net.mysql;
+use protocol.mysql;
+use std;
+use strconv;
+use strings;
+use sync;
+
+
+// Length-prefix each string field so different configurations cannot collide
+// through delimiter characters embedded in credentials or initialization SQL.
+func mysql_pool_key_part(value: String) -> String {
+    return strconv.itoa(std.len(value)) + ":" + value;
+}
+
+func mysql_pool_key(cfg: protocol.mysql.Config) -> String {
+    return mysql_pool_key_part(cfg.host)
+        + "|" + strconv.itoa(cfg.port)
+        + "|" + mysql_pool_key_part(cfg.user)
+        + "|" + mysql_pool_key_part(cfg.password)
+        + "|" + mysql_pool_key_part(cfg.database)
+        + "|" + mysql_pool_key_part(cfg.charset_name)
+        + "|" + mysql_pool_key_part(cfg.collation)
+        + "|" + mysql_pool_key_part(cfg.time_zone)
+        + "|" + mysql_pool_key_part(cfg.sql_mode)
+        + "|" + mysql_pool_key_part(cfg.init_command)
+        + "|" + (cfg.tls ? "1" : "0")
+        + "|" + (cfg.tls_verify ? "1" : "0")
+        + "|" + mysql_pool_key_part(cfg.tls_ca_file)
+        + "|" + mysql_pool_key_part(cfg.tls_server_name)
+        + "|" + (cfg.allow_cleartext_password ? "1" : "0")
+        + "|" + (cfg.allow_local_infile ? "1" : "0")
+        + "|" + (cfg.allow_public_key_retrieval ? "1" : "0")
+        + "|" + mysql_pool_key_part(cfg.local_infile_root)
+        + "|" + strconv.itoa(cfg.max_local_infile_bytes)
+        + "|" + (cfg.compression ? "1" : "0")
+        + "|" + strconv.itoa(cfg.compression_min_bytes)
+        + "|" + strconv.itoa(cfg.max_uncompressed_packet_bytes)
+        + "|" + (cfg.multi_statements ? "1" : "0")
+        + "|" + strconv.itoa(cfg.timeout_ms)
+        + "|" + strconv.itoa(cfg.charset);
+}
+
+// Pools outlive request arenas. Promote every string before retaining the
+// configuration in engine-owned state.
+func mysql_promoted_config(cfg: protocol.mysql.Config) -> protocol.mysql.Config {
+    let out: protocol.mysql.Config = new protocol.mysql.Config();
+    out.host = asp.runtime.promote_runtime_string(cfg.host);
+    out.port = cfg.port;
+    out.user = asp.runtime.promote_runtime_string(cfg.user);
+    out.password = asp.runtime.promote_runtime_string(cfg.password);
+    out.database = asp.runtime.promote_runtime_string(cfg.database);
+    out.charset_name = asp.runtime.promote_runtime_string(cfg.charset_name);
+    out.collation = asp.runtime.promote_runtime_string(cfg.collation);
+    out.time_zone = asp.runtime.promote_runtime_string(cfg.time_zone);
+    out.sql_mode = asp.runtime.promote_runtime_string(cfg.sql_mode);
+    out.init_command = asp.runtime.promote_runtime_string(cfg.init_command);
+    out.tls = cfg.tls;
+    out.tls_verify = cfg.tls_verify;
+    out.tls_ca_file = asp.runtime.promote_runtime_string(cfg.tls_ca_file);
+    out.tls_server_name = asp.runtime.promote_runtime_string(cfg.tls_server_name);
+    out.allow_cleartext_password = cfg.allow_cleartext_password;
+    out.allow_local_infile = cfg.allow_local_infile;
+    out.allow_public_key_retrieval = cfg.allow_public_key_retrieval;
+    out.local_infile_root = asp.runtime.promote_runtime_string(cfg.local_infile_root);
+    out.max_local_infile_bytes = cfg.max_local_infile_bytes;
+    out.compression = cfg.compression;
+    out.compression_min_bytes = cfg.compression_min_bytes;
+    out.max_uncompressed_packet_bytes = cfg.max_uncompressed_packet_bytes;
+    out.multi_statements = cfg.multi_statements;
+    out.timeout_ms = cfg.timeout_ms;
+    out.charset = cfg.charset;
+    return out;
+}
+
+// Worker-wide pool registry keyed by the complete wire/security configuration.
+// keys and pools have identical indices and are protected by mu. `closed`
+// makes teardown idempotent.
+class MysqlPoolRegistry {
+    var keys: collections.Vector<String>;
+    var pools: collections.Vector<net.mysql.Pool>;
+    var mu: sync.Mutex;
+    var max_size: Int;
+    var closed: Bool;
+
+    func init(self: MysqlPoolRegistry, max_size: Int = 4) -> Void {
+        self.keys = new collections.Vector<String>();
+        self.pools = new collections.Vector<net.mysql.Pool>();
+        self.mu = new sync.Mutex();
+        self.max_size = max_size > 0 ? max_size : 1;
+        self.closed = false;
+    }
+
+    // Return an existing pool or publish a fully configured one while holding
+    // the registry lock. Pool operations have their own synchronization.
+    func get(self: MysqlPoolRegistry, cfg: protocol.mysql.Config) -> net.mysql.Pool {
+        let key: String = mysql_pool_key(cfg);
+        _ = self.mu.lock();
+        let i: Int = 0;
+        loop i < self.keys.len() {
+            if self.keys.get_unchecked(i) == key {
+                let pool: net.mysql.Pool = self.pools.get_unchecked(i);
+                _ = self.mu.unlock();
+                return pool;
+            }
+            i += 1;
+        }
+        let stable_cfg: protocol.mysql.Config = mysql_promoted_config(cfg);
+        let pool: net.mysql.Pool = new net.mysql.Pool(stable_cfg, self.max_size);
+        pool.configure(stable_cfg.timeout_ms, 300000, 1800000, "SELECT 1", false, 60000);
+        _ = self.keys.push(asp.runtime.promote_runtime_string(key));
+        _ = self.pools.push(pool);
+        _ = self.mu.unlock();
+        return pool;
+    }
+
+    func close(self: MysqlPoolRegistry) -> Void {
+        _ = self.mu.lock();
+        if self.closed {
+            _ = self.mu.unlock();
+            return;
+        }
+        self.closed = true;
+        let i: Int = 0;
+        loop i < self.pools.len() {
+            self.pools.get_unchecked(i).close();
+            i += 1;
+        }
+        self.pools.clear();
+        self.keys.clear();
+        _ = self.mu.unlock();
+    }
+}
+
+func mysql_config(obj: asp.vm.RuntimeObject) -> protocol.mysql.Config {
+    let cfg: protocol.mysql.Config = new protocol.mysql.Config();
+    cfg.host = obj.store.get_first(strings.split("server,host", ","), cfg.host);
+    cfg.database = obj.store.get_first(strings.split("database,initial catalog", ","), cfg.database);
+    cfg.user = obj.store.get_first(strings.split("user id,uid,user,username", ","), cfg.user);
+    cfg.password = obj.store.get_first(strings.split("password,pwd", ","), cfg.password);
+    cfg.charset_name = obj.store.get_first(strings.split("charset,character set", ","), cfg.charset_name);
+    let port_text: String = obj.store.get_first(strings.split("port", ","));
+    let timeout_text: String = obj.store.get_first(strings.split("connection timeout,connect timeout,timeout", ","));
+    if std.len(port_text) > 0 {
+        cfg.port = strconv.atoi(port_text);
+    }
+    if std.len(timeout_text) > 0 {
+        cfg.timeout_ms = strconv.atoi(timeout_text) * 1000;
+    }
+    let charset_id: Int = protocol.mysql.charset_id(cfg.charset_name);
+    if charset_id != 0 {
+        cfg.charset = charset_id;
+    }
+    return cfg;
+}
+
+func mysql_error_text(conn: net.mysql.Conn, err: ErrCode) -> String {
+    if conn.last_error_code() != 0 {
+        return conn.last_error_text();
+    }
+    return "MySQL protocol error " + strconv.itoa(err => Int);
+}
+
+// Lease one connection into the request ObjectSpace. close_mysql_connection
+// returns it to the same pool instead of destroying the underlying socket.
+func mysql_open(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, obj: asp.vm.RuntimeObject) -> Bool {
+    if ctx.objects.has_mysql_connection(obj_id) {
+        return true;
+    }
+    let cfg: protocol.mysql.Config = mysql_config(obj);
+    let pool: net.mysql.Pool = evaluator.engine.mysql_pools.get(cfg);
+    let conn, err = pool.get();
+    if err != std.OK {
+        evaluator.raise_runtime_error(ctx, 3709, "MySQL connection failed with protocol error " + strconv.itoa(err => Int), "ADODB.Connection");
+        return false;
+    }
+    ctx.objects.put_mysql_connection(obj_id, conn, pool);
+    return true;
+}
+
+func mysql_close(ctx: asp.runtime.RequestContext, obj_id: Int) -> Void {
+    ctx.objects.close_mysql_connection(obj_id);
+}
+
+func mysql_cell_variant(column: protocol.mysql.ColumnDefinition, cell: protocol.mysql.ResultCell) -> asp.runtime.Variant {
+    if cell.is_null {
+        return asp.runtime.variant_null();
+    }
+    let column_type: Int = column.column_type;
+    if column_type == protocol.mysql.type_tiny()
+    || column_type == protocol.mysql.type_short()
+    || column_type == protocol.mysql.type_long()
+    || column_type == protocol.mysql.type_longlong()
+    || column_type == protocol.mysql.type_int24()
+    || column_type == protocol.mysql.type_year()
+    || column_type == protocol.mysql.type_bit() {
+        return asp.runtime.variant_int(strconv.atoi(cell.text));
+    }
+    if column_type == protocol.mysql.type_float()
+    || column_type == protocol.mysql.type_double()
+    || column_type == protocol.mysql.type_decimal()
+    || column_type == protocol.mysql.type_newdecimal() {
+        return asp.runtime.variant_float(strconv.parse_float64(cell.text));
+    }
+    return asp.runtime.variant_string(cell.text);
+}
+
+// Convert protocol rows into request-arena native cells when possible. The
+// Recordset stores its owning connection id for later command/update behavior.
+func mysql_result_recordset(ctx: asp.runtime.RequestContext, connection_id: Int, sql: String, result: net.mysql.QueryResult) -> asp.runtime.Variant {
+    let rs: asp.vm.RuntimeObject = new asp.vm.RuntimeObject();
+    rs.kind = asp.vm.RuntimeObjectAdoRecordset;
+    rs.component_kind = asp.object.ComponentAdoRecordset;
+    rs.prog_id = "ADODB.Recordset";
+    rs.opened = true;
+    rs.text_value = sql;
+    rs.secondary_text = strconv.itoa(connection_id);
+    rs.int_value = result.ok.affected_rows;
+    if result.is_result_set {
+        let native_rows: Bool = rs.create_native_rows(
+            ctx.request_arena_handle,
+            result.result_set.rows.len(),
+            result.result_set.columns.len()
+        );
+        let column_index: Int = 0;
+        loop column_index < result.result_set.columns.len() {
+            _ = rs.items.push(asp.runtime.variant_string(result.result_set.columns.get(column_index).name));
+            column_index += 1;
+        }
+        let row_index: Int = 0;
+        loop row_index < result.result_set.rows.len() {
+            let source_row: protocol.mysql.Row = result.result_set.rows.get(row_index);
+            if native_rows {
+                column_index = 0;
+                loop column_index < result.result_set.columns.len() {
+                    if column_index < source_row.cells.len() {
+                        let cell: protocol.mysql.ResultCell = source_row.cells.get(column_index);
+                        _ = rs.set_native_cell(
+                            row_index,
+                            column_index,
+                            mysql_cell_variant(result.result_set.columns.get(column_index), cell)
+                        );
+                    } else {
+                        _ = rs.set_native_null_cell(row_index, column_index);
+                    }
+                    column_index += 1;
+                }
+            } else {
+                let row: asp.runtime.KeyValueStore = new asp.runtime.KeyValueStore();
+                column_index = 0;
+                loop column_index < result.result_set.columns.len() {
+                    let column: protocol.mysql.ColumnDefinition = result.result_set.columns.get(column_index);
+                    let value: asp.runtime.Variant = column_index < source_row.cells.len()
+                        ? mysql_cell_variant(column, source_row.cells.get(column_index))
+                        : asp.runtime.variant_null();
+                    _ = row.set(column.name, value);
+                    column_index += 1;
+                }
+                _ = rs.rows.push(row);
+                _ = rs.original_rows.push(row.clone());
+            }
+            row_index += 1;
+        }
+    }
+    let recordset_id: Int = ctx.objects.add(rs);
+    return asp.runtime.variant_object(recordset_id);
+}
+
+func mysql_execute_result(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, sql: String, result: net.mysql.QueryResult, err: ErrCode, conn: net.mysql.Conn) -> asp.runtime.Variant {
+    // A transport/protocol failure may return an empty QueryResult whose
+    // nested error object is not initialized. Inspect it only after the
+    // top-level operation succeeded.
+    if err != std.OK {
+        evaluator.raise_runtime_error(ctx, 3000, mysql_error_text(conn, err) + "; SQL: " + sql, "ADODB.Connection");
+        return asp.runtime.variant_empty();
+    }
+    if result.err.code != 0 {
+        let message: String = "mysql error " + strconv.itoa(result.err.code) + " [" + result.err.sql_state + "] " + result.err.message;
+        evaluator.raise_runtime_error(ctx, 3000, message + "; SQL: " + sql, "ADODB.Connection");
+        return asp.runtime.variant_empty();
+    }
+    return mysql_result_recordset(ctx, obj_id, sql, result);
+}
+
+func mysql_execute(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, obj_id: Int, sql: String) -> asp.runtime.Variant {
+    if !ctx.objects.has_mysql_connection(obj_id) {
+        evaluator.raise_runtime_error(ctx, 3709, "MySQL connection is not open", "ADODB.Connection");
+        return asp.runtime.variant_empty();
+    }
+    let mysql_sql: String = sql_mysql_rewrite(sql);
+    let conn: net.mysql.Conn = ctx.objects.mysql_connection(obj_id);
+    let result, err = conn.query(mysql_sql);
+    return mysql_execute_result(evaluator, ctx, obj_id, mysql_sql, result, err, conn);
+}
+
+func mysql_parameter_value(parameter: asp.vm.RuntimeObject) -> protocol.mysql.StmtParam {
+    if parameter.cursor == 2 || parameter.cursor == 3 || parameter.cursor == 4 || parameter.cursor == 5 || parameter.cursor == 6 || parameter.cursor == 16 || parameter.cursor == 17 || parameter.cursor == 18 || parameter.cursor == 19 || parameter.cursor == 20 || parameter.cursor == 21 {
+        return protocol.mysql.param_i64(strconv.atoi(parameter.text_value));
+    }
+    if parameter.cursor == 11 {
+        return protocol.mysql.param_i32(strings.equal_fold_ascii(parameter.text_value, "true") || parameter.text_value == "1" || parameter.text_value == "-1" ? 1 : 0);
+    }
+    if parameter.cursor == 128 || parameter.cursor == 204 || parameter.cursor == 205 {
+        return protocol.mysql.param_blob(parameter.text_value);
+    }
+    return protocol.mysql.param_string(parameter.text_value);
+}
+
+func mysql_execute_command(evaluator: asp.Evaluator, ctx: asp.runtime.RequestContext, connection_id: Int, command: asp.vm.RuntimeObject) -> asp.runtime.Variant {
+    if std.len(command.class_name) == 0 {
+        return mysql_execute(evaluator, ctx, connection_id, command.text_value);
+    }
+    if !ctx.objects.has_mysql_connection(connection_id) {
+        evaluator.raise_runtime_error(ctx, 3709, "MySQL connection is not open", "ADODB.Command");
+        return asp.runtime.variant_empty();
+    }
+    let parameters: asp.vm.RuntimeObject = ctx.objects.get(strconv.atoi(command.class_name));
+    let parameter_ids: collections.Vector<String> = strings.split(parameters.text_value, ",");
+    let conn: net.mysql.Conn = ctx.objects.mysql_connection(connection_id);
+    let mysql_sql: String = sql_mysql_rewrite(command.text_value);
+    let statement, prepare_err = conn.prepare(mysql_sql);
+    if prepare_err != std.OK {
+        evaluator.raise_runtime_error(ctx, 3000, mysql_error_text(conn, prepare_err) + "; SQL: " + mysql_sql, "ADODB.Command");
+        return asp.runtime.variant_empty();
+    }
+    if statement.param_count != parameters.int_value {
+        _ = conn.stmt_close(statement.statement_id);
+        evaluator.raise_runtime_error(ctx, 3001, "parameter count mismatch: statement expects " + strconv.itoa(statement.param_count) + ", received " + strconv.itoa(parameters.int_value), "ADODB.Command");
+        return asp.runtime.variant_empty();
+    }
+    let bound: collections.Vector<protocol.mysql.StmtParam> = new collections.Vector<protocol.mysql.StmtParam>();
+    let i: Int = 0;
+    loop i < parameters.int_value && i < parameter_ids.len() {
+        _ = bound.push(mysql_parameter_value(ctx.objects.get(strconv.atoi(parameter_ids.get(i)))));
+        i += 1;
+    }
+    let result, execute_err = conn.stmt_execute(statement.statement_id, bound);
+    _ = conn.stmt_close(statement.statement_id);
+    return mysql_execute_result(evaluator, ctx, connection_id, mysql_sql, result, execute_err, conn);
+}
