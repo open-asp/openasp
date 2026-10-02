@@ -758,6 +758,7 @@ Provider、扩展组件注册表、请求状态、日志、arena 和 GC 服务�
 ## 验证
 
 ```sh
+make test-source-paths
 make test-openasp-commands
 make test-vbscript-bnf
 make test-backend-components

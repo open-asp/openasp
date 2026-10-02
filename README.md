@@ -784,6 +784,7 @@ Repository layout:
 ## Verification
 
 ```sh
+make test-source-paths
 make test-openasp-commands
 make test-vbscript-bnf
 make test-backend-components
