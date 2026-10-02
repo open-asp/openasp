@@ -1,6 +1,6 @@
 # ASP HTTP Server Examples
 
-[Chinese](README.zh-CN.md)
+[中文](README.zh-CN.md)
 
 These examples do not depend on `openasp-fpm`, Nginx, or external scripts.
 `server.asp` implements the HTTP listener, request-header parsing, and response

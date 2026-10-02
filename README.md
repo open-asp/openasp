@@ -20,7 +20,7 @@
   <a href="#architecture">Architecture</a> |
   <a href="docs/OpenASP%E5%91%BD%E4%BB%A4%E8%A1%8C.md">CLI</a> |
   <a href="https://openasp.dev">Website</a> |
-  <a href="README.zh-CN.md">Chinese</a>
+  <a href="README.zh-CN.md">中文</a>
 </p>
 
 Official website: **[https://openasp.dev](https://openasp.dev)**. For questions, suggestions, or other feedback, please visit the website.

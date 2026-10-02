@@ -1,6 +1,6 @@
 # ASP Server Module
 
-[Chinese](README.zh-CN.md)
+[中文](README.zh-CN.md)
 
 `asp.server` owns only server processes, FastCGI protocol adaptation, and
 request dispatch. The ASP language runtime, compiler, VM, and client-side

@@ -1,6 +1,6 @@
 # Native Modules
 
-[Chinese](README.zh-CN.md)
+[中文](README.zh-CN.md)
 
 Native C implementations are organized by responsibility. Source files do not
 live directly in the `native/` root.
