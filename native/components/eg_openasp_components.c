@@ -11,10 +11,14 @@
 #include <openssl/rand.h>
 #include <poll.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -737,4 +741,52 @@ int64_t eg_openasp_process_signal(int64_t pid, int64_t signal_number) {
 
 int64_t eg_openasp_process_exit(int64_t exit_code) {
     _exit((int)(exit_code & 255));
+}
+
+static const char* eg_fpm_socket_path(eg_string_t* value) {
+    if (!value || eg_string_len(value) <= 0) return NULL;
+    const char* path = eg_string_cstr(value);
+    if (!path || (size_t)eg_string_len(value) != strlen(path)) return NULL;
+    return path;
+}
+
+int64_t eg_openasp_fpm_socket_prepare(eg_string_t* path_value) {
+    const char* path = eg_fpm_socket_path(path_value);
+    struct stat info;
+    if (!path) return -1;
+    if (lstat(path, &info) != 0) return errno == ENOENT ? 0 : -1;
+    if (!S_ISSOCK(info.st_mode)) return -2;
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un address;
+    size_t path_length = strlen(path);
+    if (path_length >= sizeof(address.sun_path)) {
+        close(fd);
+        return -1;
+    }
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, path, path_length + 1);
+    int connect_rc = connect(fd, (struct sockaddr*)&address, (socklen_t)(offsetof(struct sockaddr_un, sun_path) + path_length + 1));
+    int connect_error = errno;
+    close(fd);
+    if (connect_rc == 0 || (connect_error != ECONNREFUSED && connect_error != ENOENT)) return -3;
+    if (connect_error == ENOENT) return 0;
+    return unlink(path) == 0 ? 1 : -1;
+}
+
+int64_t eg_openasp_fpm_socket_chmod(eg_string_t* path_value, int64_t mode) {
+    const char* path = eg_fpm_socket_path(path_value);
+    if (!path || mode < 0 || mode > 0777) return -1;
+    return chmod(path, (mode_t)mode) == 0 ? 0 : -1;
+}
+
+int64_t eg_openasp_fpm_socket_cleanup(eg_string_t* path_value) {
+    const char* path = eg_fpm_socket_path(path_value);
+    struct stat info;
+    if (!path) return -1;
+    if (lstat(path, &info) != 0) return errno == ENOENT ? 0 : -1;
+    if (!S_ISSOCK(info.st_mode)) return -2;
+    return unlink(path) == 0 ? 0 : -1;
 }

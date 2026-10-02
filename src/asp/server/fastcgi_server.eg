@@ -18,6 +18,12 @@ class FastcgiServer {
 
     // Starts the blocking master lifecycle and returns its process exit status.
     async func run_tcp(self: FastcgiServer, host: String, port: Int, max_accepts: Int, workers: Int, max_concurrent_connections: Int, aot_enabled: Bool = true) -> Int {
-        return await self.master.run(host, port, max_accepts, workers, max_concurrent_connections, aot_enabled);
+        return await self.master.run_tcp(host, port, max_accepts, workers, max_concurrent_connections, aot_enabled);
+    }
+
+    // Unix sockets avoid exposing FastCGI on a TCP port and let the filesystem
+    // permission boundary restrict which local gateways may connect.
+    async func run_unix(self: FastcgiServer, socket_path: String, max_accepts: Int, workers: Int, max_concurrent_connections: Int, aot_enabled: Bool = true) -> Int {
+        return await self.master.run_unix(socket_path, max_accepts, workers, max_concurrent_connections, aot_enabled);
     }
 }

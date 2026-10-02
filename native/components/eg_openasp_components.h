@@ -37,6 +37,14 @@ eg_string_t* eg_openasp_process_waitpid(int64_t pid, int64_t timeout_ms);
 int64_t eg_openasp_process_signal(int64_t pid, int64_t signal_number);
 int64_t eg_openasp_process_exit(int64_t exit_code);
 
+/*
+ * Unix FastCGI listener helpers distinguish socket nodes from ordinary files,
+ * reject active listeners, and constrain the created endpoint permissions.
+ */
+int64_t eg_openasp_fpm_socket_prepare(eg_string_t* path);
+int64_t eg_openasp_fpm_socket_chmod(eg_string_t* path, int64_t mode);
+int64_t eg_openasp_fpm_socket_cleanup(eg_string_t* path);
+
 #ifdef __cplusplus
 }
 #endif

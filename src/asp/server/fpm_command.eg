@@ -18,7 +18,7 @@ class OpenAspFpm {
 
     func print_help(self: OpenAspFpm) -> Void {
         print("openasp-fpm: FastCGI server for OpenASP");
-        print("Usage: openasp-fpm [--root <dir>] [--host <127.0.0.1>] [--port <9000>] [--max-accepts <n>] [--workers <n>] [--worker-connections <n>] [--aot=on|off (default: on)] [--optimize=on|off (default: on)] [--log-file <path|off>] [--log-level <level|off>] [--shell-enable=on] [--process-enable=on]");
+        print("Usage: openasp-fpm [--root <dir>] [--host <127.0.0.1> --port <9000> | --unix-socket <path>] [--max-accepts <n>] [--workers <n>] [--worker-connections <n>] [--aot=on|off (default: on)] [--optimize=on|off (default: on)] [--log-file <path|off>] [--log-level <level|off>] [--shell-enable=on] [--process-enable=on]");
     }
 
     // Invalid option values return 2; runtime startup/worker failures propagate
@@ -54,26 +54,40 @@ class OpenAspFpm {
         let root_dir: String = args.value(argc, argv, "--root", ".");
         let host: String = args.value(argc, argv, "--host", "127.0.0.1");
         let port: Int = strconv.atoi(args.value(argc, argv, "--port", "9000"));
+        let unix_socket: String = args.value(argc, argv, "--unix-socket", "");
+        let unix_socket_requested: Bool = args.has_option(argc, argv, "--unix-socket");
+        if unix_socket_requested && std.len(unix_socket) == 0 {
+            print("invalid --unix-socket value; expected a non-empty filesystem path");
+            logger.error("invalid unix socket path");
+            logger.close();
+            return 2;
+        }
+        if unix_socket_requested && (args.has_option(argc, argv, "--host") || args.has_option(argc, argv, "--port")) {
+            print("--unix-socket cannot be combined with --host or --port");
+            logger.error("conflicting listen options");
+            logger.close();
+            return 2;
+        }
         let max_accepts: Int = strconv.atoi(args.value(argc, argv, "--max-accepts", "0"));
         let workers: Int = strconv.atoi(args.value(argc, argv, "--workers", "2"));
         let worker_connections: Int = strconv.atoi(args.value(argc, argv, "--worker-connections", "128"));
+        let listen_address: String = unix_socket_requested ? "unix:" + unix_socket : host + ":" + strconv.itoa(port);
         logger.info(
             "starting root=" + root_dir
-            + " listen=" + host + ":" + strconv.itoa(port)
+            + " listen=" + listen_address
             + " workers=" + strconv.itoa(workers < 1 ? 1 : workers)
             + " worker_connections=" + strconv.itoa(worker_connections < 1 ? 1 : worker_connections)
             + " max_accepts=" + strconv.itoa(max_accepts)
             + " aot=" + strings.to_lower_ascii(aot_value)
             + " optimize=" + strings.to_lower_ascii(args.value(argc, argv, "--optimize", "on"))
         );
-        let rc: Int = await (new FastcgiServer(root_dir, logger)).run_tcp(
-            host,
-            port,
-            max_accepts,
-            workers,
-            worker_connections,
-            strings.equal_fold_ascii(aot_value, "on")
-        );
+        let server: FastcgiServer = new FastcgiServer(root_dir, logger);
+        let rc: Int = 0;
+        if unix_socket_requested {
+            rc = await server.run_unix(unix_socket, max_accepts, workers, worker_connections, strings.equal_fold_ascii(aot_value, "on"));
+        } else {
+            rc = await server.run_tcp(host, port, max_accepts, workers, worker_connections, strings.equal_fold_ascii(aot_value, "on"));
+        }
         logger.info("stopped status=" + strconv.itoa(rc));
         logger.close();
         return rc;

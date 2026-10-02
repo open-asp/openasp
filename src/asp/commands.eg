@@ -48,6 +48,17 @@ class CommandArgs {
         return false;
     }
 
+    func has_option(self: CommandArgs, argc: Int, argv: Int, flag: String) -> Bool {
+        let prefix: String = flag + "=";
+        loop (let i: Int = 1; i < argc; i += 1) {
+            let arg: String = std.argv_get(argc, argv, i);
+            if arg == flag || strings.starts_with(arg, prefix) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     func first_positional(self: CommandArgs, argc: Int, argv: Int) -> String {
         loop (let i: Int = 1; i < argc; i += 1) {
             let arg: String = std.argv_get(argc, argv, i);
@@ -60,6 +71,7 @@ class CommandArgs {
                 || arg == "--session"
                 || arg == "--host"
                 || arg == "--port"
+                || arg == "--unix-socket"
                 || arg == "--max-accepts"
                 || arg == "--workers"
                 || arg == "--worker-connections"

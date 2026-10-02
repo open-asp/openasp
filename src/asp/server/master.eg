@@ -8,10 +8,15 @@ use asp;
 use std;
 use aio.fs;
 use aio.tcp;
+use aio.unix.socket;
 use collections;
 use os;
 use strings;
 use strconv;
+
+extern func eg_openasp_fpm_socket_prepare(path: String) -> Int;
+extern func eg_openasp_fpm_socket_chmod(path: String, mode: Int) -> Int;
+extern func eg_openasp_fpm_socket_cleanup(path: String) -> Int;
 
 // Parent-process supervisor. It owns the listening descriptor and stable worker
 // slots; children inherit the listener, serve a bounded lifetime, and exit.
@@ -51,35 +56,34 @@ class FastcgiMaster {
 
     // AOT preparation runs in a disposable child before workers fork. This
     // prevents compiler scratch state from becoming part of every worker heap.
-    async func run(self: FastcgiMaster, host: String, port: Int, max_accepts: Int, workers: Int, max_concurrent_connections: Int, aot_enabled: Bool) -> Int {
-        if aot_enabled {
-            let prepare_pid, prepare_fork_err = os.fork();
-            if prepare_fork_err != OK {
-                self.runtime_state.logger.error("aot preparation fork failed");
-                return 1;
-            }
-            if prepare_pid == 0 {
-                let prepare_rc: Int = self.runtime_state.engine.prepare_aot();
-                _ = aio.fs.shutdown();
-                _ = os.exit(prepare_rc);
-                return prepare_rc;
-            }
-            let exited_pid, prepare_wait_err = os.wait_any_pid();
-            let prepare_status: Int = os.wait_any_status();
-            if prepare_wait_err != OK || exited_pid != prepare_pid || prepare_status != 0 {
-                self.runtime_state.logger.error("aot preparation failed status=" + strconv.itoa(prepare_status));
-                return prepare_status != 0 ? prepare_status : 1;
-            }
+    async func prepare_aot(self: FastcgiMaster, aot_enabled: Bool) -> Int {
+        if !aot_enabled {
+            return 0;
         }
-        let lfd, listen_err = aio.tcp.listen(host, port, 128);
-        if listen_err != OK {
-            print("fastcgi listen failed");
-            self.runtime_state.logger.error("listen failed address=" + host + ":" + strconv.itoa(port));
-            return 2;
+        let prepare_pid, prepare_fork_err = os.fork();
+        if prepare_fork_err != OK {
+            self.runtime_state.logger.error("aot preparation fork failed");
+            return 1;
         }
+        if prepare_pid == 0 {
+            let prepare_rc: Int = self.runtime_state.engine.prepare_aot();
+            _ = aio.fs.shutdown();
+            _ = os.exit(prepare_rc);
+            return prepare_rc;
+        }
+        let exited_pid, prepare_wait_err = os.wait_any_pid();
+        let prepare_status: Int = os.wait_any_status();
+        if prepare_wait_err != OK || exited_pid != prepare_pid || prepare_status != 0 {
+            self.runtime_state.logger.error("aot preparation failed status=" + strconv.itoa(prepare_status));
+            return prepare_status != 0 ? prepare_status : 1;
+        }
+        return 0;
+    }
+
+    async func supervise(self: FastcgiMaster, lfd: Int, listen_address: String, max_accepts: Int, workers: Int, max_concurrent_connections: Int, aot_enabled: Bool) -> Int {
         let worker_count: Int = workers < 1 ? 1 : workers;
-        print("fastcgi listening on " + host + ":" + strconv.itoa(port) + " workers=" + strconv.itoa(worker_count) + " worker_connections=" + strconv.itoa(max_concurrent_connections < 1 ? 1 : max_concurrent_connections) + " aot=" + (aot_enabled ? "on" : "off") + " shell=" + (asp.shell_application_enabled() ? "enabled" : "disabled") + " process=" + (asp.process_component_enabled() ? "enabled" : "disabled"));
-        self.runtime_state.logger.info("master listening address=" + host + ":" + strconv.itoa(port));
+        print("fastcgi listening on " + listen_address + " workers=" + strconv.itoa(worker_count) + " worker_connections=" + strconv.itoa(max_concurrent_connections < 1 ? 1 : max_concurrent_connections) + " aot=" + (aot_enabled ? "on" : "off") + " shell=" + (asp.shell_application_enabled() ? "enabled" : "disabled") + " process=" + (asp.process_component_enabled() ? "enabled" : "disabled"));
+        self.runtime_state.logger.info("master listening address=" + listen_address);
         let pids: collections.Vector<Int> = new collections.Vector<Int>();
         loop (let wi: Int = 0; wi < worker_count; wi += 1) {
             let pid, fork_err = await self.fork_worker_slot(lfd, wi, max_accepts, max_concurrent_connections, aot_enabled);
@@ -122,6 +126,52 @@ class FastcgiMaster {
         }
         _ = aio.tcp.close(lfd);
         _ = aio.fs.shutdown();
+        return rc;
+    }
+
+    async func run_tcp(self: FastcgiMaster, host: String, port: Int, max_accepts: Int, workers: Int, max_concurrent_connections: Int, aot_enabled: Bool) -> Int {
+        let prepare_rc: Int = await self.prepare_aot(aot_enabled);
+        if prepare_rc != 0 {
+            return prepare_rc;
+        }
+        let lfd, listen_err = aio.tcp.listen(host, port, 128);
+        if listen_err != OK {
+            print("fastcgi listen failed");
+            self.runtime_state.logger.error("listen failed address=" + host + ":" + strconv.itoa(port));
+            return 2;
+        }
+        return await self.supervise(lfd, host + ":" + strconv.itoa(port), max_accepts, workers, max_concurrent_connections, aot_enabled);
+    }
+
+    async func run_unix(self: FastcgiMaster, socket_path: String, max_accepts: Int, workers: Int, max_concurrent_connections: Int, aot_enabled: Bool) -> Int {
+        let prepare_rc: Int = await self.prepare_aot(aot_enabled);
+        if prepare_rc != 0 {
+            return prepare_rc;
+        }
+        let path_rc: Int = eg_openasp_fpm_socket_prepare(socket_path);
+        if path_rc < 0 {
+            let reason: String = path_rc == -2 ? "path exists and is not a socket" : (path_rc == -3 ? "socket is already active" : "socket path preparation failed");
+            print("fastcgi unix listen failed: " + reason);
+            self.runtime_state.logger.error("unix listen failed path=" + socket_path + " reason=" + reason);
+            return 2;
+        }
+        let lfd, listen_err = aio.unix.socket.listen(socket_path, 128);
+        if listen_err != OK {
+            print("fastcgi unix listen failed");
+            self.runtime_state.logger.error("unix listen failed path=" + socket_path);
+            return 2;
+        }
+        if eg_openasp_fpm_socket_chmod(socket_path, 432) != 0 {
+            print("fastcgi unix socket chmod failed");
+            self.runtime_state.logger.error("unix socket chmod failed path=" + socket_path + " mode=0660");
+            _ = aio.unix.socket.close(lfd);
+            _ = eg_openasp_fpm_socket_cleanup(socket_path);
+            return 2;
+        }
+        let rc: Int = await self.supervise(lfd, "unix:" + socket_path, max_accepts, workers, max_concurrent_connections, aot_enabled);
+        if eg_openasp_fpm_socket_cleanup(socket_path) != 0 {
+            self.runtime_state.logger.warn("unix socket cleanup failed path=" + socket_path);
+        }
         return rc;
     }
 }

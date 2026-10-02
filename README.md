@@ -513,7 +513,7 @@ Set http = Server.CreateObject("OpenASP.HttpClient")
 http.Timeout = 10000
 http.MaxResponseBytes = 1048576
 http.TLSVerify = True
-' http.CAFile = "/etc/ssl/private-service-ca.pem"
+http.CAFile = "/etc/ssl/private-service-ca.pem"
 
 Call http.SetHeader("Accept", "application/json")
 Call http.SetHeader("Content-Type", "application/json")
