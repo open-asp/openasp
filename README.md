@@ -419,6 +419,7 @@ Windows-oriented ProgIDs are implemented by portable runtime components:
 ADO uses native providers selected by the connection string:
 
 ```asp
+<%
 Set db = Server.CreateObject("ADODB.Connection")
 db.Open "Provider=OpenASP.SQLite;Data Source=/srv/www/example/data/site.db"
 
@@ -427,6 +428,7 @@ Do Until rows.EOF
     Response.Write Server.HTMLEncode(rows("title")) & "<br>"
     rows.MoveNext
 Loop
+%>
 ```
 
 | Provider | Connection string |

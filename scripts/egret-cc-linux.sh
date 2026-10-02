@@ -5,4 +5,12 @@
 
 set -euo pipefail
 
-exec cc "$@" $(pkg-config --static --libs libmdbsql) -lssl -lcrypto -lz -ldl -lpthread -lm
+prefix_flags=()
+if [[ -n "${OPENASP_SOURCE_ROOT:-}" ]]; then
+    prefix_flags+=("-ffile-prefix-map=${OPENASP_SOURCE_ROOT}=." "-fdebug-prefix-map=${OPENASP_SOURCE_ROOT}=.")
+fi
+if [[ -n "${EGRET_SOURCE_ROOT:-}" ]]; then
+    prefix_flags+=("-ffile-prefix-map=${EGRET_SOURCE_ROOT}=egret" "-fdebug-prefix-map=${EGRET_SOURCE_ROOT}=egret")
+fi
+
+exec cc "${prefix_flags[@]}" "$@" $(pkg-config --static --libs libmdbsql) -lssl -lcrypto -lz -ldl -lpthread -lm
