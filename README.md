@@ -11,6 +11,7 @@
 </p>
 
 <p align="center">
+  <a href="#install-a-binary-package">Install</a> |
   <a href="#build-from-source">Build</a> |
   <a href="#hello-world">Hello World</a> |
   <a href="#deploy-openasp-fpm-behind-a-web-server">Deployment</a> |
@@ -34,7 +35,10 @@ FastCGI serving, ADO-compatible data access, bytecode execution, and AOT mmap
 loading. Compatibility and performance work stays inside the engine, so
 application code does not need platform-specific workarounds.
 
-Get started with the [source build](#build-from-source) and [first ASP page](#hello-world), then place [`openasp-fpm` behind a web server](#deploy-openasp-fpm-behind-a-web-server).
+Get started with a [binary package](#install-a-binary-package) or a
+[source build](#build-from-source), then run the
+[first ASP page](#hello-world) and place [`openasp-fpm` behind a web
+server](#deploy-openasp-fpm-behind-a-web-server).
 
 ## Beyond Windows and IIS
 
@@ -44,6 +48,43 @@ Get started with the [source build](#build-from-source) and [first ASP page](#he
 | Hosted by IIS | Runs standalone or behind Nginx/FastCGI |
 | Windows-oriented COM and ADO dependencies | Native C components and in-process database drivers |
 | Platform migration requires application rewrites | Compatibility is implemented in the runtime |
+
+## Install a Binary Package
+
+Download the OpenASP 0.1.1 package for your operating system and CPU:
+
+| Platform | Binary package |
+| --- | --- |
+| Linux x86-64 | [`openasp-0.1.1-linux-x86-64.tar.gz`](https://github.com/open-asp/openasp/releases/download/pre-release-0.1.1/openasp-0.1.1-linux-x86-64.tar.gz) |
+| Linux ARM64 | [`openasp-0.1.1-linux-arm64.tar.gz`](https://github.com/open-asp/openasp/releases/download/pre-release-0.1.1/openasp-0.1.1-linux-arm64.tar.gz) |
+| MacOS Apple Silicon | [`openasp-0.1.1-macos-arm64.zip`](https://github.com/open-asp/openasp/releases/download/pre-release-0.1.1/openasp-0.1.1-macos-arm64.zip) |
+
+Each package contains three executables in its `bin/` directory:
+
+- `openasp`: run an ASP page directly.
+- `openasp-cli`: start the interactive command-line environment.
+- `openasp-fpm`: run the FastCGI service.
+
+After downloading, extract the package:
+
+```sh
+# Linux
+tar -xzf openasp-0.1.1-linux-x86-64.tar.gz
+
+# MacOS
+unzip openasp-0.1.1-macos-arm64.zip
+```
+
+Add the extracted `bin/` directory to `PATH`:
+
+```sh
+export PATH="/path/to/openasp-0.1.1-linux-x86-64/bin:$PATH"
+openasp --help
+```
+
+Use the corresponding directory name for Linux ARM64 or MacOS. Add the
+`export` line to your shell profile to keep the setting after restarting the
+terminal.
 
 ## Build from Source
 
@@ -63,44 +104,13 @@ toolchains are available from the
 | Linux x86_64 | `egret-0.1.6-x86_64-unknown-linux-gnu.tar.gz` |
 | Linux ARM64 | `egret-0.1.6-aarch64-unknown-linux-gnu.tar.gz` |
 
-MacOS Apple Silicon:
+Download and extract the matching package, then set `EGRET_HOME` to the
+extracted directory and add `$EGRET_HOME/bin` to `PATH`. Run `egret version`
+to verify the installation.
 
-```sh
-curl -fLO https://github.com/egret-lang/release/raw/main/egret-lang/egret-0.1.6-aarch64-apple-darwin.zip
-unzip egret-0.1.6-aarch64-apple-darwin.zip
-mkdir -p "$HOME/.local/opt"
-mv egret-0.1.6-aarch64-apple-darwin "$HOME/.local/opt/"
-
-export EGRET_HOME="$HOME/.local/opt/egret-0.1.6-aarch64-apple-darwin"
-export PATH="$EGRET_HOME/bin:$PATH"
-egret version
-```
-
-Linux:
-
-```sh
-case "$(uname -m)" in
-    x86_64) EGRET_TARGET=x86_64-unknown-linux-gnu ;;
-    aarch64|arm64) EGRET_TARGET=aarch64-unknown-linux-gnu ;;
-    *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
-esac
-
-curl -fLO "https://github.com/egret-lang/release/raw/main/egret-lang/egret-0.1.6-${EGRET_TARGET}.tar.gz"
-tar -xzf "egret-0.1.6-${EGRET_TARGET}.tar.gz"
-mkdir -p "$HOME/.local/opt"
-mv "egret-0.1.6-${EGRET_TARGET}" "$HOME/.local/opt/"
-
-export EGRET_HOME="$HOME/.local/opt/egret-0.1.6-${EGRET_TARGET}"
-export PATH="$EGRET_HOME/bin:$PATH"
-egret version
-```
-
-Add the two exports to the shell profile for a persistent installation. The
-binary distribution contains the compiler, standard system modules, headers,
-and target definitions. OpenASP's current build also creates a patched cold
-compiler and runtime, so `EGRET_ROOT` below must still point to the matching
-full Egret source tree; installing the binary package does not replace that
-source dependency.
+The binary package provides the compiler and standard files. Building OpenASP
+also requires the matching full Egret source tree; set `EGRET_ROOT` to that
+source directory before running `make`.
 
 ### Linux dependencies
 

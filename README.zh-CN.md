@@ -11,6 +11,7 @@
 </p>
 
 <p align="center">
+  <a href="#通过二进制安装包安装">安装</a> |
   <a href="#从源码构建">构建</a> |
   <a href="#hello-world">Hello World</a> |
   <a href="#将-openasp-fpm-部署在-web-server-之后">部署</a> |
@@ -28,7 +29,9 @@
 
 OpenASP 由 Egret 语言前端和原生 C 运行时组成，内置 FastCGI 服务、ADO 兼容数据访问、字节码执行与 AOT mmap 加载。兼容性、性能优化和系统适配全部在引擎层完成，不要求业务 ASP 编写平台专用的变通逻辑。
 
-从[源码构建](#从源码构建)和[第一个 ASP 页面](#hello-world)开始，再将 [`openasp-fpm` 部署在 Web server 之后](#将-openasp-fpm-部署在-web-server-之后)。
+可以直接[安装二进制发行包](#通过二进制安装包安装)，也可以
+[从源码构建](#从源码构建)。安装后从[第一个 ASP 页面](#hello-world)开始，
+再将 [`openasp-fpm` 部署在 Web server 之后](#将-openasp-fpm-部署在-web-server-之后)。
 
 ## 告别 Windows 与 IIS 限制
 
@@ -38,6 +41,42 @@ OpenASP 由 Egret 语言前端和原生 C 运行时组成，内置 FastCGI 服�
 | 由 IIS 托管 | 可独立运行，也可部署于 Nginx/FastCGI 之后 |
 | 依赖 Windows 平台的 COM 与 ADO | 使用原生 C 组件和进程内数据库驱动 |
 | 跨平台迁移需要改写业务代码 | 兼容逻辑统一由运行时实现 |
+
+## 通过二进制安装包安装
+
+根据操作系统和 CPU 架构下载 OpenASP 0.1.1 安装包：
+
+| 平台 | 二进制安装包 |
+| --- | --- |
+| Linux x86-64 | [`openasp-0.1.1-linux-x86-64.tar.gz`](https://github.com/open-asp/openasp/releases/download/pre-release-0.1.1/openasp-0.1.1-linux-x86-64.tar.gz) |
+| Linux ARM64 | [`openasp-0.1.1-linux-arm64.tar.gz`](https://github.com/open-asp/openasp/releases/download/pre-release-0.1.1/openasp-0.1.1-linux-arm64.tar.gz) |
+| MacOS Apple Silicon | [`openasp-0.1.1-macos-arm64.zip`](https://github.com/open-asp/openasp/releases/download/pre-release-0.1.1/openasp-0.1.1-macos-arm64.zip) |
+
+每个安装包的 `bin/` 目录中包含三个程序：
+
+- `openasp`：直接运行 ASP 页面。
+- `openasp-cli`：启动交互式命令行环境。
+- `openasp-fpm`：启动 FastCGI 服务。
+
+下载后解压：
+
+```sh
+# Linux
+tar -xzf openasp-0.1.1-linux-x86-64.tar.gz
+
+# MacOS
+unzip openasp-0.1.1-macos-arm64.zip
+```
+
+将解压目录中的 `bin/` 加入 `PATH`：
+
+```sh
+export PATH="/path/to/openasp-0.1.1-linux-x86-64/bin:$PATH"
+openasp --help
+```
+
+Linux ARM64 或 MacOS 使用对应的解压目录名。需要永久生效时，将 `export`
+命令加入 shell 配置文件。
 
 ## 从源码构建
 
@@ -56,42 +95,11 @@ OpenASP 当前从源码构建，并依赖 Egret 编译器源码树。构建过�
 | Linux x86_64 | `egret-0.1.6-x86_64-unknown-linux-gnu.tar.gz` |
 | Linux ARM64 | `egret-0.1.6-aarch64-unknown-linux-gnu.tar.gz` |
 
-MacOS Apple Silicon：
+下载并解压对应平台的软件包，将 `EGRET_HOME` 指向解压目录，并把
+`$EGRET_HOME/bin` 加入 `PATH`。执行 `egret version` 可以确认安装是否成功。
 
-```sh
-curl -fLO https://github.com/egret-lang/release/raw/main/egret-lang/egret-0.1.6-aarch64-apple-darwin.zip
-unzip egret-0.1.6-aarch64-apple-darwin.zip
-mkdir -p "$HOME/.local/opt"
-mv egret-0.1.6-aarch64-apple-darwin "$HOME/.local/opt/"
-
-export EGRET_HOME="$HOME/.local/opt/egret-0.1.6-aarch64-apple-darwin"
-export PATH="$EGRET_HOME/bin:$PATH"
-egret version
-```
-
-Linux：
-
-```sh
-case "$(uname -m)" in
-    x86_64) EGRET_TARGET=x86_64-unknown-linux-gnu ;;
-    aarch64|arm64) EGRET_TARGET=aarch64-unknown-linux-gnu ;;
-    *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
-esac
-
-curl -fLO "https://github.com/egret-lang/release/raw/main/egret-lang/egret-0.1.6-${EGRET_TARGET}.tar.gz"
-tar -xzf "egret-0.1.6-${EGRET_TARGET}.tar.gz"
-mkdir -p "$HOME/.local/opt"
-mv "egret-0.1.6-${EGRET_TARGET}" "$HOME/.local/opt/"
-
-export EGRET_HOME="$HOME/.local/opt/egret-0.1.6-${EGRET_TARGET}"
-export PATH="$EGRET_HOME/bin:$PATH"
-egret version
-```
-
-需要永久安装时，将两个 `export` 加入 shell 配置。二进制发布包包含编译器、
-标准系统模块、头文件和目标平台定义。OpenASP 当前还会构建经过补丁的 cold
-compiler 与 runtime，因此下文的 `EGRET_ROOT` 仍必须指向版本匹配的完整 Egret
-源码树；安装二进制包不能替代该源码依赖。
+二进制包提供编译器和标准文件。编译 OpenASP 还需要版本匹配的完整 Egret
+源码树，执行 `make` 前必须将 `EGRET_ROOT` 指向该源码目录。
 
 ### Linux 依赖
 
